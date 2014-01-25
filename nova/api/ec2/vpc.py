@@ -31,7 +31,7 @@ from nova.openstack.common import log as logging
 
 from keystoneclient import exceptions as ke
 import keystoneclient.v2_0
-from nova.network import quantumv2
+from nova.network import neutronv2
 import time
 import uuid
 try:
@@ -98,9 +98,9 @@ class VpcController(object):
         if cidr == '0.0.0.0/0':
             return 'any'
 
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            network_rsp = quantum.list_networks()
+            network_rsp = neutron.list_networks()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -111,7 +111,7 @@ class VpcController(object):
                 continue
 
             try:
-                subnets_rsp = quantum.list_subnets(
+                subnets_rsp = neutron.list_subnets(
                     network_id=network['id'])
                 for subnet in subnets_rsp['subnets']:
                     if IPNetwork(cidr) in IPNetwork(subnet['cidr']):
@@ -246,9 +246,9 @@ class VpcController(object):
         # uuid = 2cefa85e-0a14-4f7d-8d12-a93ffe054dae
         # for security group id = sg-2cefa85e
         try:
-            quantum = quantumv2.get_client(context)
+            neutron = neutronv2.get_client(context)
 
-            groups = quantum.list_security_groups()
+            groups = neutron.list_security_groups()
             foundGroup = False
             for group in groups['security_groups']:
                 if (group_id == 'default' and
@@ -270,8 +270,8 @@ class VpcController(object):
     def _get_rule_uuid_from_params(self, context, req):
         # check if rule with specified parameter already exists or not
         try:
-            quantum = quantumv2.get_client(context)
-            group_rule_rsp = quantum.list_security_group_rules()
+            neutron = neutronv2.get_client(context)
+            group_rule_rsp = neutron.list_security_group_rules()
             foundRule = False
 
             for rule in group_rule_rsp['security_group_rules']:
@@ -302,7 +302,7 @@ class VpcController(object):
 
         # create network-ipam for vpc
         cidr_block = kwargs['cidr_block']
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         req = {'ipam': {'mgmt': {
                         'cidr_block': {
@@ -313,10 +313,10 @@ class VpcController(object):
         create_ipam = True
         while create_ipam:
             try:
-                quantum.create_ipam(req)
+                neutron.create_ipam(req)
                 create_ipam = False
             except Exception as e:
-                ipams = quantum.list_ipams()
+                ipams = neutron.list_ipams()
                 for ipam in ipams['ipams']:
                     if ipam['fq_name'][1] == tenant_name:
                         create_ipam = False
@@ -324,7 +324,7 @@ class VpcController(object):
                     time.sleep(3)
 
         # check for default security group
-        quantum.list_security_groups()
+        neutron.list_security_groups()
 
         # create policy and associate with vpc
         self.create_network_acl(context, vpc_id=[tenant_name], default=True)
@@ -339,37 +339,37 @@ class VpcController(object):
         vpc_id = kwargs['vpc_id']
         tenant_id = self._get_tenantid_from_vpcid(vpc_id, context)
 
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
             # delete default subnet
-            nets = quantum.list_networks()
+            nets = neutron.list_networks()
             for net in nets['networks']:
                 if net['contrail:fq_name'][1] == vpc_id:
-                    quantum.delete_network(net['id'])
+                    neutron.delete_network(net['id'])
 
             # delete default route table
-            routes = quantum.list_route_tables()
+            routes = neutron.list_route_tables()
             for route in routes['route_tables']:
                 if route['fq_name'][1] == vpc_id:
-                    quantum.delete_route_table(route['id'])
+                    neutron.delete_route_table(route['id'])
 
             # delete default security group
-            groups = quantum.list_security_groups()
+            groups = neutron.list_security_groups()
             for group in groups['security_groups']:
                 if group['tenant_id'] == tenant_id:
-                    quantum.delete_security_group(group['id'])
+                    neutron.delete_security_group(group['id'])
 
             # delete default network policy
-            policys = quantum.list_policys()
+            policys = neutron.list_policys()
             for pol in policys['policys']:
                 if pol['fq_name'][1] == vpc_id:
-                    quantum.delete_policy(pol['id'])
+                    neutron.delete_policy(pol['id'])
 
             # delete default-network-ipam
-            ipams = quantum.list_ipams()
+            ipams = neutron.list_ipams()
             for ipam in ipams['ipams']:
                 if ipam['fq_name'][1] == vpc_id:
-                    quantum.delete_ipam(ipam['id'])
+                    neutron.delete_ipam(ipam['id'])
 
         except Exception as e:
             raise exception.EC2APIError(e)
@@ -399,9 +399,9 @@ class VpcController(object):
             raise exception.EC2APIError(e)
 
         # fetch ipam list
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            ipam_rsp = quantum.list_ipams()
+            ipam_rsp = neutron.list_ipams()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -460,8 +460,8 @@ class VpcController(object):
         dhcp_options_id = 'dopt-' + ('%x' % uuid.uuid4().time_low)
         dhcp_options = kwargs
 
-        # get client directly from quantumclient
-        quantum = quantumv2.get_client(context)
+        # get client directly from neutronclient
+        neutron = neutronv2.get_client(context)
         dhcp = []
         # create a storage ipam for dhcp options
         for key, value in dhcp_options.items():
@@ -474,7 +474,7 @@ class VpcController(object):
                'tenant_id': context.project_id,
                'mgmt': {'dhcp_option_list': {'dhcp_option': dhcp}}}
         try:
-            quantum.create_ipam({'ipam': req})
+            neutron.create_ipam({'ipam': req})
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -486,9 +486,9 @@ class VpcController(object):
         dhcp_options_id = kwargs.get('dhcp_options_id')[0]
 
         # get ipam list
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            ipam_rsp = quantum.list_ipams()
+            ipam_rsp = neutron.list_ipams()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -515,7 +515,7 @@ class VpcController(object):
                 err='No matching VPC or DHCP options')
 
         try:
-            quantum.update_ipam(vpcIpamId, {'ipam': req})
+            neutron.update_ipam(vpcIpamId, {'ipam': req})
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -524,27 +524,27 @@ class VpcController(object):
     def delete_dhcp_options(self, context, **kwargs):
         dhcp_options_id = kwargs.get('dhcp_options_id')[0]
 
-        # get client directly from quantumclient
-        quantum = quantumv2.get_client(context)
+        # get client directly from neutronclient
+        neutron = neutronv2.get_client(context)
         try:
-            ipam_rsp = quantum.list_ipams()
+            ipam_rsp = neutron.list_ipams()
         except Exception as e:
             raise exception.EC2APIError(e)
 
         for ipam in ipam_rsp['ipams']:
             if ipam['fq_name'][2] == dhcp_options_id:
                 try:
-                    quantum.delete_ipam(ipam['id'])
+                    neutron.delete_ipam(ipam['id'])
                 except Exception as e:
                     raise exception.EC2APIError(e)
 
         return {'return': 'true'}
 
     def describe_dhcp_options(self, context, **kwargs):
-        # get client directly from quantumclient
-        quantum = quantumv2.get_client(context)
+        # get client directly from neutronclient
+        neutron = neutronv2.get_client(context)
         try:
-            ipam_rsp = quantum.list_ipams()
+            ipam_rsp = neutron.list_ipams()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -576,11 +576,11 @@ class VpcController(object):
 
         # get project id
         tenant_id = self._get_tenantid_from_vpcid(vpc_id, context)
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         # check if subnet cidr in vpc cidr
         try:
-            ipam_rsp = quantum.list_ipams()
+            ipam_rsp = neutron.list_ipams()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -606,14 +606,14 @@ class VpcController(object):
                 vn_name = 'subnet-default'
 
             # associate default network policy
-            policy_l = quantum.list_policys()
+            policy_l = neutron.list_policys()
             for pol in policy_l['policys']:
                 if pol['fq_name'][1] == vpc_id and \
                    pol['fq_name'][2] == 'acl-default':
                     break
 
             # associate default route table
-            route_rsp = quantum.list_route_tables()
+            route_rsp = neutron.list_route_tables()
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == 'rtb-default' and \
                    route_table['fq_name'][1] == vpc_id:
@@ -623,7 +623,7 @@ class VpcController(object):
             net_req = {'name': vn_name, 'tenant_id': tenant_id,
                        'contrail:policys': [pol['fq_name']],
                        'vpc:route_table': route_table['fq_name']}
-            net_rsp = quantum.create_network({'network': net_req})
+            net_rsp = neutron.create_network({'network': net_req})
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -634,7 +634,7 @@ class VpcController(object):
                       'tenant_id': tenant_id,
                       'contrail:ipam_fq_name': ipam['fq_name']}
         try:
-            quantum.create_subnet({'subnet': subnet_req})
+            neutron.create_subnet({'subnet': subnet_req})
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -644,10 +644,10 @@ class VpcController(object):
     def delete_subnet(self, context, **kwargs):
         # delete VN for the passed subnet_id
         subnet_id = kwargs['subnet_id']
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
-            network_rsp = quantum.list_networks()
+            network_rsp = neutron.list_networks()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -658,10 +658,10 @@ class VpcController(object):
                 continue
 
             try:
-                subnets_rsp = quantum.list_subnets(network_id=network['id'])
+                subnets_rsp = neutron.list_subnets(network_id=network['id'])
                 for subnet in subnets_rsp['subnets']:
-                    quantum.delete_subnet(subnet['id'])
-                quantum.delete_network(network['id'])
+                    neutron.delete_subnet(subnet['id'])
+                neutron.delete_network(network['id'])
             except Exception as e:
                 raise exception.EC2APIError(e)
 
@@ -675,9 +675,9 @@ class VpcController(object):
             raise exception.EC2APIError(e)
 
         # fetch network list
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            network_rsp = quantum.list_networks()
+            network_rsp = neutron.list_networks()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -707,11 +707,11 @@ class VpcController(object):
         else:
             route_table_id = 'rtb-default'
 
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         # get cidr block for given vpc
         try:
-            ipam_rsp = quantum.list_ipams()
+            ipam_rsp = neutron.list_ipams()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -730,7 +730,7 @@ class VpcController(object):
         req = {'name': route_table_id, 'tenant_id': tenant_id,
                'routes': route_dict}
         try:
-            quantum.create_route_table({'route_table': req})
+            neutron.create_route_table({'route_table': req})
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -743,11 +743,11 @@ class VpcController(object):
     def associate_route_table(self, context, **kwargs):
         route_table_id = kwargs['route_table_id']
         subnet_id = kwargs['subnet_id']
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
             # find the subnet
-            net_rsp = quantum.list_networks(tenant_id=context.project_id)
+            net_rsp = neutron.list_networks(tenant_id=context.project_id)
             found_net = False
             for net in net_rsp['networks']:
                 if net['name'] == subnet_id:
@@ -757,7 +757,7 @@ class VpcController(object):
                 raise exception.InvalidParameterValue(err='No subnet found')
 
             # find the route table
-            route_rsp = quantum.list_route_tables(tenant_id=context.project_id)
+            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
             foundRouteTable = False
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == route_table_id:
@@ -769,7 +769,7 @@ class VpcController(object):
 
             # associate route table to subnet
             net_req = {'vpc:route_table': route_table['fq_name']}
-            quantum.update_network(net['id'], {'network': net_req})
+            neutron.update_network(net['id'], {'network': net_req})
             association_id = 'rtbassoc-' + net['id'][:8]
 
         except Exception as e:
@@ -779,11 +779,11 @@ class VpcController(object):
 
     def disassociate_route_table(self, context, **kwargs):
         association_id = kwargs['association_id']
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
             # find the associated vn
-            net_rsp = quantum.list_networks(tenant_id=context.project_id)
+            net_rsp = neutron.list_networks(tenant_id=context.project_id)
             found_net = False
             for net in net_rsp['networks']:
                 if net['id'][:8] == association_id.split('-')[1]:
@@ -793,7 +793,7 @@ class VpcController(object):
                 raise exception.InvalidParameterValue(err='No subnet found')
 
             # find the default route table
-            route_rsp = quantum.list_route_tables(tenant_id=context.project_id)
+            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
             foundRouteTable = False
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == 'rtb-default' and \
@@ -806,7 +806,7 @@ class VpcController(object):
 
             # associate default route table to vn
             net_req = {'vpc:route_table': route_table['fq_name']}
-            quantum.update_network(net['id'], {'network': net_req})
+            neutron.update_network(net['id'], {'network': net_req})
             association_id = 'rtbassoc-' + net['id'][:8]
 
         except Exception as e:
@@ -817,11 +817,11 @@ class VpcController(object):
     def replace_route_table_association(self, context, **kwargs):
         association_id = kwargs['association_id']
         route_table_id = kwargs['route_table_id']
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
             # find the associated vn
-            net_rsp = quantum.list_networks(tenant_id=context.project_id)
+            net_rsp = neutron.list_networks(tenant_id=context.project_id)
             found_net = False
             for net in net_rsp['networks']:
                 if net['id'][:8] == association_id.split('-')[1]:
@@ -831,7 +831,7 @@ class VpcController(object):
                 raise exception.InvalidParameterValue(err='No subnet found')
 
             # find the route table
-            route_rsp = quantum.list_route_tables(tenant_id=context.project_id)
+            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
             foundRouteTable = False
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == route_table_id:
@@ -843,7 +843,7 @@ class VpcController(object):
 
             # associate new route table to vn
             net_req = {'vpc:route_table': route_table['fq_name']}
-            quantum.update_network(net['id'], {'network': net_req})
+            neutron.update_network(net['id'], {'network': net_req})
             association_id = 'rtbassoc-' + net['id'][:8]
 
         except Exception as e:
@@ -853,15 +853,15 @@ class VpcController(object):
 
     def delete_route_table(self, context, **kwargs):
         route_table_id = kwargs['route_table_id']
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         # find the route table to delete
         try:
-            route_rsp = quantum.list_route_tables()
+            route_rsp = neutron.list_route_tables()
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == route_table_id:
                     # delete the specified route table
-                    quantum.delete_route_table(route_table['id'])
+                    neutron.delete_route_table(route_table['id'])
                     break
 
         except Exception as e:
@@ -871,10 +871,10 @@ class VpcController(object):
 
     def describe_route_tables(self, context, **kwargs):
         # fetch all route tables
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            route_rsp = quantum.list_route_tables(tenant_id=context.project_id)
-            net_rsp = quantum.list_networks(tenant_id=context.project_id)
+            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
+            net_rsp = neutron.list_networks(tenant_id=context.project_id)
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -939,11 +939,11 @@ class VpcController(object):
         else:
             raise exception.InvalidParameterValue(
                 err="gateway/instance/interfacem id must be provided")
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
             # find the route table
-            route_rsp = quantum.list_route_tables(tenant_id=context.project_id)
+            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
             foundRouteTable = False
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == route_table_id:
@@ -971,7 +971,7 @@ class VpcController(object):
             # add route to the route table
             route_dict = {'route': route_table['routes']}
             req = {'routes': route_dict}
-            route_rsp = quantum.update_route_table(route_table['id'],
+            route_rsp = neutron.update_route_table(route_table['id'],
                                                    {'route_table': req})
         except Exception as e:
             raise exception.EC2APIError(e)
@@ -999,11 +999,11 @@ class VpcController(object):
         else:
             raise exception.InvalidParameterValue(
                 err="gateway/instance/interface id must be provided")
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
             # find the route table
-            route_rsp = quantum.list_route_tables(tenant_id=context.project_id)
+            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
             foundRouteTable = False
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == route_table_id:
@@ -1029,7 +1029,7 @@ class VpcController(object):
             route_table['routes'][i]['next_hop_type'] = next_hop_type
             route_dict = {'route': route_table['routes']}
             req = {'routes': route_dict}
-            route_rsp = quantum.update_route_table(route_table['id'],
+            route_rsp = neutron.update_route_table(route_table['id'],
                                                    {'route_table': req})
 
         except Exception as e:
@@ -1040,11 +1040,11 @@ class VpcController(object):
     def delete_route(self, context, **kwargs):
         route_table_id = kwargs['route_table_id']
         cidr = kwargs['destination_cidr_block']
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
             # find the route table
-            route_rsp = quantum.list_route_tables(tenant_id=context.project_id)
+            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
             foundRouteTable = False
             for route_table in route_rsp['route_tables']:
                 if route_table['name'] == route_table_id:
@@ -1069,7 +1069,7 @@ class VpcController(object):
             route_table['routes'].pop(i)
             route_dict = {'route': route_table['routes']}
             req = {'routes': route_dict}
-            route_rsp = quantum.update_route_table(route_table['id'],
+            route_rsp = neutron.update_route_table(route_table['id'],
                                                    {'route_table': req})
 
         except Exception as e:
@@ -1125,7 +1125,7 @@ class VpcController(object):
         pol_dict['policy_rule'].append(rule)
 
         # create network policy with default rules in current project
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
             if 'default' in kwargs:
                 acl_id = 'acl-default'
@@ -1133,7 +1133,7 @@ class VpcController(object):
                 acl_id = 'acl-' + ('%x' % uuid.uuid4().time_low)
             policy_req = {'tenant_id': tenant_id, 'name': acl_id,
                           'entries': pol_dict}
-            quantum.create_policy({'policy': policy_req})
+            neutron.create_policy({'policy': policy_req})
 
         except Exception as e:
             raise exception.EC2APIError(e)
@@ -1151,10 +1151,10 @@ class VpcController(object):
         acl_id = kwargs.get('network_acl_id')
         association_id = kwargs.get('association_id')
 
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
             # find policy
-            policys = quantum.list_policys(tenant_id=context.project_id)
+            policys = neutron.list_policys(tenant_id=context.project_id)
             found_policy = False
             for pol in policys['policys']:
                 if pol['name'] == acl_id:
@@ -1162,7 +1162,7 @@ class VpcController(object):
                     break
 
             # find network
-            nets = quantum.list_networks(tenant_id=context.project_id)
+            nets = neutron.list_networks(tenant_id=context.project_id)
             found_net = False
             for net in nets['networks']:
                 if association_id == 'aclassoc-' + net['id'][:8]:
@@ -1175,7 +1175,7 @@ class VpcController(object):
                     err='No network association')
 
             # update association
-            quantum.update_network(net['id'], {'network': net_req})
+            neutron.update_network(net['id'], {'network': net_req})
 
         except Exception as e:
             raise exception.EC2APIError(e)
@@ -1192,16 +1192,16 @@ class VpcController(object):
 
         # find the acl from list and delete it
         # if associated with subnet throw exception
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            policys = quantum.list_policys()
+            policys = neutron.list_policys()
             for pol in policys['policys']:
                 if pol['name'] == acl_id:
                     break
             if 'nets_using' in pol:
                 raise exception.InvalidParameterValue(
                     err='Cannot delete network policy.Associeted with VN')
-            quantum.delete_policy(pol['id'])
+            neutron.delete_policy(pol['id'])
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -1212,9 +1212,9 @@ class VpcController(object):
             acl_id = kwargs.get('acl_id')
         acls = []
 
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            policys = quantum.list_policys(tenant_id=context.project_id)
+            policys = neutron.list_policys(tenant_id=context.project_id)
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -1267,7 +1267,7 @@ class VpcController(object):
 
             if 'nets_using' in pol:
                 try:
-                    nets = quantum.list_networks(tenant_id=context.project_id)
+                    nets = neutron.list_networks(tenant_id=context.project_id)
                 except Exception as e:
                     raise exception.EC2APIError(e)
 
@@ -1293,9 +1293,9 @@ class VpcController(object):
         rule_no = pol_dict['policy_rule'][0]['rule_uuid']
 
         # add new policy entry to list and update acl policy
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            policys = quantum.list_policys(tenant_id=context.project_id)
+            policys = neutron.list_policys(tenant_id=context.project_id)
             for pol in policys['policys']:
                 if pol['name'] == acl_id:
                     break
@@ -1314,7 +1314,7 @@ class VpcController(object):
 
             pol_list_dict = {'policy_rule': pol_list}
             policy_req = {'entries': pol_list_dict}
-            quantum.update_policy(pol['id'], {'policy': policy_req})
+            neutron.update_policy(pol['id'], {'policy': policy_req})
 
         except Exception as e:
             raise exception.EC2APIError(e)
@@ -1328,9 +1328,9 @@ class VpcController(object):
         rule_no = pol_dict['policy_rule'][0]['rule_uuid']
 
         # replace entry in acl policy list and update acl
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            policys = quantum.list_policys(tenant_id=context.project_id)
+            policys = neutron.list_policys(tenant_id=context.project_id)
             for pol in policys['policys']:
                 if pol['name'] == acl_id:
                     break
@@ -1351,7 +1351,7 @@ class VpcController(object):
                     err='No matching ACL entry found')
 
             policy_req = {'entries': pol_list_dict}
-            quantum.update_policy(pol['id'], {'policy': policy_req})
+            neutron.update_policy(pol['id'], {'policy': policy_req})
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -1376,9 +1376,9 @@ class VpcController(object):
                 err='Invalid direction argument')
 
         # delete policy entry and update acl
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            policys = quantum.list_policys(tenant_id=context.project_id)
+            policys = neutron.list_policys(tenant_id=context.project_id)
             for pol in policys['policys']:
                 if pol['name'] == acl_id:
                     break
@@ -1398,7 +1398,7 @@ class VpcController(object):
                     err='No matching ACL entry found')
 
             policy_req = {'entries': pol_list_dict}
-            quantum.update_policy(pol['id'], {'policy': policy_req})
+            neutron.update_policy(pol['id'], {'policy': policy_req})
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -1408,14 +1408,14 @@ class VpcController(object):
                                   group_description, vpc_id=None):
         # get project id
         tenant_id = self._get_tenantid_from_vpcid(vpc_id, context)
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         # set security group
         group_req = {'description': group_description,
                      'name': group_name,
                      'tenant_id': tenant_id}
         try:
-            group_rsp = quantum.create_security_group(
+            group_rsp = neutron.create_security_group(
                 {'security_group': group_req})
             group_ref = group_rsp['security_group']
             sg_id = "sg-" + group_ref['id'][0:8]
@@ -1425,12 +1425,12 @@ class VpcController(object):
 
     def vpc_delete_security_group(self, context, group_name=None,
                                   group_id=None, kwargs=None):
-        quantum = quantumv2.get_client(context)
-        groups = quantum.list_security_groups()
+        neutron = neutronv2.get_client(context)
+        groups = neutron.list_security_groups()
         for group in groups['security_groups']:
             sg_id = "sg-" + group['id'][0:8]
             if sg_id == group_id:
-                quantum.delete_security_group(group['id'])
+                neutron.delete_security_group(group['id'])
 
         return {'return': 'true'}
 
@@ -1442,11 +1442,11 @@ class VpcController(object):
             self._get_group_uuid_from_group_id(context, group_id)
 
         try:
-            quantum = quantumv2.get_client(context)
+            neutron = neutronv2.get_client(context)
             # check if rule with specified parameters already exists
             if not self._get_rule_uuid_from_params(context, req):
                 # create rule in given security group
-                quantum.create_security_group_rule(
+                neutron.create_security_group_rule(
                     {'security_group_rule': req})
                 return {'return': 'true'}
 
@@ -1466,9 +1466,9 @@ class VpcController(object):
         try:
             # check if rule with specified parameters already exists
             if not self._get_rule_uuid_from_params(context, req):
-                quantum = quantumv2.get_client(context)
+                neutron = neutronv2.get_client(context)
                 # create rule in given security group
-                quantum.create_security_group_rule(
+                neutron.create_security_group_rule(
                     {'security_group_rule': req})
                 return {'return': 'true'}
 
@@ -1487,13 +1487,13 @@ class VpcController(object):
             self._get_group_uuid_from_group_id(context, group_id)
 
         try:
-            quantum = quantumv2.get_client(context)
+            neutron = neutronv2.get_client(context)
             # check if rule with specified parameter exists or not
             rule_id = self._get_rule_uuid_from_params(context, req)
 
             if rule_id:
                 # delete the rule
-                quantum.delete_security_group_rule(rule_id)
+                neutron.delete_security_group_rule(rule_id)
                 return {'return': 'true'}
             raise exception.InvalidParameterValue(
                 'No rule for the specified parameters.')
@@ -1510,12 +1510,12 @@ class VpcController(object):
             self._get_group_uuid_from_group_id(context, group_id)
 
         try:
-            quantum = quantumv2.get_client(context)
+            neutron = neutronv2.get_client(context)
             # check if rule with specified parameter exists or not
             rule_id = self._get_rule_uuid_from_params(context, req)
             if rule_id:
                 # delete the rule
-                quantum.delete_security_group_rule(rule_id)
+                neutron.delete_security_group_rule(rule_id)
                 return {'return': 'true'}
             raise exception.InvalidParameterValue(
                 'No rule for the specified parameters.')
@@ -1525,10 +1525,10 @@ class VpcController(object):
 
     def vpc_describe_security_groups(self, context, group_name=None,
                                      group_id=None, kwargs=None):
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
 
         try:
-            groups = quantum.list_security_groups(
+            groups = neutron.list_security_groups(
                 tenant_id=context.project_id)
         except Exception as e:
             raise exception.EC2APIError(e)
@@ -1577,13 +1577,13 @@ class VpcController(object):
 
         return {'security_group_info': grps}
 
-    def vpc_format_address(self, context, floating_ip, quantum):
+    def vpc_format_address(self, context, floating_ip, neutron):
         ec2_id = None
         assoc_id = None
         address = {}
 
         if 'port_id' in floating_ip and floating_ip['port_id']:
-            port = quantum.show_port(floating_ip['port_id'])
+            port = neutron.show_port(floating_ip['port_id'])
             inst_id = port['port']['device_id']
             ec2_id = ec2utils.id_to_ec2_inst_id(inst_id)
             assoc_id = 'eipassoc-' + floating_ip['id'][:8]
@@ -1599,9 +1599,9 @@ class VpcController(object):
         return address
 
     def vpc_allocate_address(self, context, kwargs):
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            nw_list = quantum.list_networks()
+            nw_list = neutron.list_networks()
         except Exception as e:
             raise exception.EC2APIError(e)
 
@@ -1616,7 +1616,7 @@ class VpcController(object):
                 fip_req = {'floatingip':
                           {'floating_network_id': nw['id'],
                            'tenant_id': context.project_id}}
-                fip_resp = quantum.create_floatingip(fip_req)
+                fip_resp = neutron.create_floatingip(fip_req)
                 fip = fip_resp['floatingip']['floating_ip_address']
                 eip_id = 'eipalloc-' + fip_resp['floatingip']['id'][:8]
             except Exception as e:
@@ -1632,9 +1632,9 @@ class VpcController(object):
         LOG.audit(_("Release address %s"), eip_id, context=context)
 
         # return floating ip to the floating ip pool
-        quantum = quantumv2.get_client(context)
+        neutron = neutronv2.get_client(context)
         try:
-            fip_list = quantum.list_floatingips(
+            fip_list = neutron.list_floatingips(
                 tenant_id=context.project_id)
             for fip in fip_list['floatingips']:
                 if eip_id:
@@ -1644,7 +1644,7 @@ class VpcController(object):
                     if fip['floating_ip_address'] != public_ip:
                         continue
 
-                quantum.delete_floatingip(fip['id'])
+                neutron.delete_floatingip(fip['id'])
                 return {'return': "true"}
         except Exception as e:
             raise exception.EC2APIError(e)
@@ -1657,8 +1657,8 @@ class VpcController(object):
                     "%(instance_id)s"),
                   {'eip_id': eip_id, 'instance_id': instance_id},
                   context=context)
-        quantum = quantumv2.get_client(context)
-        fip_list = quantum.list_floatingips(tenant_id=context.project_id)
+        neutron = neutronv2.get_client(context)
+        fip_list = neutron.list_floatingips(tenant_id=context.project_id)
         found = False
         for fip in fip_list['floatingips']:
             if eip_id:
@@ -1674,10 +1674,10 @@ class VpcController(object):
             raise exception.InvalidParameterValue(err="Value not found")
 
         try:
-            ports = quantum.list_ports(device_id=[instance_uuid])
+            ports = neutron.list_ports(device_id=[instance_uuid])
             for port in ports['ports']:
                 fip_req = {'floatingip': {'port_id': port['id']}}
-                quantum.update_floatingip(fip['id'], fip_req)
+                neutron.update_floatingip(fip['id'], fip_req)
                 association_id = 'eipassoc-' + fip['id'][:8]
                 return {'return': 'true',
                         'association_id': association_id}
@@ -1689,8 +1689,8 @@ class VpcController(object):
         LOG.audit(_("Disassociate address %s"), public_ip, context=context)
 
         # fecth the matching floating ip
-        quantum = quantumv2.get_client(context)
-        fip_list = quantum.list_floatingips(tenant_id=context.project_id)
+        neutron = neutronv2.get_client(context)
+        fip_list = neutron.list_floatingips(tenant_id=context.project_id)
         found = False
         for fip in fip_list['floatingips']:
             if eip_id:
@@ -1708,17 +1708,17 @@ class VpcController(object):
         # disassociate the floating ip
         try:
             fip_req = {'floatingip': {'port_id': None}}
-            quantum.update_floatingip(fip['id'], fip_req)
+            neutron.update_floatingip(fip['id'], fip_req)
         except Exception as e:
             raise exception.EC2APIError(e)
 
         return {'return': "true"}
 
     def vpc_describe_addresses(self, context, kwargs):
-        quantum = quantumv2.get_client(context)
-        floatings = quantum.list_floatingips(tenant_id=context.project_id)
+        neutron = neutronv2.get_client(context)
+        floatings = neutron.list_floatingips(tenant_id=context.project_id)
         addresses = [self.vpc_format_address(
-            context, f, quantum) for f in floatings['floatingips']]
+            context, f, neutron) for f in floatings['floatingips']]
         return {'addressesSet': addresses}
 
     def create_internet_gateway(self, context):
