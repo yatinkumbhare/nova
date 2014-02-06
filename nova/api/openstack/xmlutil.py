@@ -141,7 +141,7 @@ class TemplateElement(object):
     """Represent an element in the template."""
 
     def __init__(self, tag, attrib=None, selector=None, subselector=None,
-                 colon_ns=False, **extra):
+                 **extra):
         """Initialize an element.
 
         Initializes an element in the template.  Keyword arguments
@@ -159,9 +159,6 @@ class TemplateElement(object):
                             This is used to further refine the datum
                             object returned by selector in the event
                             that it is a list of objects.
-        :colon_ns: An optional flag indicates whether support k:v
-                    type tagname, if so the k:v type tagname will
-                    be supported by adding the k into namespace.
         """
 
         # Convert selector into a Selector
@@ -181,7 +178,6 @@ class TemplateElement(object):
         self._text = None
         self._children = []
         self._childmap = {}
-        self.colon_ns = colon_ns
 
         # Run the incoming attributes through set() so that they
         # become selectorized
@@ -371,15 +367,6 @@ class TemplateElement(object):
             tagname = self.tag(datum)
         else:
             tagname = self.tag
-
-        if self.colon_ns:
-            if ':' in tagname:
-                if nsmap is None:
-                    nsmap = {}
-                colon_key, colon_name = tagname.split(':')
-                nsmap[colon_key] = colon_key
-                tagname = '{%s}%s' % (colon_key, colon_name)
-
         elem = etree.Element(tagname, nsmap=nsmap)
 
         # If we have a parent, append the node to the parent
@@ -509,7 +496,7 @@ class TemplateElement(object):
 
 
 def SubTemplateElement(parent, tag, attrib=None, selector=None,
-                       subselector=None, colon_ns=False, **extra):
+                       subselector=None, **extra):
     """Create a template element as a child of another.
 
     Corresponds to the etree.SubElement interface.  Parameters are as
@@ -522,7 +509,7 @@ def SubTemplateElement(parent, tag, attrib=None, selector=None,
 
     # Get a TemplateElement
     elem = TemplateElement(tag, attrib=attrib, selector=selector,
-                           subselector=subselector, colon_ns=colon_ns)
+                           subselector=subselector)
 
     # Append the parent safely
     if parent is not None:
@@ -891,8 +878,7 @@ def make_links(parent, selector=None):
     return elem
 
 
-def make_flat_dict(name, selector=None, subselector=None,
-                   ns=None, colon_ns=False):
+def make_flat_dict(name, selector=None, subselector=None, ns=None):
     """
     Utility for simple XML templates that traditionally used
     XMLDictSerializer with no metadata.  Returns a template element
@@ -916,11 +902,10 @@ def make_flat_dict(name, selector=None, subselector=None,
 
     # Build the root element
     root = TemplateElement(elemname, selector=selector,
-                           subselector=subselector, colon_ns=colon_ns)
+                           subselector=subselector)
 
     # Build an element to represent all the keys and values
-    elem = SubTemplateElement(root, tagname, selector=get_items,
-                              colon_ns=colon_ns)
+    elem = SubTemplateElement(root, tagname, selector=get_items)
     elem.text = 1
 
     # Return the template

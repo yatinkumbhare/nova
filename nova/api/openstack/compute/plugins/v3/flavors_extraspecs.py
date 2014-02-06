@@ -28,8 +28,7 @@ from nova.openstack.common.gettextutils import _
 
 class ExtraSpecsTemplate(xmlutil.TemplateBuilder):
     def construct(self):
-        extra_specs_dict = xmlutil.make_flat_dict('extra_specs', colon_ns=True)
-        return xmlutil.MasterTemplate(extra_specs_dict, 1)
+        return xmlutil.MasterTemplate(xmlutil.make_flat_dict('extra_specs'), 1)
 
 
 class ExtraSpecTemplate(xmlutil.TemplateBuilder):

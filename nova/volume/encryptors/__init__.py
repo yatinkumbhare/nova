@@ -19,6 +19,7 @@
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
+from nova import volume
 from nova.volume.encryptors import nop
 
 
@@ -48,12 +49,15 @@ def get_volume_encryptor(connection_info, **kwargs):
     return encryptor
 
 
-def get_encryption_metadata(context, volume_api, volume_id, connection_info):
+_volume_api = volume.API()
+
+
+def get_encryption_metadata(context, volume_id, connection_info):
     metadata = {}
     if ('data' in connection_info and
             connection_info['data'].get('encrypted', False)):
         try:
-            metadata = volume_api.get_volume_encryption_metadata(context,
+            metadata = _volume_api.get_volume_encryption_metadata(context,
                                                                  volume_id)
         except Exception as e:
             LOG.error(_("Failed to retrieve encryption metadata for "
