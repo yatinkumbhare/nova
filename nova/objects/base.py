@@ -102,7 +102,7 @@ def remotable_classmethod(fn):
     def wrapper(cls, context, *args, **kwargs):
         if NovaObject.indirection_api:
             result = NovaObject.indirection_api.object_class_action(
-                context, cls.obj_name(), fn.__name__, cls.VERSION,
+                context, cls.obj_name(), fn.__name__, cls.version,
                 args, kwargs)
         else:
             result = fn(cls, context, *args, **kwargs)
@@ -140,7 +140,6 @@ def remotable(fn):
             for key, value in updates.iteritems():
                 if key in self.fields:
                     self[key] = self._attr_from_primitive(key, value)
-            self.obj_reset_changes()
             self._changed_fields = set(updates.get('obj_what_changed', []))
             return result
         else:
@@ -184,7 +183,7 @@ class NovaObject(object):
     __metaclass__ = NovaObjectMetaclass
 
     # Version of this object (see rules above check_object_version())
-    VERSION = '1.0'
+    version = '1.0'
 
     # The fields present in this object as key:typefn pairs. For example:
     #
@@ -216,10 +215,10 @@ class NovaObject(object):
 
         compatible_match = None
         for objclass in cls._obj_classes[objname]:
-            if objclass.VERSION == objver:
+            if objclass.version == objver:
                 return objclass
             try:
-                check_object_version(objclass.VERSION, objver)
+                check_object_version(objclass.version, objver)
                 compatible_match = objclass
             except exception.IncompatibleObjectVersion:
                 pass
@@ -306,7 +305,7 @@ class NovaObject(object):
                 primitive[name] = self._attr_to_primitive(name)
         obj = {'nova_object.name': self.obj_name(),
                'nova_object.namespace': 'nova',
-               'nova_object.version': self.VERSION,
+               'nova_object.version': self.version,
                'nova_object.data': primitive}
         if self.obj_what_changed():
             obj['nova_object.changes'] = list(self.obj_what_changed())
