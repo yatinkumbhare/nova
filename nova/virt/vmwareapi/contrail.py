@@ -297,8 +297,8 @@ class ContrailESXDriver(VMwareESXDriver):
                                              injected_files, admin_password,
                                              network_info, block_device_info)
 
-    def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True):
+    def destroy(self, instance, network_info, block_device_info=None,
+                destroy_disks=True, context=None):
         session = self._session
         vlan_id = None
         vswitch = ""
@@ -307,8 +307,8 @@ class ContrailESXDriver(VMwareESXDriver):
             for vif in network_info:
                 self.VifInfo.unplug(instance, vif)
 
-        super(ContrailESXDriver, self).destroy(context, instance, network_info,
-                block_device_info, destroy_disks)
+        super(ContrailESXDriver, self).destroy(instance, network_info,
+                block_device_info, destroy_disks, context)
 
         if not network_info:
             return
