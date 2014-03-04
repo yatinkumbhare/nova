@@ -284,6 +284,7 @@ class ContrailESXDriver(VMwareESXDriver):
                     raise exception.NovaException("Vlan id space is full")
 
                 vif['network']['bridge'] = vif['network']['label'] + \
+                                            '-' + str(instance['hostname']) + \
                                             '-' + str(vif['id'])
                 args = {'should_create_vlan':True, 'vlan':vlan_id}
                 vif['network']._set_meta(args)
@@ -314,7 +315,9 @@ class ContrailESXDriver(VMwareESXDriver):
             return
 
         for vif in network_info:
-            port_group = vif['network']['label'] + '-' + str(vif['id'])
+            port_group = vif['network']['label'] + \
+                          '-' + str(instance['hostname']) + \
+                          '-' + str(vif['id'])
             try:
                 vlan_id, vswitch = \
                     network_util.get_vlanid_and_vswitch_for_portgroup(session,
