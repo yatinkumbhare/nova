@@ -356,7 +356,7 @@ class VpcController(object):
             # delete default security group
             groups = quantum.list_security_groups()
             for group in groups['security_groups']:
-                if (group['tenant_id'] == tenant_id  and
+                if (group['tenant_id'] == tenant_id and
                         group['name'] != 'default'):
                     quantum.delete_security_group(group['id'])
 
