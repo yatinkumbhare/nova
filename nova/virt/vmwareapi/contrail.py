@@ -43,12 +43,11 @@ from nova.virt.vmwareapi import network_util
 
 from nova.virt.vmwareapi.driver import VMwareESXDriver
 from bitstring import BitArray
-from instance_service import ttypes
-from instance_service import InstanceService
 from thrift.transport import TTransport, TSocket
 from thrift.transport.TTransport import TTransportException
 from thrift.protocol import TBinaryProtocol, TProtocol
-from instance_service import InstanceService
+from nova_contrail_vif.gen_py.instance_service import InstanceService
+from nova_contrail_vif.gen_py.instance_service import ttypes
 
 LOG = logging.getLogger(__name__)
 
