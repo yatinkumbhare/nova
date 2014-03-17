@@ -317,6 +317,7 @@ class ContrailESXDriver(VMwareESXDriver):
             port_group = vif['network']['label'] + \
                           '-' + str(instance['hostname']) + \
                           '-' + str(vif['id'])
+
             try:
                 vlan_id, vswitch = \
                     network_util.get_vlanid_and_vswitch_for_portgroup(session,
@@ -329,3 +330,25 @@ class ContrailESXDriver(VMwareESXDriver):
             self.remove_port_group(port_group)
             self.Vlan.free_vlan(vlan_id)
 
+    def plug_vifs(self, instance, network_info):
+        """Plug VIFs into networks."""
+
+        session = self._session
+        for vif in network_info:
+            vlan_id = None
+            vswitch = ""
+            port_group = vif['network']['label'] + \
+                          '-' + str(instance['hostname']) + \
+                          '-' + str(vif['id'])
+            try:
+                vlan_id, vswitch = \
+                    network_util.get_vlanid_and_vswitch_for_portgroup(session,
+                                                                      port_group)
+            except TypeError:
+                pass
+            if not vlan_id:
+                continue
+            vif['network']['bridge'] = vif['network']['label'] + \
+                                            '-' + str(instance['hostname']) + \
+                                            '-' + str(vif['id'])
+            self.VifInfo.plug(instance, vif, vlan_id)
