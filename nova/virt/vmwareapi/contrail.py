@@ -27,6 +27,7 @@ import socket
 import sys
 import uuid
 
+from oslo.config import cfg
 from nova import exception
 from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
@@ -50,6 +51,8 @@ from nova_contrail_vif.gen_py.instance_service import InstanceService
 from nova_contrail_vif.gen_py.instance_service import ttypes
 
 LOG = logging.getLogger(__name__)
+CONF = cfg.CONF
+CONF.register_opts(vmwareapi_opts, 'vmware')
 
 
 class ContrailVIFDriver(object):
@@ -289,7 +292,7 @@ class ContrailESXDriver(VMwareESXDriver):
                 vif['network']._set_meta(args)
                 network_util.create_port_group(session,
                                                 vif['network']['bridge'],
-                                                "vSwitch1",
+                                                CONF.vmware.vmpg_vswich
                                                 vlan_id)
                 self.VifInfo.plug(instance, vif, vlan_id)
 
