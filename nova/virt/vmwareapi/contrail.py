@@ -51,9 +51,13 @@ from nova_contrail_vif.gen_py.instance_service import InstanceService
 from nova_contrail_vif.gen_py.instance_service import ttypes
 
 LOG = logging.getLogger(__name__)
-CONF = cfg.CONF
-CONF.register_opts(vmwareapi_opts, 'vmware')
 
+vmwareapi_contrail_opts = [
+    cfg.StrOpt('vmpg_vswitch',
+               help='Vswitch name to use to instantiate VMs incase of Contaril ESX solution'),
+    ]
+CONF = cfg.CONF
+CONF.register_opts(vmwareapi_contrail_opts, 'vmware')
 
 class ContrailVIFDriver(object):
     """to inform agent"""
@@ -292,7 +296,7 @@ class ContrailESXDriver(VMwareESXDriver):
                 vif['network']._set_meta(args)
                 network_util.create_port_group(session,
                                                 vif['network']['bridge'],
-                                                CONF.vmware.vmpg_vswich
+                                                CONF.vmware.vmpg_vswitch,
                                                 vlan_id)
                 self.VifInfo.plug(instance, vif, vlan_id)
 
