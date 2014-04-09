@@ -52,6 +52,10 @@ from nova import servicegroup
 from nova import utils
 from nova import volume
 
+from nova.network import neutronv2
+
+from nova.api.ec2.vpc import VpcController as vpc
+
 ec2_opts = [
     cfg.StrOpt('ec2_host',
                default='$my_ip',
@@ -208,7 +212,7 @@ def _format_mappings(properties, result):
         result['blockDeviceMapping'] = mappings
 
 
-class CloudController(object):
+class CloudController(vpc, object):
     """CloudController provides the critical dispatch between
  inbound API calls through the endpoint and messages
  sent to the other nodes.
@@ -223,6 +227,10 @@ class CloudController(object):
                                    security_group_api=self.security_group_api)
         self.keypair_api = compute_api.KeypairAPI()
         self.servicegroup_api = servicegroup.API()
+
+        #keystone client
+        self.kc = None
+        self.kc_ip = CONF.my_ip
 
     def __str__(self):
         return 'CloudController'
@@ -467,7 +475,12 @@ class CloudController(object):
 
     def describe_security_groups(self, context, group_name=None, group_id=None,
                                  **kwargs):
+        #vpcapi - handle vpc case
         search_opts = ec2utils.search_opts_from_filters(kwargs.get('filter'))
+        if 'vpc_id' in search_opts:
+            resp = vpc.vpc_describe_security_groups(self, context, search_opts,
+                                                    group_name, group_id)
+            return resp
 
         raw_groups = self.security_group_api.list(context,
                                                   group_name,
@@ -619,6 +632,13 @@ class CloudController(object):
                                       group_id=None, **kwargs):
         self._validate_group_identifier(group_name, group_id)
 
+        #vpcapi - handle vpc case
+        if group_id and str(group_id).startswith('sg-'):
+            resp = vpc.vpc_revoke_security_group_ingress(self, context,
+                                                         group_id=group_id,
+                                                         kwargs=kwargs)
+            return resp
+
         security_group = self.security_group_api.get(context, group_name,
                                                      group_id)
 
@@ -652,6 +672,13 @@ class CloudController(object):
     def authorize_security_group_ingress(self, context, group_name=None,
                                          group_id=None, **kwargs):
         self._validate_group_identifier(group_name, group_id)
+
+        #vpcapi - handle vpc case
+        if group_id and str(group_id).startswith('sg-'):
+            resp = vpc.vpc_authorize_security_group_ingress(self, context,
+                                                        group_id=group_id,
+                                                        kwargs=kwargs)
+            return resp
 
         security_group = self.security_group_api.get(context, group_name,
                                                      group_id)
@@ -695,7 +722,8 @@ class CloudController(object):
 
         return source_project_id
 
-    def create_security_group(self, context, group_name, group_description):
+    def create_security_group(self, context, group_name, group_description,
+                              vpc_id=None):
         if isinstance(group_name, unicode):
             group_name = group_name.encode('utf-8')
         if CONF.ec2_strict_validation:
@@ -713,6 +741,12 @@ class CloudController(object):
             self.security_group_api.validate_property(group_name, 'name',
                                                       allowed)
 
+        #vpcapi - handle vpc case
+        if vpc_id:
+            resp = vpc.vpc_create_security_group(self, context, group_name,
+                                                 group_description, vpc_id)
+            return resp
+
         group_ref = self.security_group_api.create_security_group(
             context, group_name, group_description)
 
@@ -724,6 +758,12 @@ class CloudController(object):
         if not group_name and not group_id:
             err = _("need group_name or group_id")
             raise exception.MissingParameter(reason=err)
+
+        #vpcapi - handle vpc case
+        if group_id and str(group_id).startswith('sg-'):
+            resp = vpc.vpc_delete_security_group(self, context, group_name,
+                                             group_id, kwargs)
+            return resp
 
         security_group = self.security_group_api.get(context, group_name,
                                                      group_id)
@@ -1156,6 +1196,10 @@ class CloudController(object):
             for k, v in utils.instance_meta(instance).iteritems():
                 i['tagSet'].append({'key': k, 'value': v})
 
+            vpc_id = vpc._get_vpcid_from_tenantid(self, instance['project_id'], context)
+            if vpc_id:
+                i['vpcId'] = vpc_id
+
             if context.is_admin:
                 i['keyName'] = '%s (%s, %s)' % (i['keyName'],
                     instance['project_id'],
@@ -1183,6 +1227,11 @@ class CloudController(object):
         return list(reservations.values())
 
     def describe_addresses(self, context, public_ip=None, **kwargs):
+        #vpcapi - handle vpc case
+        if 'filter' in kwargs:
+            resp = vpc.vpc_describe_addresses(self, context, kwargs)
+            return resp
+
         if public_ip:
             floatings = []
             for address in public_ip:
@@ -1195,6 +1244,12 @@ class CloudController(object):
         return {'addressesSet': addresses}
 
     def _format_address(self, context, floating_ip):
+        #vpcapi - handle vpc case
+        if 'pool' in floating_ip:
+            if floating_ip['pool'] == 'vpc-public':
+                resp = vpc.vpc_format_address(self, context, floating_ip)
+                return resp
+
         ec2_id = None
         if floating_ip['fixed_ip_id']:
             fixed_id = floating_ip['fixed_ip_id']
@@ -1211,15 +1266,33 @@ class CloudController(object):
 
     def allocate_address(self, context, **kwargs):
         LOG.audit(_("Allocate address"), context=context)
-        public_ip = self.network_api.allocate_floating_ip(context)
+
+        #vpcapi - handle vpc case
+        if 'domain' in kwargs:
+            resp = vpc.vpc_allocate_address(self, context, kwargs)
+            return resp
+
+        try:
+            public_ip = self.network_api.allocate_floating_ip(context)
+        except exception.FloatingIpLimitExceeded:
+            raise exception.EC2APIError(_('No more floating IPs available'))
         return {'publicIp': public_ip}
 
-    def release_address(self, context, public_ip, **kwargs):
-        LOG.audit(_('Release address %s'), public_ip, context=context)
-        self.network_api.release_floating_ip(context, address=public_ip)
-        return {'return': "true"}
+    def release_address(self, context, public_ip=None, **kwargs):
+        #vpcapi - handle vpc case
+        if 'allocation_id' in kwargs:
+            resp = vpc.vpc_release_address(self, context, public_ip, kwargs)
+            return resp
 
-    def associate_address(self, context, instance_id, public_ip, **kwargs):
+        LOG.audit(_('Release address %s'), public_ip, context=context)
+        try:
+            self.network_api.release_floating_ip(context, address=public_ip)
+            return {'return': "true"}
+        except exception.FloatingIpNotFound:
+            raise exception.EC2APIError(_('Unable to release IP Address.'))
+
+    def associate_address(self, context, instance_id, public_ip=None,
+                                                           **kwargs):
         LOG.audit(_("Associate address %(public_ip)s to instance "
                     "%(instance_id)s"),
                   {'public_ip': public_ip, 'instance_id': instance_id},
@@ -1241,12 +1314,25 @@ class CloudController(object):
             msg = _('multiple fixed_ips exist, using the first: %s')
             LOG.warning(msg, fixed_ips[0])
 
+        #vpcapi - handle vpc case
+        if 'allocation_id' in kwargs:
+            kwargs['instance_uuid'] = instance['uuid']
+            resp = vpc.vpc_associate_address(self, context, instance_id,
+                                         public_ip, kwargs)
+            return resp
+
         self.network_api.associate_floating_ip(context, instance,
-                                               floating_address=public_ip,
-                                               fixed_address=fixed_ips[0])
+                              floating_address=public_ip,
+                              fixed_address=fixed_ips[0])
         return {'return': 'true'}
 
-    def disassociate_address(self, context, public_ip, **kwargs):
+    def disassociate_address(self, context, public_ip=None, **kwargs):
+        #vpcapi - handle vpc case
+        if 'association_id' in kwargs:
+            resp = vpc.vpc_disassociate_address(self, context,
+                                            public_ip, kwargs)
+            return resp
+
         instance_id = self.network_api.get_instance_id_by_floating_address(
                                                          context, public_ip)
         if instance_id:
@@ -1291,6 +1377,48 @@ class CloudController(object):
             msg = _('Image must be available')
             raise exception.ImageNotActive(message=msg)
 
+        #vpcapi - get network uuid if subnet requested
+        networks = []
+        if kwargs.get('subnet_id'):
+            neutron = neutronv2.get_client(context)
+            try:
+                nw_list = neutron.list_networks()
+            except Exception as e:
+                raise exception.EC2APIError(e)
+
+            for nw in nw_list['networks']:
+                if nw['name'] == kwargs['subnet_id']:
+                    networks.append((nw['id'], None, None))
+                    passed_subnet = nw['id']
+
+        #vpcapi - nat instance requested hence create service only
+        name = str(image.get('name'))
+        if 'nat' in name:
+            neutron = neutronv2.get_client(context)
+            try:
+                nw_list = neutron.list_networks()
+            except Exception as e:
+                raise exception.EC2APIError(e)
+
+            public_subnet = None
+            for network in nw_list['networks']:
+                if network['contrail:fq_name'][1] == context.project_name and \
+                   network['name'].startswith('public'):
+                    public_subnet = network['id']
+
+            if public_subnet is None:
+                raise exception.EC2APIError("public network not provisioned")
+
+            req = {'name': "%s-nat" % context.project_name,
+                   'internal_net': None,
+                   'external_net': public_subnet,
+                   'tenant_id': context.project_id}
+            try:
+                subnet_rsp = neutron.create_nat_instance({'nat_instance': req})
+                return {}
+            except Exception as e:
+                raise exception.EC2APIError(e)
+
         (instances, resv_id) = self.compute_api.create(context,
             instance_type=flavors.get_flavor_by_name(
                 kwargs.get('instance_type', None)),
@@ -1302,6 +1430,7 @@ class CloudController(object):
             key_name=kwargs.get('key_name'),
             user_data=kwargs.get('user_data'),
             security_group=kwargs.get('security_group'),
+            requested_networks=networks,
             availability_zone=kwargs.get('placement', {}).get(
                                   'availability_zone'),
             block_device_mapping=kwargs.get('block_device_mapping', {}))
@@ -1370,6 +1499,23 @@ class CloudController(object):
                                                      objects=True)
         self._remove_client_token(context, instance_id)
         LOG.debug(_("Going to start terminating instances"))
+
+        #vpcapi - nat instance requested hence delete service only
+        for instance in previous_states:
+            if not 'nat' in instance['display_name']:
+                continue
+
+            # find the nat instance to delete
+            neutron = neutronv2.get_client(context)
+            try:
+                nat_instances = neutron.list_nat_instances()
+                for nat_instance in nat_instances['nat_instances']:
+                    if instance['display_name'].startswith(nat_instance['name']):
+                        neutron.delete_nat_instance(nat_instance['id'])
+                        return {'instance_id': instance['name']}
+            except Exception as e:
+                raise exception.EC2APIError(e)
+
         for instance in previous_states:
             self.compute_api.delete(context, instance)
         return self._format_terminate_instances(context,
