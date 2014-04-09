@@ -50,13 +50,12 @@ class VpcController(object):
     sent to the other nodes.
     """
     def _get_keystone_client(self, context):
-        if self.kc is None:
-            auth_url = "http://%s:5000/v2.0" % self.kc_ip
-            self.kc = keystoneclient.v2_0.client.Client(
-                token=context.auth_token,
-                username=context.user_name,
-                tenant_name=context.project_name,
-                auth_url=auth_url)
+        auth_url = "http://%s:5000/v2.0" % self.kc_ip
+        self.kc = keystoneclient.v2_0.client.Client(
+            token=context.auth_token,
+            username=context.user_name,
+            tenant_name=context.project_name,
+            auth_url=auth_url)
 
         return self.kc
 
@@ -70,12 +69,22 @@ class VpcController(object):
                     tenant_id = tenant.id
                     found = True
                     break
-            if not found:
-                raise exception.InvalidParameterValue(err='No VPC found')
         except Exception as e:
-            raise exception.EC2APIError('Keystone exception %s' % e)
+            raise exception.InvalidRequest('Keystone exception %s' % e)
+
+        if not found:
+            raise exception.InvalidParameterValue(message='No VPC found')
 
         return tenant_id
+
+    def _get_vpcid_from_tenantid(self, tenant_id, context):
+        try:
+            kc = self._get_keystone_client(context)
+            tenant = kc.tenants.get(tenant_id)
+        except Exception as e:
+            return None
+
+        return tenant.name
 
     def _get_vpcid_from_context(self, context):
         try:
@@ -87,10 +96,11 @@ class VpcController(object):
                     vpc_id = tenant.name
                     found = True
                     break
-            if not found:
-                raise exception.InvalidParameterValue(err='No VPC found')
         except Exception as e:
-            raise exception.EC2APIError('Keystone exception %s' % e)
+            raise exception.InvalidRequest('Keystone exception %s' % e)
+
+        if not found:
+            raise exception.InvalidParameterValue(err='No VPC found')
 
         return vpc_id
 
@@ -102,7 +112,7 @@ class VpcController(object):
         try:
             network_rsp = neutron.list_networks()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list nets err %s' % e)
 
         for network in network_rsp['networks']:
             if network['tenant_id'] != context.project_id:
@@ -117,9 +127,9 @@ class VpcController(object):
                     if IPNetwork(cidr) in IPNetwork(subnet['cidr']):
                         return network['name']
             except Exception as e:
-                raise exception.EC2APIError(e)
+                raise exception.InvalidRequest('Neutron list subnets err %s' % e)
 
-        raise exception.EC2APIError('Subnet for %s not found' % cidr)
+        raise exception.InvalidRequest('Subnet for %s not found' % cidr)
 
     def _create_policy_rule(self, context, kwargs):
         # parameter validation
@@ -214,32 +224,27 @@ class VpcController(object):
             raise exception.InvalidParameterValue(err='No protocol specified')
         req['protocol'] = kwargs['ip_permissions'][0]['ip_protocol']
 
-        try:
-            # check if remote security group or cidr provided
-            if 'groups' in kwargs['ip_permissions'][0]:
-                remote_group_id = \
-                    kwargs['ip_permissions'][0]['groups']['1']['group_id']
-                req['remote_group_id'] = self._get_group_uuid_from_group_id(
-                    context, remote_group_id)
+        # check if remote security group or cidr provided
+        if 'groups' in kwargs['ip_permissions'][0]:
+            remote_group_id = \
+                kwargs['ip_permissions'][0]['groups']['1']['group_id']
+            req['remote_group_id'] = self._get_group_uuid_from_group_id(
+                context, remote_group_id)
+        elif 'ip_ranges' in kwargs['ip_permissions'][0]:
+            req['remote_ip_prefix'] = \
+                kwargs['ip_permissions'][0]['ip_ranges']['1']['cidr_ip']
+        else:
+            raise exception.InvalidParameterValue(
+                err='destination subnet or group id required')
 
-            elif 'ip_ranges' in kwargs['ip_permissions'][0]:
-                req['remote_ip_prefix'] = \
-                    kwargs['ip_permissions'][0]['ip_ranges']['1']['cidr_ip']
-            else:
-                raise exception.InvalidParameterValue(
-                    err='destination subnet or group id required')
+        # check if port numbers are provided and protocol is tcp or udp
+        if req['protocol'] in ['tcp', 'udp'] and \
+                'to_port' in kwargs['ip_permissions'][0]:
+            req['port_range_min'] = \
+                kwargs['ip_permissions'][0]['from_port']
+            req['port_range_max'] = kwargs['ip_permissions'][0]['to_port']
 
-            # check if port numbers are provided and protocol is tcp or udp
-            if req['protocol'] in ['tcp', 'udp'] and \
-                    'to_port' in kwargs['ip_permissions'][0]:
-                req['port_range_min'] = \
-                    kwargs['ip_permissions'][0]['from_port']
-                req['port_range_max'] = kwargs['ip_permissions'][0]['to_port']
-
-            return req
-
-        except Exception as e:
-            raise exception.EC2APIError(e)
+        return req
 
     def _get_group_uuid_from_group_id(self, context, group_id):
         # get security group uuid from security group id
@@ -257,15 +262,14 @@ class VpcController(object):
                         group['id'][:8] == group_id.split('-')[1]):
                     foundGroup = True
                     break
-
-            if not foundGroup:
-                raise exception.InvalidParameterValue(
-                    err='No group %s found' % group_id)
-
-            return group['id']
-
         except Exception as e:
-                raise exception.EC2APIError(e)
+                raise exception.InvalidRequest('Neutron list sg err %s' % e)
+
+        if not foundGroup:
+            raise exception.InvalidParameterValue(
+                err='No group %s found' % group_id)
+
+        return group['id']
 
     def _get_rule_uuid_from_params(self, context, req):
         # check if rule with specified parameter already exists or not
@@ -284,7 +288,7 @@ class VpcController(object):
 
             return False
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list sg err %s' % e)
 
     def create_vpc(self, context, **kwargs):
         # check if cidr address mask between 16 and 28
@@ -298,7 +302,7 @@ class VpcController(object):
             kc = self._get_keystone_client(context)
             tenant_id = kc.tenants.create(tenant_name)
         except ke.ClientException as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Keystone err %s' % e)
 
         # create network-ipam for vpc
         cidr_block = kwargs['cidr_block']
@@ -323,9 +327,6 @@ class VpcController(object):
                 if create_ipam == True:
                     time.sleep(3)
 
-        # check for default security group
-        neutron.list_security_groups()
-
         # create policy and associate with vpc
         self.create_network_acl(context, vpc_id=[tenant_name], default=True)
 
@@ -338,7 +339,6 @@ class VpcController(object):
     def delete_vpc(self, context, **kwargs):
         vpc_id = kwargs['vpc_id']
         tenant_id = self._get_tenantid_from_vpcid(vpc_id, context)
-
         neutron = neutronv2.get_client(context)
         try:
             # delete default subnet
@@ -373,7 +373,7 @@ class VpcController(object):
                     neutron.delete_ipam(ipam['id'])
 
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('VPC delete err %s' % e)
 
         # delete project for the passed vpc
         try:
@@ -382,8 +382,8 @@ class VpcController(object):
             for vpc in vpc_list:
                 if vpc.name == vpc_id:
                     kc.tenants.delete(vpc)
-        except ke.ClientException as e:
-            raise exception.EC2APIError(e)
+        except Exception as e:
+            raise exception.InvalidRequest('VPC delete failed %s' % e)
 
         return {'return': 'true'}
 
@@ -397,14 +397,14 @@ class VpcController(object):
             kc = self._get_keystone_client(context)
             tenant_list = kc.tenants.list()
         except ke.ClientException as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Keystone tenat list err %s' % e)
 
         # fetch ipam list
         neutron = neutronv2.get_client(context)
         try:
             ipam_rsp = neutron.list_ipams()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list ipam err %s' % e)
 
         # list of vpcs
         vpcs = []
@@ -477,7 +477,7 @@ class VpcController(object):
         try:
             neutron.create_ipam({'ipam': req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron create ipam err %s' % e)
 
         return {'dhcpOptions': {'dhcpOptionsId': dhcp_options_id,
                                 'dhcpConfigurationSet': ''}}
@@ -491,7 +491,7 @@ class VpcController(object):
         try:
             ipam_rsp = neutron.list_ipams()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list ipam err %s' % e)
 
         # copy the dhcp options from storage ipam to vpc ipam
         foundDhcp = True if dhcp_options_id == 'default' else False
@@ -518,7 +518,7 @@ class VpcController(object):
         try:
             neutron.update_ipam(vpcIpamId, {'ipam': req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron update ipam err %s' % e)
 
         return {'return': 'true'}
 
@@ -530,14 +530,14 @@ class VpcController(object):
         try:
             ipam_rsp = neutron.list_ipams()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list ipam err %s' % e)
 
         for ipam in ipam_rsp['ipams']:
             if ipam['fq_name'][2] == dhcp_options_id:
                 try:
                     neutron.delete_ipam(ipam['id'])
                 except Exception as e:
-                    raise exception.EC2APIError(e)
+                    raise exception.InvalidRequest('Neutron delete ipam err %s' % e)
 
         return {'return': 'true'}
 
@@ -547,7 +547,7 @@ class VpcController(object):
         try:
             ipam_rsp = neutron.list_ipams()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list ipam err %s' % e)
 
         item_list = []
         for ipam in ipam_rsp['ipams']:
@@ -583,7 +583,7 @@ class VpcController(object):
         try:
             ipam_rsp = neutron.list_ipams()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list ipam err %s' % e)
 
         for ipam in ipam_rsp['ipams']:
             if ipam['fq_name'][2] == vpc_id:
@@ -626,7 +626,7 @@ class VpcController(object):
                        'vpc:route_table': route_table['fq_name']}
             net_rsp = neutron.create_network({'network': net_req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron create net err %s' % e)
 
         # set subnet for VN
         subnet_req = {'network_id': net_rsp['network']['id'],
@@ -637,7 +637,7 @@ class VpcController(object):
         try:
             neutron.create_subnet({'subnet': subnet_req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron create subnet err %s' % e)
 
         return {'subnet': {'subnetId': vn_name, 'state': 'available',
                            'vpcId': vpc_id, 'cidrBlock': cidr_block}}
@@ -650,7 +650,7 @@ class VpcController(object):
         try:
             network_rsp = neutron.list_networks()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list nets err %s' % e)
 
         for network in network_rsp['networks']:
             if not network['name'].startswith('subnet-'):
@@ -664,7 +664,7 @@ class VpcController(object):
                     neutron.delete_subnet(subnet['id'])
                 neutron.delete_network(network['id'])
             except Exception as e:
-                raise exception.EC2APIError(e)
+                raise exception.InvalidRequest('Neutron delete net err %s' % e)
 
         return {'return': 'true'}
 
@@ -673,14 +673,14 @@ class VpcController(object):
         try:
             kc = self._get_keystone_client(context)
         except kc.ClientException as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         # fetch network list
         neutron = neutronv2.get_client(context)
         try:
             network_rsp = neutron.list_networks()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest('Neutron list nets err %s' % e)
 
         # list of subnets/VNs
         subnets = []
@@ -714,7 +714,7 @@ class VpcController(object):
         try:
             ipam_rsp = neutron.list_ipams()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         for ipam in ipam_rsp['ipams']:
             if ipam['fq_name'][2] == vpc_id:
@@ -733,7 +733,7 @@ class VpcController(object):
         try:
             neutron.create_route_table({'route_table': req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'routeTable': {'route_table_id': route_table_id,
                                'vpc_id': vpc_id, 'routeSet': [{
@@ -749,33 +749,36 @@ class VpcController(object):
         try:
             # find the subnet
             net_rsp = neutron.list_networks(tenant_id=context.project_id)
-            found_net = False
-            for net in net_rsp['networks']:
-                if net['name'] == subnet_id:
-                    found_net = True
-                    break
-            if not found_net:
-                raise exception.InvalidParameterValue(err='No subnet found')
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
+        found_net = False
+        for net in net_rsp['networks']:
+            if net['name'] == subnet_id:
+                found_net = True
+                break
+        if not found_net:
+            raise exception.InvalidParameterValue(err='No subnet found')
+
+        try:
             # find the route table
             route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
-            foundRouteTable = False
-            for route_table in route_rsp['route_tables']:
-                if route_table['name'] == route_table_id:
-                    foundRouteTable = True
-                    break
-            if not foundRouteTable:
-                raise exception.InvalidParameterValue(
-                    err='No route table found')
-
-            # associate route table to subnet
-            net_req = {'vpc:route_table': route_table['fq_name']}
-            neutron.update_network(net['id'], {'network': net_req})
-            association_id = 'rtbassoc-' + net['id'][:8]
-
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
+        foundRouteTable = False
+        for route_table in route_rsp['route_tables']:
+            if route_table['name'] == route_table_id:
+                foundRouteTable = True
+                break
+        if not foundRouteTable:
+            raise exception.InvalidParameterValue(
+                err='No route table found')
+
+        # associate route table to subnet
+        net_req = {'vpc:route_table': route_table['fq_name']}
+        neutron.update_network(net['id'], {'network': net_req})
+        association_id = 'rtbassoc-' + net['id'][:8]
         return {'association_id': association_id}
 
     def disassociate_route_table(self, context, **kwargs):
@@ -785,34 +788,37 @@ class VpcController(object):
         try:
             # find the associated vn
             net_rsp = neutron.list_networks(tenant_id=context.project_id)
-            found_net = False
-            for net in net_rsp['networks']:
-                if net['id'][:8] == association_id.split('-')[1]:
-                    found_net = True
-                    break
-            if not found_net:
-                raise exception.InvalidParameterValue(err='No subnet found')
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
+        found_net = False
+        for net in net_rsp['networks']:
+            if net['id'][:8] == association_id.split('-')[1]:
+                found_net = True
+                break
+        if not found_net:
+            raise exception.InvalidParameterValue(err='No subnet found')
+
+        try:
             # find the default route table
             route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
-            foundRouteTable = False
-            for route_table in route_rsp['route_tables']:
-                if route_table['name'] == 'rtb-default' and \
-                   net['contrail:fq_name'][1] == route_table['fq_name'][1]:
-                    foundRouteTable = True
-                    break
-            if not foundRouteTable:
-                raise exception.InvalidParameterValue(
-                    err='No default route table found')
-
-            # associate default route table to vn
-            net_req = {'vpc:route_table': route_table['fq_name']}
-            neutron.update_network(net['id'], {'network': net_req})
-            association_id = 'rtbassoc-' + net['id'][:8]
-
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
+        foundRouteTable = False
+        for route_table in route_rsp['route_tables']:
+            if route_table['name'] == 'rtb-default' and \
+               net['contrail:fq_name'][1] == route_table['fq_name'][1]:
+                foundRouteTable = True
+                break
+        if not foundRouteTable:
+            raise exception.InvalidParameterValue(
+                err='No default route table found')
+
+        # associate default route table to vn
+        net_req = {'vpc:route_table': route_table['fq_name']}
+        neutron.update_network(net['id'], {'network': net_req})
+        association_id = 'rtbassoc-' + net['id'][:8]
         return {'return': 'true'}
 
     def replace_route_table_association(self, context, **kwargs):
@@ -823,33 +829,32 @@ class VpcController(object):
         try:
             # find the associated vn
             net_rsp = neutron.list_networks(tenant_id=context.project_id)
-            found_net = False
-            for net in net_rsp['networks']:
-                if net['id'][:8] == association_id.split('-')[1]:
-                    found_net = True
-                    break
-            if not found_net:
-                raise exception.InvalidParameterValue(err='No subnet found')
-
-            # find the route table
-            route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
-            foundRouteTable = False
-            for route_table in route_rsp['route_tables']:
-                if route_table['name'] == route_table_id:
-                    foundRouteTable = True
-                    break
-            if not foundRouteTable:
-                raise exception.InvalidParameterValue(
-                    err='No route table found')
-
-            # associate new route table to vn
-            net_req = {'vpc:route_table': route_table['fq_name']}
-            neutron.update_network(net['id'], {'network': net_req})
-            association_id = 'rtbassoc-' + net['id'][:8]
-
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
+        found_net = False
+        for net in net_rsp['networks']:
+            if net['id'][:8] == association_id.split('-')[1]:
+                found_net = True
+                break
+        if not found_net:
+            raise exception.InvalidParameterValue(err='No subnet found')
+
+        # find the route table
+        route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
+        foundRouteTable = False
+        for route_table in route_rsp['route_tables']:
+            if route_table['name'] == route_table_id:
+                foundRouteTable = True
+                break
+        if not foundRouteTable:
+            raise exception.InvalidParameterValue(
+                err='No route table found')
+
+        # associate new route table to vn
+        net_req = {'vpc:route_table': route_table['fq_name']}
+        neutron.update_network(net['id'], {'network': net_req})
+        association_id = 'rtbassoc-' + net['id'][:8]
         return {'new_association_id': association_id}
 
     def delete_route_table(self, context, **kwargs):
@@ -864,9 +869,8 @@ class VpcController(object):
                     # delete the specified route table
                     neutron.delete_route_table(route_table['id'])
                     break
-
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': True}
 
@@ -877,7 +881,7 @@ class VpcController(object):
             route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
             net_rsp = neutron.list_networks(tenant_id=context.project_id)
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         # formatting and filtering to display
         rt_passed = kwargs.get('route_table_id')
@@ -945,37 +949,41 @@ class VpcController(object):
         try:
             # find the route table
             route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
-            foundRouteTable = False
-            for route_table in route_rsp['route_tables']:
-                if route_table['name'] == route_table_id:
-                    foundRouteTable = True
-                    break
-            if not foundRouteTable:
-                raise exception.InvalidParameterValue(
-                    err='No route table found')
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
-            # find the route
-            foundRoute = False
-            for route in route_table['routes']:
-                if route['prefix'] == cidr:
-                    route['next_hop'] = next_hop
-                    route['next_hop_type'] = next_hop_type
-                    foundRoute = True
-                    break
+        foundRouteTable = False
+        for route_table in route_rsp['route_tables']:
+            if route_table['name'] == route_table_id:
+                foundRouteTable = True
+                break
+        if not foundRouteTable:
+            raise exception.InvalidParameterValue(
+                err='No route table found')
 
-            if not foundRoute:
-                route = {'prefix': cidr,
-                         'next_hop': next_hop,
-                         'next_hop_type': next_hop_type}
-                route_table['routes'].append(route)
+        # find the route
+        foundRoute = False
+        for route in route_table['routes']:
+            if route['prefix'] == cidr:
+                route['next_hop'] = next_hop
+                route['next_hop_type'] = next_hop_type
+                foundRoute = True
+                break
 
-            # add route to the route table
-            route_dict = {'route': route_table['routes']}
-            req = {'routes': route_dict}
+        if not foundRoute:
+            route = {'prefix': cidr,
+                     'next_hop': next_hop,
+                     'next_hop_type': next_hop_type}
+            route_table['routes'].append(route)
+
+        # add route to the route table
+        route_dict = {'route': route_table['routes']}
+        req = {'routes': route_dict}
+        try:
             route_rsp = neutron.update_route_table(route_table['id'],
                                                    {'route_table': req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': True}
 
@@ -1005,36 +1013,39 @@ class VpcController(object):
         try:
             # find the route table
             route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
-            foundRouteTable = False
-            for route_table in route_rsp['route_tables']:
-                if route_table['name'] == route_table_id:
-                    foundRouteTable = True
-                    break
-            if not foundRouteTable:
-                raise exception.InvalidParameterValue(
-                    err='No route table found')
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
-            # find the route
-            i = 0
-            foundRoute = False
-            for route in route_table['routes']:
-                if route['prefix'] == cidr:
-                    foundRoute = True
-                    break
-                i += 1
-            if not foundRoute:
-                raise exception.InvalidParameterValue(err='No route found')
+        foundRouteTable = False
+        for route_table in route_rsp['route_tables']:
+            if route_table['name'] == route_table_id:
+                foundRouteTable = True
+                break
+        if not foundRouteTable:
+            raise exception.InvalidParameterValue(
+                err='No route table found')
 
-            # replace route
-            route_table['routes'][i]['next_hop'] = next_hop
-            route_table['routes'][i]['next_hop_type'] = next_hop_type
-            route_dict = {'route': route_table['routes']}
-            req = {'routes': route_dict}
+        # find the route
+        i = 0
+        foundRoute = False
+        for route in route_table['routes']:
+            if route['prefix'] == cidr:
+                foundRoute = True
+                break
+            i += 1
+        if not foundRoute:
+            raise exception.InvalidParameterValue(err='No route found')
+
+        # replace route
+        route_table['routes'][i]['next_hop'] = next_hop
+        route_table['routes'][i]['next_hop_type'] = next_hop_type
+        route_dict = {'route': route_table['routes']}
+        req = {'routes': route_dict}
+        try:
             route_rsp = neutron.update_route_table(route_table['id'],
                                                    {'route_table': req})
-
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': True}
 
@@ -1046,35 +1057,38 @@ class VpcController(object):
         try:
             # find the route table
             route_rsp = neutron.list_route_tables(tenant_id=context.project_id)
-            foundRouteTable = False
-            for route_table in route_rsp['route_tables']:
-                if route_table['name'] == route_table_id:
-                    foundRouteTable = True
-                    break
-            if not foundRouteTable:
-                raise exception.InvalidParameterValue(
-                    err='No route table found')
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
-            # find the route
-            i = 0
-            foundRoute = False
-            for route in route_table['routes']:
-                if route['prefix'] == cidr:
-                    foundRoute = True
-                    break
-                i += 1
-            if not foundRoute:
-                raise exception.InvalidParameterValue(err='No route found')
+        foundRouteTable = False
+        for route_table in route_rsp['route_tables']:
+            if route_table['name'] == route_table_id:
+                foundRouteTable = True
+                break
+        if not foundRouteTable:
+            raise exception.InvalidParameterValue(
+                err='No route table found')
 
-            # delete route
-            route_table['routes'].pop(i)
-            route_dict = {'route': route_table['routes']}
-            req = {'routes': route_dict}
+        # find the route
+        i = 0
+        foundRoute = False
+        for route in route_table['routes']:
+            if route['prefix'] == cidr:
+                foundRoute = True
+                break
+            i += 1
+        if not foundRoute:
+            raise exception.InvalidParameterValue(err='No route found')
+
+        # delete route
+        route_table['routes'].pop(i)
+        route_dict = {'route': route_table['routes']}
+        req = {'routes': route_dict}
+        try:
             route_rsp = neutron.update_route_table(route_table['id'],
                                                    {'route_table': req})
-
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': True}
 
@@ -1137,7 +1151,7 @@ class VpcController(object):
             neutron.create_policy({'policy': policy_req})
 
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         resp = {'networkAclId': acl_id, 'vpcId': vpc_id, 'default': 'false',
                 'entrySet': [{'ruleNumber': '32767', 'protocol': 'all',
@@ -1156,30 +1170,37 @@ class VpcController(object):
         try:
             # find policy
             policys = neutron.list_policys(tenant_id=context.project_id)
-            found_policy = False
-            for pol in policys['policys']:
-                if pol['name'] == acl_id:
-                    found_policy = True
-                    break
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
+        found_policy = False
+        for pol in policys['policys']:
+            if pol['name'] == acl_id:
+                found_policy = True
+                break
+
+        try:
             # find network
             nets = neutron.list_networks(tenant_id=context.project_id)
-            found_net = False
-            for net in nets['networks']:
-                if association_id == 'aclassoc-' + net['id'][:8]:
-                    found_net = True
-                    net_req = {'contrail:policys': [pol['fq_name']]}
-                    break
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
-            if not (found_policy and found_net):
-                raise exception.InvalidParameterValue(
-                    err='No network association')
+        found_net = False
+        for net in nets['networks']:
+            if association_id == 'aclassoc-' + net['id'][:8]:
+                found_net = True
+                net_req = {'contrail:policys': [pol['fq_name']]}
+                break
 
+        if not (found_policy and found_net):
+            raise exception.InvalidParameterValue(
+                err='No network association')
+
+        try:
             # update association
             neutron.update_network(net['id'], {'network': net_req})
-
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'new_association_id': association_id}
 
@@ -1196,15 +1217,20 @@ class VpcController(object):
         neutron = neutronv2.get_client(context)
         try:
             policys = neutron.list_policys()
-            for pol in policys['policys']:
-                if pol['name'] == acl_id:
-                    break
-            if 'nets_using' in pol:
-                raise exception.InvalidParameterValue(
-                    err='Cannot delete network policy.Associeted with VN')
+        except Exception as e:
+            raise exception.InvalidRequest(e)
+
+        for pol in policys['policys']:
+            if pol['name'] == acl_id:
+                break
+        if 'nets_using' in pol:
+            raise exception.InvalidParameterValue(
+                err='Cannot delete network policy.Associeted with VN')
+
+        try:
             neutron.delete_policy(pol['id'])
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': 'true'}
 
@@ -1217,11 +1243,13 @@ class VpcController(object):
         try:
             policys = neutron.list_policys(tenant_id=context.project_id)
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         for pol in policys['policys']:
             acl = {}
             if 'acl_id' in kwargs and pol['name'] != acl_id:
+                continue
+            if not pol['name'].startswith('acl-'):
                 continue
 
             acl['vpc_id'] = pol['fq_name'][1]
@@ -1270,7 +1298,7 @@ class VpcController(object):
                 try:
                     nets = neutron.list_networks(tenant_id=context.project_id)
                 except Exception as e:
-                    raise exception.EC2APIError(e)
+                    raise exception.InvalidRequest(e)
 
                 associated_net = [net[2] for net in pol['nets_using']]
                 acl['associationSet'] = []
@@ -1318,7 +1346,7 @@ class VpcController(object):
             neutron.update_policy(pol['id'], {'policy': policy_req})
 
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': 'true'}
 
@@ -1332,29 +1360,33 @@ class VpcController(object):
         neutron = neutronv2.get_client(context)
         try:
             policys = neutron.list_policys(tenant_id=context.project_id)
-            for pol in policys['policys']:
-                if pol['name'] == acl_id:
-                    break
-            i = 0
-            found = False
-            pol_list = pol['entries']['policy_rule']
-            for rule in pol_list:
-                if rule['rule_uuid'] == rule_no:
-                    found = True
-                    break
-                i += 1
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
-            if found:
-                pol_list[i] = pol_dict['policy_rule'][0]
-                pol_list_dict = {'policy_rule': pol_list}
-            else:
-                raise exception.InvalidParameterValue(
-                    err='No matching ACL entry found')
+        for pol in policys['policys']:
+            if pol['name'] == acl_id:
+                break
+        i = 0
+        found = False
+        pol_list = pol['entries']['policy_rule']
+        for rule in pol_list:
+            if rule['rule_uuid'] == rule_no:
+                found = True
+                break
+            i += 1
 
-            policy_req = {'entries': pol_list_dict}
+        if found:
+            pol_list[i] = pol_dict['policy_rule'][0]
+            pol_list_dict = {'policy_rule': pol_list}
+        else:
+            raise exception.InvalidParameterValue(
+                err='No matching ACL entry found')
+
+        policy_req = {'entries': pol_list_dict}
+        try:
             neutron.update_policy(pol['id'], {'policy': policy_req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': 'true'}
 
@@ -1380,28 +1412,32 @@ class VpcController(object):
         neutron = neutronv2.get_client(context)
         try:
             policys = neutron.list_policys(tenant_id=context.project_id)
-            for pol in policys['policys']:
-                if pol['name'] == acl_id:
-                    break
-            i = 0
-            found = False
-            pol_list = pol['entries']['policy_rule']
-            for rule in pol_list:
-                if rule['rule_uuid'] == rule_no:
-                    found = True
-                    break
-                i += 1
-            if found:
-                pol_list.pop(i)
-                pol_list_dict = {'policy_rule': pol_list}
-            else:
-                raise exception.InvalidParameterValue(
-                    err='No matching ACL entry found')
+        except Exception as e:
+            raise exception.InvalidRequest(e)
 
-            policy_req = {'entries': pol_list_dict}
+        for pol in policys['policys']:
+            if pol['name'] == acl_id:
+                break
+        i = 0
+        found = False
+        pol_list = pol['entries']['policy_rule']
+        for rule in pol_list:
+            if rule['rule_uuid'] == rule_no:
+                found = True
+                break
+            i += 1
+        if found:
+            pol_list.pop(i)
+            pol_list_dict = {'policy_rule': pol_list}
+        else:
+            raise exception.InvalidParameterValue(
+                err='No matching ACL entry found')
+
+        policy_req = {'entries': pol_list_dict}
+        try:
             neutron.update_policy(pol['id'], {'policy': policy_req})
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': 'true'}
 
@@ -1422,7 +1458,7 @@ class VpcController(object):
             sg_id = "sg-" + group_ref['id'][0:8]
             return {'return': 'true', 'groupId': sg_id}
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
     def vpc_delete_security_group(self, context, group_name=None,
                                   group_id=None, kwargs=None):
@@ -1442,19 +1478,19 @@ class VpcController(object):
         req['security_group_id'] = \
             self._get_group_uuid_from_group_id(context, group_id)
 
-        try:
-            neutron = neutronv2.get_client(context)
-            # check if rule with specified parameters already exists
-            if not self._get_rule_uuid_from_params(context, req):
+        # check if rule with specified parameters already exists
+        if not self._get_rule_uuid_from_params(context, req):
+            try:
                 # create rule in given security group
+                neutron = neutronv2.get_client(context)
                 neutron.create_security_group_rule(
                     {'security_group_rule': req})
                 return {'return': 'true'}
-
-            exception.InvalidParameterValue(
-                'Rule for the specified parameters already exists.')
-        except Exception as e:
-            raise exception.EC2APIError(e)
+            except Exception as e:
+                raise exception.InvalidRequest(e)
+        else:
+            raise exception.SecurityGroupRuleExists(
+                message='Rule for the specified parameters already exists.')
 
     def vpc_authorize_security_group_ingress(self, context, group_name=None,
                                              group_id=None, kwargs=None):
@@ -1464,20 +1500,19 @@ class VpcController(object):
         req['security_group_id'] = \
             self._get_group_uuid_from_group_id(context, group_id)
 
-        try:
-            # check if rule with specified parameters already exists
-            if not self._get_rule_uuid_from_params(context, req):
-                neutron = neutronv2.get_client(context)
+        # check if rule with specified parameters already exists
+        if not self._get_rule_uuid_from_params(context, req):
+            try:
                 # create rule in given security group
+                neutron = neutronv2.get_client(context)
                 neutron.create_security_group_rule(
                     {'security_group_rule': req})
                 return {'return': 'true'}
-
-            raise exception.InvalidParameterValue(
-                'Rule for the specified parameters already exists.')
-
-        except Exception as e:
-            raise exception.EC2APIError(e)
+            except Exception as e:
+                raise exception.InvalidRequest(e)
+        else:
+            raise exception.SecurityGroupRuleExists(
+                message='Rule for the specified parameters already exists.')
 
     def vpc_revoke_security_group_ingress(self, context, group_name=None,
                                           group_id=None, kwargs=None):
@@ -1487,20 +1522,19 @@ class VpcController(object):
         req['security_group_id'] = \
             self._get_group_uuid_from_group_id(context, group_id)
 
-        try:
-            neutron = neutronv2.get_client(context)
-            # check if rule with specified parameter exists or not
-            rule_id = self._get_rule_uuid_from_params(context, req)
-
-            if rule_id:
+        # check if rule with specified parameter exists or not
+        rule_id = self._get_rule_uuid_from_params(context, req)
+        if rule_id:
+            try:
                 # delete the rule
+                neutron = neutronv2.get_client(context)
                 neutron.delete_security_group_rule(rule_id)
                 return {'return': 'true'}
+            except Exception as e:
+                raise exception.InvalidRequest(e)
+        else:
             raise exception.InvalidParameterValue(
-                'No rule for the specified parameters.')
-
-        except Exception as e:
-            raise exception.EC2APIError(e)
+                message='No rule for the specified parameters.')
 
     def revoke_security_group_egress(self, context, group_name=None,
                                      group_id=None, **kwargs):
@@ -1510,42 +1544,48 @@ class VpcController(object):
         req['security_group_id'] = \
             self._get_group_uuid_from_group_id(context, group_id)
 
-        try:
-            neutron = neutronv2.get_client(context)
-            # check if rule with specified parameter exists or not
-            rule_id = self._get_rule_uuid_from_params(context, req)
-            if rule_id:
+        # check if rule with specified parameter exists or not
+        rule_id = self._get_rule_uuid_from_params(context, req)
+        if rule_id:
+            try:
                 # delete the rule
+                neutron = neutronv2.get_client(context)
                 neutron.delete_security_group_rule(rule_id)
                 return {'return': 'true'}
+            except Exception as e:
+                raise exception.InvalidRequest(e)
+        else:
             raise exception.InvalidParameterValue(
-                'No rule for the specified parameters.')
+                message='No rule for the specified parameters.')
 
-        except Exception as e:
-            raise exception.EC2APIError(e)
-
-    def vpc_describe_security_groups(self, context, group_name=None,
-                                     group_id=None, kwargs=None):
+    def vpc_describe_security_groups(self, context, search_opts, 
+                                     group_name=None, group_id=None):
         neutron = neutronv2.get_client(context)
+        tenant_id = self._get_tenantid_from_vpcid(search_opts['vpc_id'],
+                                                  context)
 
         try:
-            groups = neutron.list_security_groups(
-                tenant_id=context.project_id)
+            groups = neutron.list_security_groups(tenant_id=tenant_id)
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         grps = []
         for group in groups['security_groups']:
             sg_id = "sg-" + group['id'][0:8]
             grp = {}
-            if group_name and sg_id != group_id:
+
+            if group_id and sg_id not in group_id:
                 continue
+            if group_name and group['name'] not in group_name:
+                continue
+
             kc = self._get_keystone_client(context)
             try:
                 tenant = kc.tenants.get(group['tenant_id'])
                 grp['vpcId'] = tenant.name
             except Exception as e:
-                raise exception.EC2APIError('Keystone exception %s' % e)
+                raise exception.InvalidRequest('Keystone exception %s' % e)
+
             grp['groupId'] = sg_id
             grp['groupName'] = group['name']
             grp['groupDescription'] = group['description']
@@ -1604,7 +1644,7 @@ class VpcController(object):
         try:
             nw_list = neutron.list_networks()
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         # find floating pool VN
         fip = None
@@ -1621,12 +1661,12 @@ class VpcController(object):
                 fip = fip_resp['floatingip']['floating_ip_address']
                 eip_id = 'eipalloc-' + fip_resp['floatingip']['id'][:8]
             except Exception as e:
-                raise exception.EC2APIError(e)
+                raise exception.InvalidRequest(message='public network not provisioned')
 
         if fip:
             return {'publicIp': fip, 'domain': 'vpc', 'allocationId': eip_id}
         else:
-            raise exception.EC2APIError('public network not provisioned')
+            raise exception.InvalidRequest(message='public network not provisioned')
 
     def vpc_release_address(self, context, public_ip=None, kwargs=None):
         eip_id = kwargs.get('allocation_id').split('-')[1]
@@ -1648,7 +1688,7 @@ class VpcController(object):
                 neutron.delete_floatingip(fip['id'])
                 return {'return': "true"}
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
     def vpc_associate_address(self, context, instance_id,
                               public_ip=None, kwargs=None):
@@ -1683,7 +1723,7 @@ class VpcController(object):
                 return {'return': 'true',
                         'association_id': association_id}
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
     def vpc_disassociate_address(self, context, public_ip=None, kwargs=None):
         eip_id = kwargs.get('association_id').split('-')[1]
@@ -1704,14 +1744,14 @@ class VpcController(object):
                     break
 
         if not found:
-            raise exception.InvalidParameterValue("Given value not found")
+            raise exception.InvalidParameterValue(err="Given value not found")
 
         # disassociate the floating ip
         try:
             fip_req = {'floatingip': {'port_id': None}}
             neutron.update_floatingip(fip['id'], fip_req)
         except Exception as e:
-            raise exception.EC2APIError(e)
+            raise exception.InvalidRequest(e)
 
         return {'return': "true"}
 
@@ -1733,7 +1773,7 @@ class VpcController(object):
         tenant_id = self._get_tenantid_from_vpcid(vpc_id, context)
         igw = kwargs['internet_gateway_id']
         if igw != 'igw-default':
-            raise exception.EC2APIError('Gateway should be igw-default')
+            raise exception.InvalidRequest('Gateway should be igw-default')
         return {'return': "true"}
 
     def detach_internet_gateway(self, context, **kwargs):
@@ -1741,7 +1781,7 @@ class VpcController(object):
         tenant_id = self._get_tenantid_from_vpcid(vpc_id, context)
         igw = kwargs['internet_gateway_id']
         if igw != 'igw-default':
-            raise exception.EC2APIError('Gateway should be igw-default')
+            raise exception.InvalidRequest('Gateway should be igw-default')
         return {'return': "true"}
 
     def describe_internet_gateways(self, context):
