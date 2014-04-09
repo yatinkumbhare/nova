@@ -488,12 +488,11 @@ class CloudController(vpc, object):
     def describe_security_groups(self, context, group_name=None, group_id=None,
                                  **kwargs):
         #vpcapi - handle vpc case
-        if cfg.CONF.security_group_api.lower() in ('quantum', 'neutron'):
-            resp = vpc.vpc_describe_security_groups(self, context,
-                          group_name, group_id, kwargs)
-            return resp
-
         search_opts = ec2utils.search_opts_from_filters(kwargs.get('filter'))
+        if 'vpc_id' in search_opts:
+            resp = vpc.vpc_describe_security_groups(self, context, search_opts,
+                                                    group_name, group_id)
+            return resp
 
         raw_groups = self.security_group_api.list(context,
                                                   group_name,
@@ -1198,6 +1197,10 @@ class CloudController(vpc, object):
             i['ipAddress'] = floating_ip or fixed_ip
             i['dnsName'] = i['publicDnsName'] or i['privateDnsName']
             i['keyName'] = instance['key_name']
+
+            vpc_id = vpc._get_vpcid_from_tenantid(self, instance['project_id'], context)
+            if vpc_id:
+                i['vpcId'] = vpc_id
 
             if context.is_admin:
                 i['keyName'] = '%s (%s, %s)' % (i['keyName'],
