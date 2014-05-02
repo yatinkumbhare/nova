@@ -113,6 +113,9 @@ compute_opts = [
     cfg.IntOpt('network_allocate_retries',
                default=0,
                help="Number of times to retry network allocation on failures"),
+    cfg.StrOpt('storage_scope',
+               default='local',
+               help='whether instances are stored on shared or local storage'),
     ]
 
 interval_opts = [
@@ -3946,8 +3949,8 @@ class ComputeManager(manager.SchedulerDependentManager):
                                                               dest_check_data)
         finally:
             self.driver.check_can_live_migrate_destination_cleanup(ctxt,
-                    dest_check_data)
-        if 'migrate_data' in dest_check_data:
+                    dest_check_data, instance)
+        if dest_check_data and 'migrate_data' in dest_check_data:
             migrate_data.update(dest_check_data['migrate_data'])
         return migrate_data
 

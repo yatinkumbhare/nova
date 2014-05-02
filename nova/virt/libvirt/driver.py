@@ -2310,6 +2310,19 @@ class LibvirtDriver(driver.ComputeDriver):
         libvirt_utils.write_to_file(
             self._get_console_log_path(instance), '', 7)
 
+        if CONF.storage_scope.lower() == "global":
+            interpath = "global"
+        else:
+            interpath = None
+        if len(instance['metadata']) > 0:
+            ins_meta = utils.instance_meta(instance)
+            for key,value in ins_meta.items():
+                if key.lower() == 'storage_scope':
+                    if value.lower() == 'global':
+                        interpath = "global"
+                    else:
+                        interpath = None
+                    break
         if not disk_images:
             disk_images = {'image_id': instance['image_ref'],
                            'kernel_id': instance['kernel_id'],
@@ -2320,6 +2333,7 @@ class LibvirtDriver(driver.ComputeDriver):
             raw('kernel').cache(fetch_func=libvirt_utils.fetch_image,
                                 context=context,
                                 filename=fname,
+                                interpath=interpath,
                                 image_id=disk_images['kernel_id'],
                                 user_id=instance['user_id'],
                                 project_id=instance['project_id'])
@@ -2328,6 +2342,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 raw('ramdisk').cache(fetch_func=libvirt_utils.fetch_image,
                                      context=context,
                                      filename=fname,
+                                     interpath=interpath,
                                      image_id=disk_images['ramdisk_id'],
                                      user_id=instance['user_id'],
                                      project_id=instance['project_id'])
@@ -2347,6 +2362,7 @@ class LibvirtDriver(driver.ComputeDriver):
             image('disk').cache(fetch_func=libvirt_utils.fetch_image,
                                 context=context,
                                 filename=root_fname,
+                                interpath=interpath,
                                 size=size,
                                 image_id=disk_images['image_id'],
                                 user_id=instance['user_id'],
@@ -2366,6 +2382,7 @@ class LibvirtDriver(driver.ComputeDriver):
             size = ephemeral_gb * 1024 * 1024 * 1024
             image('disk.local').cache(fetch_func=fn,
                                       filename=fname,
+                                      interpath=interpath,
                                       size=size,
                                       ephemeral_size=ephemeral_gb)
 
@@ -2379,6 +2396,7 @@ class LibvirtDriver(driver.ComputeDriver):
             image(blockinfo.get_eph_disk(idx)).cache(
                 fetch_func=fn,
                 filename=fname,
+                interpath=interpath,
                 size=size,
                 ephemeral_size=eph['size'])
 
@@ -2398,6 +2416,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 size = swap_mb * 1024 * 1024
                 image('disk.swap').cache(fetch_func=self._create_swap,
                                          filename="swap_%s" % swap_mb,
+                                         interpath=interpath,
                                          size=size,
                                          swap_mb=swap_mb)
 
@@ -3778,7 +3797,7 @@ class LibvirtDriver(driver.ComputeDriver):
         self._compare_cpu(source_cpu_info)
 
         # Create file on storage, to be checked on source host
-        filename = self._create_shared_storage_test_file()
+        filename = self._create_shared_storage_test_file(instance)
 
         return {"filename": filename,
                 "block_migration": block_migration,
@@ -3786,13 +3805,14 @@ class LibvirtDriver(driver.ComputeDriver):
                 "disk_available_mb": disk_available_mb}
 
     def check_can_live_migrate_destination_cleanup(self, context,
-                                                   dest_check_data):
+                                                   dest_check_data,
+						   instance):
         """Do required cleanup on dest host after check_can_live_migrate calls
 
         :param context: security context
         """
         filename = dest_check_data["filename"]
-        self._cleanup_shared_storage_test_file(filename)
+        self._cleanup_shared_storage_test_file(filename, instance)
 
     def check_can_live_migrate_source(self, context, instance,
                                       dest_check_data):
@@ -3815,7 +3835,7 @@ class LibvirtDriver(driver.ComputeDriver):
         has_local_disks = bool(
                 jsonutils.loads(self.get_instance_disk_info(instance['name'])))
 
-        shared = self._check_shared_storage_test_file(filename)
+        shared = self._check_shared_storage_test_file(filename, instance)
 
         if block_migration:
             if shared:
@@ -3923,9 +3943,20 @@ class LibvirtDriver(driver.ComputeDriver):
             LOG.error(m, {'ret': ret, 'u': u})
             raise exception.InvalidCPUInfo(reason=m % {'ret': ret, 'u': u})
 
-    def _create_shared_storage_test_file(self):
+    def _create_shared_storage_test_file(self, instance):
         """Makes tmpfile under CONF.instances_path."""
         dirpath = CONF.instances_path
+        if CONF.storage_scope.lower() == "global":
+            dirpath = os.path.join(CONF.instances_path, "global")
+        if len(instance['metadata']) > 0:
+            ins_meta = utils.instance_meta(instance)
+            for key,value in ins_meta.items():
+                if key.lower() == 'storage_scope':
+                    if value.lower() == 'global':
+                        dirpath = os.path.join(CONF.instances_path, "global")
+                    else:
+                        dirpath = CONF.instances_path
+                    break
         fd, tmp_file = tempfile.mkstemp(dir=dirpath)
         LOG.debug(_("Creating tmpfile %s to notify to other "
                     "compute nodes that they should mount "
@@ -3933,20 +3964,45 @@ class LibvirtDriver(driver.ComputeDriver):
         os.close(fd)
         return os.path.basename(tmp_file)
 
-    def _check_shared_storage_test_file(self, filename):
+    def _check_shared_storage_test_file(self, filename, instance):
         """Confirms existence of the tmpfile under CONF.instances_path.
+        Cannot confirm tmpfile return False."""
+        shared = False
+        if CONF.storage_scope.lower() == "global":
+            shared = True
+        if len(instance['metadata']) > 0:
+            ins_meta = utils.instance_meta(instance)
+            for key,value in ins_meta.items():
+                if key.lower() == 'storage_scope':
+                    if value.lower() == 'global':
+                        shared = True
+                    else:
+                        shared = False
+                    break
 
-        Cannot confirm tmpfile return False.
-        """
-        tmp_file = os.path.join(CONF.instances_path, filename)
+        if not shared:
+            return  False
+        tmp_file = os.path.join(CONF.instances_path, "global", filename)
         if not os.path.exists(tmp_file):
             return False
         else:
             return True
 
-    def _cleanup_shared_storage_test_file(self, filename):
+    def _cleanup_shared_storage_test_file(self, filename, instance):
         """Removes existence of the tmpfile under CONF.instances_path."""
-        tmp_file = os.path.join(CONF.instances_path, filename)
+        dirpath = CONF.instances_path
+        if CONF.storage_scope.lower() == "global":
+            dirpath = os.path.join(CONF.instances_path, "global")
+        if len(instance['metadata']) > 0:
+            ins_meta = utils.instance_meta(instance)
+            for key,value in ins_meta.items():
+                if key.lower() == 'storage_scope':
+                    if value.lower() == 'global':
+                        dirpath = os.path.join(CONF.instances_path, "global")
+                    else:
+                        dirpath = CONF.instances_path
+                    break
+        tmp_file = os.path.join(dirpath, filename)
         os.remove(tmp_file)
 
     def ensure_filtering_rules_for_instance(self, instance, network_info,
@@ -4187,6 +4243,19 @@ class LibvirtDriver(driver.ComputeDriver):
             elif info['backing_file']:
                 # Creating backing file follows same way as spawning instances.
                 cache_name = os.path.basename(info['backing_file'])
+            if CONF.storage_scope.lower() == "global":
+                interpath = "global"
+            else:
+                interpath = None
+            if len(instance['metadata']) > 0:
+                ins_meta = utils.instance_meta(instance)
+                for key,value in ins_meta.items():
+                    if key.lower() == 'storage_scope':
+                        if value.lower() == 'global':
+                            interpath = "global"
+                        else:
+                            interpath = None
+                        break
 
                 image = self.image_backend.image(instance,
                                                  instance_disk,
@@ -4194,6 +4263,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 image.cache(fetch_func=libvirt_utils.fetch_image,
                             context=context,
                             filename=cache_name,
+                            interpath=interpath,
                             image_id=instance['image_ref'],
                             user_id=instance['user_id'],
                             project_id=instance['project_id'],
