@@ -582,7 +582,7 @@ class Backend(object):
         backend = self.backend(image_type)
         return backend(instance=instance, disk_name=disk_name)
 
-    def snapshot(self, disk_path, snapshot_name, image_type=None):
+    def snapshot(self, disk_path, snapshot_name, instance, image_type=None):
         """Returns snapshot for given image
 
         :path: path to image
@@ -590,4 +590,4 @@ class Backend(object):
         :image_type: type of image
         """
         backend = self.backend(image_type)
-        return backend(path=disk_path, snapshot_name=snapshot_name)
+        return backend(instance, path=disk_path, snapshot_name=snapshot_name)

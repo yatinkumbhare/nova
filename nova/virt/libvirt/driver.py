@@ -1373,6 +1373,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         snapshot_backend = self.image_backend.snapshot(disk_path,
                 snapshot_name,
+                instance=instance,
                 image_type=source_format)
 
         if live_snapshot:
