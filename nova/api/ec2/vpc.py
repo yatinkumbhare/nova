@@ -676,6 +676,7 @@ class VpcController(object):
             raise exception.InvalidRequest(e)
 
         # fetch network list
+        vpc_id = self._get_vpcid_from_context(context)
         neutron = neutronv2.get_client(context)
         try:
             network_rsp = neutron.list_networks()
@@ -688,13 +689,21 @@ class VpcController(object):
             if not network['name'].startswith('subnet-'):
                 continue
 
-            if 'contrail:subnet_ipam' not in network:
+            if (vpc_id != self._get_vpcid_from_tenantid(network['tenant_id'],
+                                                        context)):
                 continue
 
-            cidr_block = network['contrail:subnet_ipam'][0]['subnet_cidr']
+            try:
+                subnets_rsp = neutron.list_subnets(
+                    network_id=network['id'])
+            except Exception as e:
+                continue
+
+            # get vpc id
+            cidr_block = subnets_rsp['subnets'][0]['cidr']
             item = {'subnetId': network['name'],
                     'state': 'available',
-                    'vpcId': network['contrail:fq_name'][1],
+                    'vpcId': vpc_id,
                     'cidrBlock': cidr_block}
             subnets.append(item)
 
@@ -1640,6 +1649,7 @@ class VpcController(object):
         return address
 
     def vpc_allocate_address(self, context, kwargs):
+        vpc_id = self._get_vpcid_from_context(context)
         neutron = neutronv2.get_client(context)
         try:
             nw_list = neutron.list_networks()
@@ -1650,6 +1660,10 @@ class VpcController(object):
         fip = None
         for nw in nw_list['networks']:
             if nw['name'] != 'public':
+                continue
+
+            if ('admin' != self._get_vpcid_from_tenantid(nw['tenant_id'],
+                                                         context)):
                 continue
 
             # allocate floating ip
