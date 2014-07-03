@@ -17,5 +17,8 @@
 """
 # NOTE(sdague) for nicer compute_driver specification
 from nova.virt.vmwareapi import driver
+from nova.virt.vmwareapi import contrail
 
+VMwareESXDriver = driver.VMwareESXDriver
+ContrailESXDriver = contrail.ContrailESXDriver
 VMwareVCDriver = driver.VMwareVCDriver
