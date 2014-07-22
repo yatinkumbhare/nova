@@ -50,14 +50,21 @@ class VpcController(object):
     sent to the other nodes.
     """
     def _get_keystone_client(self, context):
+        if 'context.project_name' in self.kc:
+            try:
+                self.kc['context.project_name'].tenants.list()
+                return self.kc['context.project_name']
+            except Exception as e:
+                pass
+
         auth_url = "http://%s:5000/v2.0" % self.kc_ip
-        self.kc = keystoneclient.v2_0.client.Client(
+        self.kc['context.project_name'] = keystoneclient.v2_0.client.Client(
             token=context.auth_token,
             username=context.user_name,
             tenant_name=context.project_name,
             auth_url=auth_url)
 
-        return self.kc
+        return self.kc['context.project_name']
 
     def _get_tenantid_from_vpcid(self, vpc_id, context):
         try:
@@ -344,7 +351,7 @@ class VpcController(object):
             # delete default subnet
             nets = neutron.list_networks()
             for net in nets['networks']:
-                if net['contrail:fq_name'][1] == vpc_id:
+                if net['tenant_id'] == tenant_id:
                     neutron.delete_network(net['id'])
 
             # delete default route table
@@ -382,6 +389,7 @@ class VpcController(object):
             for vpc in vpc_list:
                 if vpc.name == vpc_id:
                     kc.tenants.delete(vpc)
+                    del self.kc['context.project_name']
         except Exception as e:
             raise exception.InvalidRequest('VPC delete failed %s' % e)
 
