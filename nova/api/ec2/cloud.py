@@ -238,7 +238,7 @@ class CloudController(vpc, object):
         self.servicegroup_api = servicegroup.API()
 
         #keystone client
-        self.kc = None
+        self.kc = {}
         self.kc_ip = CONF.my_ip
 
     def __str__(self):
