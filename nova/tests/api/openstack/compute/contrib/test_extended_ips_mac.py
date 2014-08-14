@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
 #
@@ -21,6 +19,7 @@ import webob
 from nova.api.openstack.compute.contrib import extended_ips_mac
 from nova.api.openstack import xmlutil
 from nova import compute
+from nova import objects
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova import test
@@ -108,7 +107,7 @@ def fake_compute_get_all(*args, **kwargs):
     ]
     fields = instance_obj.INSTANCE_DEFAULT_FIELDS
     return instance_obj._make_instance_list(args[1],
-                                            instance_obj.InstanceList(),
+                                            objects.InstanceList(),
                                             db_list, fields)
 
 

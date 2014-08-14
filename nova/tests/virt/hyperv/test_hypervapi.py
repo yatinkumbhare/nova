@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #  Copyright 2012 Cloudbase Solutions Srl
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -18,14 +16,16 @@
 Test suite for the Hyper-V driver and related APIs.
 """
 
+import contextlib
 import io
-import mox
 import os
 import platform
 import shutil
 import time
 import uuid
 
+import mock
+import mox
 from oslo.config import cfg
 
 from nova.api.metadata import base as instance_metadata
@@ -34,15 +34,16 @@ from nova.compute import task_states
 from nova import context
 from nova import db
 from nova import exception
+from nova.i18n import _
 from nova.image import glance
-from nova.openstack.common.gettextutils import _
+from nova.openstack.common import units
 from nova import test
 from nova.tests import fake_network
 from nova.tests.image import fake as fake_image
 from nova.tests import matchers
 from nova.tests.virt.hyperv import db_fakes
 from nova.tests.virt.hyperv import fake
-from nova import unit
+from nova.tests.virt import test_driver
 from nova import utils
 from nova.virt import configdrive
 from nova.virt import driver
@@ -54,11 +55,13 @@ from nova.virt.hyperv import livemigrationutils
 from nova.virt.hyperv import networkutils
 from nova.virt.hyperv import networkutilsv2
 from nova.virt.hyperv import pathutils
+from nova.virt.hyperv import rdpconsoleutils
 from nova.virt.hyperv import utilsfactory
 from nova.virt.hyperv import vhdutils
 from nova.virt.hyperv import vhdutilsv2
 from nova.virt.hyperv import vmutils
 from nova.virt.hyperv import vmutilsv2
+from nova.virt.hyperv import volumeops
 from nova.virt.hyperv import volumeutils
 from nova.virt.hyperv import volumeutilsv2
 from nova.virt import images
@@ -67,15 +70,15 @@ CONF = cfg.CONF
 CONF.import_opt('vswitch_name', 'nova.virt.hyperv.vif', 'hyperv')
 
 
-class HyperVAPITestCase(test.NoDBTestCase):
-    """Unit tests for Hyper-V driver calls."""
+class HyperVAPIBaseTestCase(test.NoDBTestCase):
+    """Base unit tests class for Hyper-V driver calls."""
 
     def __init__(self, test_case_name):
         self._mox = mox.Mox()
-        super(HyperVAPITestCase, self).__init__(test_case_name)
+        super(HyperVAPIBaseTestCase, self).__init__(test_case_name)
 
     def setUp(self):
-        super(HyperVAPITestCase, self).setUp()
+        super(HyperVAPIBaseTestCase, self).setUp()
 
         self._user_id = 'fake'
         self._project_id = 'fake'
@@ -131,10 +134,6 @@ class HyperVAPITestCase(test.NoDBTestCase):
             pass
         self.stubs.Set(time, 'sleep', fake_sleep)
 
-        def fake_vmutils__init__(self, host='.'):
-            pass
-        vmutils.VMUtils.__init__ = fake_vmutils__init__
-
         self.stubs.Set(pathutils, 'PathUtils', fake.PathUtils)
         self._mox.StubOutWithMock(fake.PathUtils, 'open')
         self._mox.StubOutWithMock(fake.PathUtils, 'copyfile')
@@ -161,7 +160,7 @@ class HyperVAPITestCase(test.NoDBTestCase):
         self._mox.StubOutWithMock(vmutils.VMUtils, 'set_nic_connection')
         self._mox.StubOutWithMock(vmutils.VMUtils, 'get_vm_scsi_controller')
         self._mox.StubOutWithMock(vmutils.VMUtils, 'get_vm_ide_controller')
-        self._mox.StubOutWithMock(vmutils.VMUtils, 'get_attached_disks_count')
+        self._mox.StubOutWithMock(vmutils.VMUtils, 'get_attached_disks')
         self._mox.StubOutWithMock(vmutils.VMUtils,
                                   'attach_volume_to_controller')
         self._mox.StubOutWithMock(vmutils.VMUtils,
@@ -172,6 +171,7 @@ class HyperVAPITestCase(test.NoDBTestCase):
                                   'get_controller_volume_paths')
         self._mox.StubOutWithMock(vmutils.VMUtils,
                                   'enable_vm_metrics_collection')
+        self._mox.StubOutWithMock(vmutils.VMUtils, 'get_vm_id')
 
         self._mox.StubOutWithMock(vhdutils.VHDUtils, 'create_differencing_vhd')
         self._mox.StubOutWithMock(vhdutils.VHDUtils, 'reconnect_parent_vhd')
@@ -230,6 +230,9 @@ class HyperVAPITestCase(test.NoDBTestCase):
         self._mox.StubOutWithMock(volumeutilsv2.VolumeUtilsV2,
                                   'execute_log_out')
 
+        self._mox.StubOutWithMock(rdpconsoleutils.RDPConsoleUtils,
+                                  'get_rdp_console_port')
+
         self._mox.StubOutClassWithMocks(instance_metadata, 'InstanceMetadata')
         self._mox.StubOutWithMock(instance_metadata.InstanceMetadata,
                                   'metadata_for_config_drive')
@@ -242,7 +245,15 @@ class HyperVAPITestCase(test.NoDBTestCase):
 
     def tearDown(self):
         self._mox.UnsetStubs()
-        super(HyperVAPITestCase, self).tearDown()
+        super(HyperVAPIBaseTestCase, self).tearDown()
+
+
+class HyperVAPITestCase(HyperVAPIBaseTestCase,
+                        test_driver.DriverAPITestHelper):
+    """Unit tests for Hyper-V driver calls."""
+
+    def test_public_api_signatures(self):
+        self.assertPublicAPISignatures(self._conn)
 
     def test_get_available_resource(self):
         cpu_info = {'Architecture': 'fake',
@@ -278,12 +289,12 @@ class HyperVAPITestCase(test.NoDBTestCase):
 
         self.assertEqual(dic['vcpus'], cpu_info['NumberOfLogicalProcessors'])
         self.assertEqual(dic['hypervisor_hostname'], platform.node())
-        self.assertEqual(dic['memory_mb'], tot_mem_kb / unit.Ki)
+        self.assertEqual(dic['memory_mb'], tot_mem_kb / units.Ki)
         self.assertEqual(dic['memory_mb_used'],
-                         tot_mem_kb / unit.Ki - free_mem_kb / unit.Ki)
-        self.assertEqual(dic['local_gb'], tot_hdd_b / unit.Gi)
+                         tot_mem_kb / units.Ki - free_mem_kb / units.Ki)
+        self.assertEqual(dic['local_gb'], tot_hdd_b / units.Gi)
         self.assertEqual(dic['local_gb_used'],
-                         tot_hdd_b / unit.Gi - free_hdd_b / unit.Gi)
+                         tot_hdd_b / units.Gi - free_hdd_b / units.Gi)
         self.assertEqual(dic['hypervisor_version'],
                          windows_version.replace('.', ''))
         self.assertEqual(dic['supported_instances'],
@@ -379,9 +390,9 @@ class HyperVAPITestCase(test.NoDBTestCase):
         self._test_spawn_instance(False, vhd_format=constants.DISK_FORMAT_VHDX)
 
     def _setup_spawn_config_drive_mocks(self, use_cdrom):
-        im = instance_metadata.InstanceMetadata(mox.IgnoreArg(),
-                                                content=mox.IsA(list),
-                                                extra_md=mox.IsA(dict))
+        instance_metadata.InstanceMetadata(mox.IgnoreArg(),
+                                           content=mox.IsA(list),
+                                           extra_md=mox.IsA(dict))
 
         m = fake.PathUtils.get_instance_dir(mox.IsA(str))
         m.AndReturn(self._test_instance_dir)
@@ -413,7 +424,7 @@ class HyperVAPITestCase(test.NoDBTestCase):
                                              mox.IsA(str))
         m.WithSideEffects(self._add_ide_disk)
 
-    def _test_spawn_config_drive(self, use_cdrom):
+    def _test_spawn_config_drive(self, use_cdrom, format_error=False):
         self.flags(force_config_drive=True)
         self.flags(config_drive_cdrom=use_cdrom, group='hyperv')
         self.flags(mkisofs_cmd='mkisofs.exe')
@@ -425,13 +436,24 @@ class HyperVAPITestCase(test.NoDBTestCase):
             expected_ide_disks = 2
             expected_ide_dvds = 0
 
-        self._test_spawn_instance(expected_ide_disks=expected_ide_disks,
-                                  expected_ide_dvds=expected_ide_dvds,
-                                  config_drive=True,
-                                  use_cdrom=use_cdrom)
+        if format_error:
+            self.assertRaises(vmutils.UnsupportedConfigDriveFormatException,
+                              self._test_spawn_instance,
+                              with_exception=True,
+                              config_drive=True,
+                              use_cdrom=use_cdrom)
+        else:
+            self._test_spawn_instance(expected_ide_disks=expected_ide_disks,
+                                      expected_ide_dvds=expected_ide_dvds,
+                                      config_drive=True,
+                                      use_cdrom=use_cdrom)
 
     def test_spawn_config_drive(self):
         self._test_spawn_config_drive(False)
+
+    def test_spawn_config_drive_format_error(self):
+        CONF.set_override('config_drive_format', 'wrong_format')
+        self._test_spawn_config_drive(True, True)
 
     def test_spawn_config_drive_cdrom(self):
         self._test_spawn_config_drive(True)
@@ -469,8 +491,8 @@ class HyperVAPITestCase(test.NoDBTestCase):
             else:
                 vswitch_conn_data = fake_vswitch_path
 
-            vmutils.VMUtils.set_nic_connection(mox.IsA(str), mox.IsA(str),
-                                               vswitch_conn_data)
+            vmutils.VMUtils.set_nic_connection(mox.IsA(str),
+                    mox.IsA(str), vswitch_conn_data)
 
         self._test_spawn_instance(setup_vif_mocks_func=setup_vif_mocks)
 
@@ -640,7 +662,6 @@ class HyperVAPITestCase(test.NoDBTestCase):
         dest_server = 'fake_server'
 
         instance_data = self._get_instance_data()
-        instance_name = instance_data['name']
 
         fake_post_method = self._mox.CreateMockAnything()
         if not test_failure and not unsupported_os:
@@ -652,16 +673,9 @@ class HyperVAPITestCase(test.NoDBTestCase):
             fake_recover_method(self._context, instance_data, dest_server,
                                 False)
 
-        fake_ide_controller_path = 'fakeide'
-        fake_scsi_controller_path = 'fakescsi'
-
         if with_volumes:
-            fake_scsi_disk_path = 'fake_scsi_disk_path'
             fake_target_iqn = 'fake_target_iqn'
             fake_target_lun = 1
-            fake_scsi_paths = {0: fake_scsi_disk_path}
-        else:
-            fake_scsi_paths = {}
 
         if not unsupported_os:
             m = livemigrationutils.LiveMigrationUtils.live_migrate_vm(
@@ -840,9 +854,9 @@ class HyperVAPITestCase(test.NoDBTestCase):
                             func_call_matcher.call)
         self._mox.VerifyAll()
 
-        self.assertTrue(self._image_metadata and
-                        "disk_format" in self._image_metadata and
-                        self._image_metadata["disk_format"] == "vhd")
+        self.assertTrue(self._image_metadata)
+        self.assertIn("disk_format", self._image_metadata)
+        self.assertEqual("vhd", self._image_metadata["disk_format"])
 
         # Assert states changed in correct order
         self.assertIsNone(func_call_matcher.match())
@@ -926,8 +940,8 @@ class HyperVAPITestCase(test.NoDBTestCase):
             self._mock_attach_volume(mox.Func(self._check_vm_name), target_iqn,
                                      target_lun, target_portal, True)
 
-        vmutils.VMUtils.create_nic(mox.Func(self._check_vm_name), mox.IsA(str),
-                                   mox.IsA(str)).InAnyOrder()
+        vmutils.VMUtils.create_nic(mox.Func(self._check_vm_name),
+                mox.IsA(str), mox.IsA(unicode)).InAnyOrder()
 
         if setup_vif_mocks_func:
             setup_vif_mocks_func()
@@ -975,7 +989,8 @@ class HyperVAPITestCase(test.NoDBTestCase):
                 mox.IsA(str), mox.IsA(object))
             m.AndReturn(1025)
 
-            vhdutils.VHDUtils.resize_vhd(mox.IsA(str), mox.IsA(object))
+            vhdutils.VHDUtils.resize_vhd(mox.IsA(str), mox.IsA(object),
+                                         is_file_max_size=False)
 
     def _setup_spawn_instance_mocks(self, cow, setup_vif_mocks_func=None,
                                     with_exception=False,
@@ -1003,19 +1018,30 @@ class HyperVAPITestCase(test.NoDBTestCase):
             m.AndReturn(self._test_instance_dir)
 
             self._setup_get_cached_image_mocks(cow, vhd_format)
+            m = vhdutils.VHDUtils.get_vhd_info(mox.IsA(str))
+            m.AndReturn({'MaxInternalSize': 1024, 'FileSize': 1024,
+                         'Type': 2})
 
             if cow:
-                vhdutils.VHDUtils.create_differencing_vhd(mox.IsA(str),
-                                                          mox.IsA(str))
+                m = vhdutils.VHDUtils.get_vhd_format(mox.IsA(str))
+                m.AndReturn(vhd_format)
+                if vhd_format == constants.DISK_FORMAT_VHD:
+                    vhdutils.VHDUtils.create_differencing_vhd(mox.IsA(str),
+                                                              mox.IsA(str))
+                else:
+                    m = vhdutils.VHDUtils.get_internal_vhd_size_by_file_size(
+                        mox.IsA(str), mox.IsA(object))
+                    m.AndReturn(1025)
+                    vhdutils.VHDUtils.create_differencing_vhd(mox.IsA(str),
+                                                              mox.IsA(str),
+                                                              mox.IsA(int))
             else:
                 fake.PathUtils.copyfile(mox.IsA(str), mox.IsA(str))
-                m = vhdutils.VHDUtils.get_vhd_info(mox.IsA(str))
-                m.AndReturn({'MaxInternalSize': 1024, 'FileSize': 1024,
-                             'Type': 2})
                 m = vhdutils.VHDUtils.get_internal_vhd_size_by_file_size(
                     mox.IsA(str), mox.IsA(object))
                 m.AndReturn(1025)
-                vhdutils.VHDUtils.resize_vhd(mox.IsA(str), mox.IsA(object))
+                vhdutils.VHDUtils.resize_vhd(mox.IsA(str), mox.IsA(object),
+                                             is_file_max_size=False)
 
         self._setup_check_admin_permissions_mocks(
                                           admin_permissions=admin_permissions)
@@ -1030,7 +1056,7 @@ class HyperVAPITestCase(test.NoDBTestCase):
                                           block_device_info,
                                           ephemeral_storage=ephemeral_storage)
 
-        if config_drive:
+        if config_drive and not with_exception:
             self._setup_spawn_config_drive_mocks(use_cdrom)
 
         # TODO(alexpilotti) Based on where the exception is thrown
@@ -1101,6 +1127,8 @@ class HyperVAPITestCase(test.NoDBTestCase):
         fake_mounted_disk = "fake_mounted_disk"
         fake_device_number = 0
         fake_controller_path = 'fake_scsi_controller_path'
+        self._mox.StubOutWithMock(self._conn._volumeops,
+                                  '_get_free_controller_slot')
 
         self._mock_login_storage_target(target_iqn, target_lun,
                                         target_portal,
@@ -1120,7 +1148,8 @@ class HyperVAPITestCase(test.NoDBTestCase):
             m.AndReturn(fake_controller_path)
 
             fake_free_slot = 1
-            m = vmutils.VMUtils.get_attached_disks_count(fake_controller_path)
+            m = self._conn._volumeops._get_free_controller_slot(
+                fake_controller_path)
             m.AndReturn(fake_free_slot)
 
         m = vmutils.VMUtils.attach_volume_to_controller(instance_name,
@@ -1246,7 +1275,6 @@ class HyperVAPITestCase(test.NoDBTestCase):
                                           boot_from_volume=False):
         fake_mounted_disk = "fake_mounted disk"
         fake_device_number = 0
-        fake_controller_path = "fake_scsi_controller_path"
 
         self._mock_login_storage_target(target_iqn, target_lun,
                                        target_portal,
@@ -1257,7 +1285,7 @@ class HyperVAPITestCase(test.NoDBTestCase):
                                                    fake_mounted_disk,
                                                    fake_device_number)
 
-        m = volumeutils.VolumeUtils.logout_storage_target(target_iqn)
+        volumeutils.VolumeUtils.logout_storage_target(target_iqn)
 
     def test_attach_volume_logout(self):
         instance_data = self._get_instance_data()
@@ -1287,7 +1315,7 @@ class HyperVAPITestCase(test.NoDBTestCase):
         mount_point = '/dev/sdc'
 
         def fake_login_storage_target(connection_info):
-            raise Exception('Fake connection exception')
+            raise vmutils.HyperVException('Fake connection exception')
 
         self.stubs.Set(self._conn._volumeops, '_login_storage_target',
                        fake_login_storage_target)
@@ -1295,8 +1323,6 @@ class HyperVAPITestCase(test.NoDBTestCase):
                           None, connection_info, instance_data, mount_point)
 
     def _mock_detach_volume(self, target_iqn, target_lun):
-        mount_point = '/dev/sdc'
-
         fake_mounted_disk = "fake_mounted_disk"
         fake_device_number = 0
         m = volumeutils.VolumeUtils.get_device_number_for_target(target_iqn,
@@ -1313,14 +1339,14 @@ class HyperVAPITestCase(test.NoDBTestCase):
 
     def test_detach_volume(self):
         instance_data = self._get_instance_data()
-        instance_name = instance_data['name']
+        self.assertIn('name', instance_data)
 
         connection_info = db_fakes.get_fake_volume_info_data(
             self._volume_target_portal, self._volume_id)
         data = connection_info['data']
         target_lun = data['target_lun']
         target_iqn = data['target_iqn']
-        target_portal = data['target_portal']
+        self.assertIn('target_portal', data)
 
         mount_point = '/dev/sdc'
 
@@ -1482,7 +1508,39 @@ class HyperVAPITestCase(test.NoDBTestCase):
                           flavor, network_info)
         self._mox.VerifyAll()
 
-    def _test_finish_migration(self, power_on, ephemeral_storage=False):
+    def _mock_attach_config_drive(self, instance, config_drive_format):
+        instance['config_drive'] = True
+        self._mox.StubOutWithMock(fake.PathUtils, 'lookup_configdrive_path')
+        m = fake.PathUtils.lookup_configdrive_path(
+            mox.Func(self._check_instance_name))
+
+        if config_drive_format in constants.DISK_FORMAT_MAP:
+            m.AndReturn(self._test_instance_dir + '/configdrive.' +
+                        config_drive_format)
+        else:
+            m.AndReturn(None)
+
+        m = vmutils.VMUtils.attach_ide_drive(
+            mox.Func(self._check_instance_name),
+            mox.IsA(str),
+            mox.IsA(int),
+            mox.IsA(int),
+            mox.IsA(str))
+        m.WithSideEffects(self._add_ide_disk).InAnyOrder()
+
+    def _verify_attach_config_drive(self, config_drive_format):
+        if config_drive_format == constants.IDE_DISK_FORMAT.lower():
+            self.assertEqual(self._instance_ide_disks[1],
+                self._test_instance_dir + '/configdrive.' +
+                config_drive_format)
+        elif config_drive_format == constants.IDE_DVD_FORMAT.lower():
+            self.assertEqual(self._instance_ide_dvds[0],
+                self._test_instance_dir + '/configdrive.' +
+                config_drive_format)
+
+    def _test_finish_migration(self, power_on, ephemeral_storage=False,
+                               config_drive=False,
+                               config_drive_format='iso'):
         self._instance_data = self._get_instance_data()
         instance = db.instance_create(self._context, self._instance_data)
         instance['system_metadata'] = {}
@@ -1531,10 +1589,16 @@ class HyperVAPITestCase(test.NoDBTestCase):
             vmutils.VMUtils.set_vm_state(mox.Func(self._check_instance_name),
                                          constants.HYPERV_VM_STATE_ENABLED)
 
+        if config_drive:
+            self._mock_attach_config_drive(instance, config_drive_format)
+
         self._mox.ReplayAll()
         self._conn.finish_migration(self._context, None, instance, "",
                                     network_info, None, False, None, power_on)
         self._mox.VerifyAll()
+
+        if config_drive:
+            self._verify_attach_config_drive(config_drive_format)
 
     def test_finish_migration_power_on(self):
         self._test_finish_migration(True)
@@ -1544,6 +1608,14 @@ class HyperVAPITestCase(test.NoDBTestCase):
 
     def test_finish_migration_with_ephemeral_storage(self):
         self._test_finish_migration(False, ephemeral_storage=True)
+
+    def test_finish_migration_attach_config_drive_iso(self):
+        self._test_finish_migration(False, config_drive=True,
+            config_drive_format=constants.IDE_DVD_FORMAT.lower())
+
+    def test_finish_migration_attach_config_drive_vhd(self):
+        self._test_finish_migration(False, config_drive=True,
+            config_drive_format=constants.IDE_DISK_FORMAT.lower())
 
     def test_confirm_migration(self):
         self._instance_data = self._get_instance_data()
@@ -1556,7 +1628,9 @@ class HyperVAPITestCase(test.NoDBTestCase):
         self._conn.confirm_migration(None, instance, network_info)
         self._mox.VerifyAll()
 
-    def _test_finish_revert_migration(self, power_on, ephemeral_storage=False):
+    def _test_finish_revert_migration(self, power_on, ephemeral_storage=False,
+                                      config_drive=False,
+                                      config_drive_format='iso'):
         self._instance_data = self._get_instance_data()
         instance = db.instance_create(self._context, self._instance_data)
         network_info = fake_network.fake_get_instance_nw_info(self.stubs)
@@ -1594,11 +1668,17 @@ class HyperVAPITestCase(test.NoDBTestCase):
             vmutils.VMUtils.set_vm_state(mox.Func(self._check_instance_name),
                                          constants.HYPERV_VM_STATE_ENABLED)
 
+        if config_drive:
+            self._mock_attach_config_drive(instance, config_drive_format)
+
         self._mox.ReplayAll()
         self._conn.finish_revert_migration(self._context, instance,
                                            network_info, None,
                                            power_on)
         self._mox.VerifyAll()
+
+        if config_drive:
+            self._verify_attach_config_drive(config_drive_format)
 
     def test_finish_revert_migration_power_on(self):
         self._test_finish_revert_migration(True)
@@ -1615,6 +1695,14 @@ class HyperVAPITestCase(test.NoDBTestCase):
     def test_finish_revert_migration_with_ephemeral_storage(self):
         self._test_finish_revert_migration(False, ephemeral_storage=True)
 
+    def test_finish_revert_migration_attach_config_drive_iso(self):
+        self._test_finish_revert_migration(False, config_drive=True,
+            config_drive_format=constants.IDE_DVD_FORMAT.lower())
+
+    def test_finish_revert_migration_attach_config_drive_vhd(self):
+        self._test_finish_revert_migration(False, config_drive=True,
+            config_drive_format=constants.IDE_DISK_FORMAT.lower())
+
     def test_plug_vifs(self):
         # Check to make sure the method raises NotImplementedError.
         self.assertRaises(NotImplementedError,
@@ -1628,3 +1716,104 @@ class HyperVAPITestCase(test.NoDBTestCase):
                           self._conn.unplug_vifs,
                           instance=self._test_spawn_instance,
                           network_info=None)
+
+    def test_rollback_live_migration_at_destination(self):
+        with mock.patch.object(self._conn, "destroy") as mock_destroy:
+            self._conn.rollback_live_migration_at_destination(self._context,
+                    self._test_spawn_instance, [], None)
+            mock_destroy.assert_called_once_with(self._context,
+                    self._test_spawn_instance, [], None)
+
+    def test_refresh_instance_security_rules(self):
+        self.assertRaises(NotImplementedError,
+                          self._conn.refresh_instance_security_rules,
+                          instance=None)
+
+    def test_get_rdp_console(self):
+        self.flags(my_ip="192.168.1.1")
+
+        self._instance_data = self._get_instance_data()
+        instance = db.instance_create(self._context, self._instance_data)
+
+        fake_port = 9999
+        fake_vm_id = "fake_vm_id"
+
+        m = rdpconsoleutils.RDPConsoleUtils.get_rdp_console_port()
+        m.AndReturn(fake_port)
+
+        m = vmutils.VMUtils.get_vm_id(mox.IsA(str))
+        m.AndReturn(fake_vm_id)
+
+        self._mox.ReplayAll()
+        connect_info = self._conn.get_rdp_console(self._context, instance)
+        self._mox.VerifyAll()
+
+        self.assertEqual(CONF.my_ip, connect_info['host'])
+        self.assertEqual(fake_port, connect_info['port'])
+        self.assertEqual(fake_vm_id, connect_info['internal_access_path'])
+
+
+class VolumeOpsTestCase(HyperVAPIBaseTestCase):
+    """Unit tests for VolumeOps class."""
+
+    def setUp(self):
+        super(VolumeOpsTestCase, self).setUp()
+        self.volumeops = volumeops.VolumeOps()
+
+    def test_get_mounted_disk_from_lun(self):
+        with contextlib.nested(
+            mock.patch.object(self.volumeops._volutils,
+                              'get_device_number_for_target'),
+            mock.patch.object(self.volumeops._vmutils,
+                              'get_mounted_disk_by_drive_number')
+            ) as (mock_get_device_number_for_target,
+                  mock_get_mounted_disk_by_drive_number):
+
+            mock_get_device_number_for_target.return_value = 0
+            mock_get_mounted_disk_by_drive_number.return_value = 'disk_path'
+
+            block_device_info = db_fakes.get_fake_block_device_info(
+                self._volume_target_portal, self._volume_id)
+
+            mapping = driver.block_device_info_get_mapping(block_device_info)
+            data = mapping[0]['connection_info']['data']
+            target_lun = data['target_lun']
+            target_iqn = data['target_iqn']
+
+            disk = self.volumeops._get_mounted_disk_from_lun(target_iqn,
+                                                             target_lun)
+            self.assertEqual(disk, 'disk_path')
+
+    def test_get_mounted_disk_from_lun_failure(self):
+        self.flags(mounted_disk_query_retry_count=1, group='hyperv')
+
+        with mock.patch.object(self.volumeops._volutils,
+                               'get_device_number_for_target') as m_device_num:
+            m_device_num.side_effect = [None, -1]
+
+            block_device_info = db_fakes.get_fake_block_device_info(
+                self._volume_target_portal, self._volume_id)
+
+            mapping = driver.block_device_info_get_mapping(block_device_info)
+            data = mapping[0]['connection_info']['data']
+            target_lun = data['target_lun']
+            target_iqn = data['target_iqn']
+
+            for attempt in xrange(1):
+                self.assertRaises(exception.NotFound,
+                                  self.volumeops._get_mounted_disk_from_lun,
+                                  target_iqn, target_lun)
+
+    def test_get_free_controller_slot_exception(self):
+        fake_drive = mock.MagicMock()
+        type(fake_drive).AddressOnParent = mock.PropertyMock(
+            side_effect=xrange(constants.SCSI_CONTROLLER_SLOTS_NUMBER))
+        fake_scsi_controller_path = 'fake_scsi_controller_path'
+
+        with mock.patch.object(self.volumeops._vmutils,
+                'get_attached_disks') as fake_get_attached_disks:
+            fake_get_attached_disks.return_value = (
+                [fake_drive] * constants.SCSI_CONTROLLER_SLOTS_NUMBER)
+            self.assertRaises(vmutils.HyperVException,
+                              self.volumeops._get_free_controller_slot,
+                              fake_scsi_controller_path)

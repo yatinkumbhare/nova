@@ -14,6 +14,7 @@
 
 import uuid
 
+import mock
 from oslo.config import cfg
 import webob
 
@@ -24,6 +25,7 @@ from nova import exception
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 
 CONF = cfg.CONF
 CONF.import_opt('password_length', 'nova.utils')
@@ -33,13 +35,11 @@ def fake_compute_api(*args, **kwargs):
     return True
 
 
-def fake_compute_api_get(self, context, instance_id):
-    return {
-        'id': 1,
-        'uuid': instance_id,
-        'vm_state': vm_states.ACTIVE,
-        'task_state': None, 'host': 'host1'
-    }
+def fake_compute_api_get(self, context, instance_id, want_objects=False,
+                         **kwargs):
+    return fake_instance.fake_instance_obj(context, id=1, uuid=instance_id,
+                                           vm_state=vm_states.ACTIVE,
+                                           task_state=None, host='host1')
 
 
 def fake_service_get_by_compute_host(self, context, host):
@@ -83,17 +83,54 @@ class EvacuateTest(test.NoDBTestCase):
 
         return req, app
 
-    def test_evacuate_instance_with_no_target(self):
+    @mock.patch('nova.compute.api.API.evacuate')
+    def test_evacuate_instance_with_no_target(self, evacuate_mock):
         req, app = self._gen_request_with_app({'on_shared_storage': 'False',
                                                'admin_password': 'MyNewPass'})
         res = req.get_response(app)
-        self.assertEqual(res.status_int, 400)
+        self.assertEqual(202, res.status_int)
+        evacuate_mock.assert_called_once_with(mock.ANY, mock.ANY, None,
+                                              mock.ANY, mock.ANY)
+
+    def test_evacuate_instance_with_empty_host(self):
+        req, app = self._gen_request_with_app({'host': '',
+                                               'on_shared_storage': 'False',
+                                               'admin_password': 'MyNewPass'})
+        res = req.get_response(app)
+        jsonutils.loads(res.body)
+        self.assertEqual(400, res.status_int)
+
+    def test_evacuate_instance_with_too_long_host(self):
+        host = 'a' * 256
+        req, app = self._gen_request_with_app({'host': host,
+                                               'on_shared_storage': 'False',
+                                               'admin_password': 'MyNewPass'})
+        res = req.get_response(app)
+        jsonutils.loads(res.body)
+        self.assertEqual(400, res.status_int)
+
+    def test_evacuate_instance_with_invalid_characters_host(self):
+        host = 'abc!#'
+        req, app = self._gen_request_with_app({'host': host,
+                                               'on_shared_storage': 'False',
+                                               'admin_password': 'MyNewPass'})
+        res = req.get_response(app)
+        jsonutils.loads(res.body)
+        self.assertEqual(400, res.status_int)
+
+    def test_evacuate_instance_with_invalid_on_shared_storage(self):
+        req, app = self._gen_request_with_app({'host': 'my-host',
+                                               'on_shared_storage': 'foo',
+                                               'admin_password': 'MyNewPass'})
+        res = req.get_response(app)
+        jsonutils.loads(res.body)
+        self.assertEqual(400, res.status_int)
 
     def test_evacuate_instance_without_on_shared_storage(self):
         req, app = self._gen_request_with_app({'host': 'my-host',
                                                'admin_password': 'MyNewPass'})
         res = req.get_response(app)
-        self.assertEqual(res.status_int, 400)
+        self.assertEqual(400, res.status_int)
 
     def test_evacuate_instance_with_bad_host(self):
         req, app = self._gen_request_with_app({'host': 'bad-host',
@@ -101,7 +138,7 @@ class EvacuateTest(test.NoDBTestCase):
                                                'admin_password': 'MyNewPass'})
 
         res = req.get_response(app)
-        self.assertEqual(res.status_int, 404)
+        self.assertEqual(404, res.status_int)
 
     def test_evacuate_instance_with_target(self):
         req, app = self._gen_request_with_app({'host': 'my-host',
@@ -111,7 +148,7 @@ class EvacuateTest(test.NoDBTestCase):
         self.stubs.Set(compute_api.API, 'update', self._fake_update)
 
         resp = req.get_response(app)
-        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(202, resp.status_int)
         resp_json = jsonutils.loads(resp.body)
         self.assertEqual("MyNewPass", resp_json['admin_password'])
 
@@ -126,7 +163,7 @@ class EvacuateTest(test.NoDBTestCase):
         self.stubs.Set(compute_api.API, 'update', self._fake_update)
 
         resp = req.get_response(app)
-        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(202, resp.status_int)
         resp_json = jsonutils.loads(resp.body)
         self.assertEqual("MyNewPass", resp_json['admin_password'])
 
@@ -137,7 +174,7 @@ class EvacuateTest(test.NoDBTestCase):
         self.stubs.Set(compute_api.API, 'update', self._fake_update)
 
         res = req.get_response(app)
-        self.assertEqual(res.status_int, 400)
+        self.assertEqual(400, res.status_int)
 
     def test_evacuate_not_shared_pass_generated(self):
         req, app = self._gen_request_with_app({'host': 'my-host',
@@ -146,7 +183,7 @@ class EvacuateTest(test.NoDBTestCase):
         self.stubs.Set(compute_api.API, 'update', self._fake_update)
 
         resp = req.get_response(app)
-        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(202, resp.status_int)
         resp_json = jsonutils.loads(resp.body)
         self.assertEqual(CONF.password_length,
                          len(resp_json['admin_password']))
@@ -157,7 +194,7 @@ class EvacuateTest(test.NoDBTestCase):
         self.stubs.Set(compute_api.API, 'update', self._fake_update)
 
         res = req.get_response(app)
-        self.assertEqual(res.status_int, 200)
+        self.assertEqual(202, res.status_int)
         resp_json = jsonutils.loads(res.body)
         self.assertIsNone(resp_json['admin_password'])
 
@@ -172,7 +209,7 @@ class EvacuateTest(test.NoDBTestCase):
         self.stubs.Set(compute_api.API, 'evacuate', fake_evacuate)
 
         res = req.get_response(app)
-        self.assertEqual(res.status_int, 400)
+        self.assertEqual(400, res.status_int)
 
     def test_not_admin(self):
         req, app = self._gen_request_with_app({'host': 'my-host',
@@ -181,4 +218,31 @@ class EvacuateTest(test.NoDBTestCase):
 
         req.content_type = 'application/json'
         res = req.get_response(app)
-        self.assertEqual(res.status_int, 403)
+        self.assertEqual(403, res.status_int)
+
+    def test_evacuate_disable_password_return(self):
+        self._test_evacuate_enable_instance_password_conf(False)
+
+    def test_evacuate_enable_password_return(self):
+        self._test_evacuate_enable_instance_password_conf(True)
+
+    def _test_evacuate_enable_instance_password_conf(self, enable_pass):
+        self.flags(enable_instance_password=enable_pass)
+        req, app = self._gen_request_with_app({'host': 'my_host',
+                                               'on_shared_storage': 'False'})
+        self.stubs.Set(compute_api.API, 'update', self._fake_update)
+
+        res = req.get_response(app)
+        self.assertEqual(res.status_int, 202)
+        resp_json = jsonutils.loads(res.body)
+        if enable_pass:
+            self.assertIn('admin_password', resp_json)
+        else:
+            self.assertIsNone(resp_json.get('admin_password'))
+
+    def test_evacuate_to_same_host(self):
+        req, app = self._gen_request_with_app({'host': 'host1',
+                                               'on_shared_storage': 'False',
+                                               'admin_password': 'MyNewPass'})
+        res = req.get_response(app)
+        self.assertEqual(400, res.status_int)

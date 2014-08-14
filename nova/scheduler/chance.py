@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -27,7 +25,7 @@ from oslo.config import cfg
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.scheduler import driver
 
 CONF = cfg.CONF
@@ -64,15 +62,6 @@ class ChanceScheduler(driver.Scheduler):
 
         return random.choice(hosts)
 
-    def select_hosts(self, context, request_spec, filter_properties):
-        """Selects a set of random hosts."""
-        hosts = [self._schedule(context, CONF.compute_topic,
-            request_spec, filter_properties)
-            for instance_uuid in request_spec.get('instance_uuids', [])]
-        if not hosts:
-            raise exception.NoValidHost(reason="")
-        return hosts
-
     def select_destinations(self, context, request_spec, filter_properties):
         """Selects random destinations."""
         num_instances = request_spec['num_instances']
@@ -89,6 +78,8 @@ class ChanceScheduler(driver.Scheduler):
             raise exception.NoValidHost(reason='')
         return dests
 
+    # NOTE(alaski): Remove this method when the scheduler rpc interface is
+    # bumped to 4.x as it is no longer used.
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,
                               requested_networks, is_first_time,

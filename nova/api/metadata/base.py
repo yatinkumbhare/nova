@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -19,7 +17,6 @@
 """Instance Metadata information."""
 
 import base64
-import json
 import os
 import posixpath
 
@@ -32,11 +29,10 @@ from nova.compute import flavors
 from nova import conductor
 from nova import context
 from nova import network
+from nova import objects
 from nova.objects import base as obj_base
-from nova.objects import instance as instance_obj
-from nova.objects import security_group as secgroup_obj
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 from nova import utils
@@ -57,7 +53,6 @@ metadata_opts = [
 CONF = cfg.CONF
 CONF.register_opts(metadata_opts)
 CONF.import_opt('dhcp_domain', 'nova.network.manager')
-
 
 VERSIONS = [
     '1.0',
@@ -80,11 +75,15 @@ OPENSTACK_VERSIONS = [
     HAVANA,
 ]
 
+VERSION = "version"
+CONTENT = "content"
 CONTENT_DIR = "content"
 MD_JSON_NAME = "meta_data.json"
 VD_JSON_NAME = "vendor_data.json"
 UD_NAME = "user_data"
 PASS_NAME = "password"
+MIME_TYPE_TEXT_PLAIN = "text/plain"
+MIME_TYPE_APPLICATION_JSON = "application/json"
 
 LOG = logging.getLogger(__name__)
 
@@ -115,11 +114,16 @@ class InstanceMetadata():
         ctxt = context.get_admin_context()
 
         # NOTE(danms): This should be removed after bp:compute-manager-objects
-        if not isinstance(instance, instance_obj.Instance):
-            instance = instance_obj.Instance._from_db_object(
-                ctxt, instance_obj.Instance(), instance,
-                expected_attrs=['metadata', 'system_metadata'])
+        if not isinstance(instance, obj_base.NovaObject):
+            expected = ['metadata', 'system_metadata']
+            if 'info_cache' in instance:
+                expected.append('info_cache')
+            instance = objects.Instance._from_db_object(
+                ctxt, objects.Instance(), instance,
+                expected_attrs=expected)
 
+        # The default value of mimeType is set to MIME_TYPE_TEXT_PLAIN
+        self.set_mimetype(MIME_TYPE_TEXT_PLAIN)
         self.instance = instance
         self.extra_md = extra_md
 
@@ -131,10 +135,10 @@ class InstanceMetadata():
         self.availability_zone = ec2utils.get_availability_zone_by_host(
                 instance['host'], capi)
 
-        self.security_groups = secgroup_obj.SecurityGroupList.get_by_instance(
+        self.security_groups = objects.SecurityGroupList.get_by_instance(
             ctxt, instance)
 
-        self.mappings = _format_instance_mapping(capi, ctxt, instance)
+        self.mappings = _format_instance_mapping(ctxt, instance)
 
         if instance.get('user_data', None) is not None:
             self.userdata_raw = base64.b64decode(instance['user_data'])
@@ -158,8 +162,7 @@ class InstanceMetadata():
 
         # get network info, and the rendered network template
         if network_info is None:
-            network_info = network.API().get_instance_nw_info(ctxt,
-                                                              instance)
+            network_info = instance.info_cache.network_info
 
         self.ip_info = \
                 ec2utils.get_ip_info_for_instance_from_nw_info(network_info)
@@ -174,7 +177,7 @@ class InstanceMetadata():
                 'content_path': "/%s/%s" % (CONTENT_DIR, key)}
 
         # 'content' is passed in from the configdrive code in
-        # nova/virt/libvirt/driver.py.  Thats how we get the injected files
+        # nova/virt/libvirt/driver.py.  That's how we get the injected files
         # (personalities) in. AFAIK they're not stored in the db at all,
         # so are not available later (web service metadata time).
         for (path, contents) in content:
@@ -190,6 +193,28 @@ class InstanceMetadata():
 
         self.vddriver = vdclass(instance=instance, address=address,
                                 extra_md=extra_md, network_info=network_info)
+
+        self.route_configuration = None
+
+    def _route_configuration(self):
+        if self.route_configuration:
+            return self.route_configuration
+
+        path_handlers = {UD_NAME: self._user_data,
+                         PASS_NAME: self._password,
+                         VD_JSON_NAME: self._vendor_data,
+                         MD_JSON_NAME: self._metadata_as_json,
+                         VERSION: self._handle_version,
+                         CONTENT: self._handle_content}
+
+        self.route_configuration = RouteConfiguration(path_handlers)
+        return self.route_configuration
+
+    def set_mimetype(self, mime_type):
+        self.md_mimetype = mime_type
+
+    def get_mimetype(self):
+        return self.md_mimetype
 
     def get_ec2_metadata(self, version):
         if version == "latest":
@@ -276,71 +301,24 @@ class InstanceMetadata():
 
     def get_openstack_item(self, path_tokens):
         if path_tokens[0] == CONTENT_DIR:
-            if len(path_tokens) == 1:
-                raise KeyError("no listing for %s" % "/".join(path_tokens))
-            if len(path_tokens) != 2:
-                raise KeyError("Too many tokens for /%s" % CONTENT_DIR)
-            return self.content[path_tokens[1]]
+            return self._handle_content(path_tokens)
+        return self._route_configuration().handle_path(path_tokens)
 
-        version = path_tokens[0]
-        if version == "latest":
-            version = OPENSTACK_VERSIONS[-1]
-
-        if version not in OPENSTACK_VERSIONS:
-            raise InvalidMetadataVersion(version)
-
-        path = '/'.join(path_tokens[1:])
-
-        if len(path_tokens) == 1:
-            # request for /version, give a list of what is available
-            ret = [MD_JSON_NAME]
-            if self.userdata_raw is not None:
-                ret.append(UD_NAME)
-            if self._check_os_version(GRIZZLY, version):
-                ret.append(PASS_NAME)
-            if self._check_os_version(HAVANA, version):
-                ret.append(VD_JSON_NAME)
-            return ret
-
-        if path == UD_NAME:
-            if self.userdata_raw is None:
-                raise KeyError(path)
-            return self.userdata_raw
-
-        if path == PASS_NAME and self._check_os_version(GRIZZLY, version):
-            return password.handle_password
-
-        if path == VD_JSON_NAME and self._check_os_version(HAVANA, version):
-            return json.dumps(self.vddriver.get())
-
-        if path != MD_JSON_NAME:
-            raise KeyError(path)
-
-        metadata = {}
-        metadata['uuid'] = self.uuid
-
+    def _metadata_as_json(self, version, path):
+        metadata = {'uuid': self.uuid}
         if self.launch_metadata:
             metadata['meta'] = self.launch_metadata
-
         if self.files:
             metadata['files'] = self.files
-
         if self.extra_md:
             metadata.update(self.extra_md)
-
-        if self.launch_metadata:
-            metadata['meta'] = self.launch_metadata
-
         if self.network_config:
             metadata['network_config'] = self.network_config
-
         if self.instance['key_name']:
             metadata['public_keys'] = {
                 self.instance['key_name']: self.instance['key_data']
             }
-
         metadata['hostname'] = self._get_hostname()
-
         metadata['name'] = self.instance['display_name']
         metadata['launch_index'] = self.instance['launch_index']
         metadata['availability_zone'] = self.availability_zone
@@ -348,11 +326,43 @@ class InstanceMetadata():
         if self._check_os_version(GRIZZLY, version):
             metadata['random_seed'] = base64.b64encode(os.urandom(512))
 
-        data = {
-            MD_JSON_NAME: json.dumps(metadata),
-        }
+        self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
+        return jsonutils.dumps(metadata)
 
-        return data[path]
+    def _handle_content(self, path_tokens):
+        if len(path_tokens) == 1:
+            raise KeyError("no listing for %s" % "/".join(path_tokens))
+        if len(path_tokens) != 2:
+            raise KeyError("Too many tokens for /%s" % CONTENT_DIR)
+        return self.content[path_tokens[1]]
+
+    def _handle_version(self, version, path):
+        # request for /version, give a list of what is available
+        ret = [MD_JSON_NAME]
+        if self.userdata_raw is not None:
+            ret.append(UD_NAME)
+        if self._check_os_version(GRIZZLY, version):
+            ret.append(PASS_NAME)
+        if self._check_os_version(HAVANA, version):
+            ret.append(VD_JSON_NAME)
+
+        return ret
+
+    def _user_data(self, version, path):
+        if self.userdata_raw is None:
+            raise KeyError(path)
+        return self.userdata_raw
+
+    def _password(self, version, path):
+        if self._check_os_version(GRIZZLY, version):
+            return password.handle_password
+        raise KeyError(path)
+
+    def _vendor_data(self, version, path):
+        if self._check_os_version(HAVANA, version):
+            self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
+            return jsonutils.dumps(self.vddriver.get())
+        raise KeyError(path)
 
     def _check_version(self, required, requested, versions=VERSIONS):
         return versions.index(requested) >= versions.index(required)
@@ -370,6 +380,9 @@ class InstanceMetadata():
             path = posixpath.normpath("/" + path)
         else:
             path = posixpath.normpath(path)
+
+        # Set default mimeType. It will be modified only if there is a change
+        self.set_mimetype(MIME_TYPE_TEXT_PLAIN)
 
         # fix up requests, prepending /ec2 to anything that does not match
         path_tokens = path.split('/')[1:]
@@ -390,7 +403,7 @@ class InstanceMetadata():
                 today = timeutils.utcnow().strftime("%Y-%m-%d")
                 versions = [v for v in OPENSTACK_VERSIONS if v <= today]
                 if OPENSTACK_VERSIONS != versions:
-                    LOG.debug(_("future versions %s hidden in version list"),
+                    LOG.debug("future versions %s hidden in version list",
                               [v for v in OPENSTACK_VERSIONS
                                if v not in versions])
                 versions += ["latest"]
@@ -427,7 +440,7 @@ class InstanceMetadata():
                 pass
 
             filepath = os.path.join('ec2', version, 'meta-data.json')
-            yield (filepath, json.dumps(data['meta-data']))
+            yield (filepath, jsonutils.dumps(data['meta-data']))
 
         ALL_OPENSTACK_VERSIONS = OPENSTACK_VERSIONS + ["latest"]
         for version in ALL_OPENSTACK_VERSIONS:
@@ -444,6 +457,36 @@ class InstanceMetadata():
 
         for (cid, content) in self.content.iteritems():
             yield ('%s/%s/%s' % ("openstack", CONTENT_DIR, cid), content)
+
+
+class RouteConfiguration(object):
+    """Routes metadata paths to request handlers."""
+
+    def __init__(self, path_handler):
+        self.path_handlers = path_handler
+
+    def _version(self, version):
+        if version == "latest":
+            version = OPENSTACK_VERSIONS[-1]
+
+        if version not in OPENSTACK_VERSIONS:
+            raise InvalidMetadataVersion(version)
+
+        return version
+
+    def handle_path(self, path_tokens):
+        version = self._version(path_tokens[0])
+        if len(path_tokens) == 1:
+            path = VERSION
+        else:
+            path = '/'.join(path_tokens[1:])
+
+        path_handler = self.path_handlers[path]
+
+        if path_handler is None:
+            raise KeyError(path)
+
+        return path_handler(version, path)
 
 
 class VendorDataDriver(object):
@@ -474,13 +517,13 @@ def get_metadata_by_address(conductor_api, address):
 def get_metadata_by_instance_id(conductor_api, instance_id, address,
                                 ctxt=None):
     ctxt = ctxt or context.get_admin_context()
-    instance = instance_obj.Instance.get_by_uuid(ctxt, instance_id)
+    instance = objects.Instance.get_by_uuid(ctxt, instance_id)
     return InstanceMetadata(instance, address)
 
 
-def _format_instance_mapping(conductor_api, ctxt, instance):
-    bdms = conductor_api.block_device_mapping_get_all_by_instance(
-               ctxt, instance)
+def _format_instance_mapping(ctxt, instance):
+    bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+            ctxt, instance.uuid)
     return block_device.instance_block_mapping(instance, bdms)
 
 

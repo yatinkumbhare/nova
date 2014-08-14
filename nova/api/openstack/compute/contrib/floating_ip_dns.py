@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Andrew Bogott for the Wikimedia Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,8 +20,8 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import exception
+from nova.i18n import _
 from nova import network
-from nova.openstack.common.gettextutils import _
 from nova import utils
 
 
@@ -284,7 +282,7 @@ class Floating_ip_dns(extensions.ExtensionDescriptor):
     name = "FloatingIpDns"
     alias = "os-floating-ip-dns"
     namespace = "http://docs.openstack.org/ext/floating_ip_dns/api/v1.1"
-    updated = "2011-12-23T00:00:00+00:00"
+    updated = "2011-12-23T00:00:00Z"
 
     def __init__(self, ext_mgr):
         self.network_api = network.API()

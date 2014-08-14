@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -20,7 +18,9 @@
 from oslo.config import cfg
 
 from nova.cloudpipe import pipelib
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _LI
+from nova.i18n import _LW
+from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 import nova.virt.firewall as base_firewall
 from nova.virt import netutils
@@ -33,8 +33,7 @@ libvirt = None
 
 
 class NWFilterFirewall(base_firewall.FirewallDriver):
-    """
-    This class implements a network filtering mechanism by using
+    """This class implements a network filtering mechanism by using
     libvirt's nwfilter.
     all instances get a filter ("nova-base") applied. This filter
     provides some basic security such as protection against MAC
@@ -46,10 +45,10 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
         global libvirt
         if libvirt is None:
             try:
-                libvirt = __import__('libvirt')
+                libvirt = importutils.import_module('libvirt')
             except ImportError:
-                LOG.warn(_("Libvirt module could not be loaded. "
-                           "NWFilterFirewall will not work correctly."))
+                LOG.warn(_LW("Libvirt module could not be loaded. "
+                             "NWFilterFirewall will not work correctly."))
         self._libvirt_get_connection = get_connection
         self.static_filters_configured = False
         self.handle_security_groups = False
@@ -64,8 +63,7 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
 
     @staticmethod
     def nova_no_nd_reflection_filter():
-        """
-        This filter protects false positives on IPv6 Duplicate Address
+        """This filter protects false positives on IPv6 Duplicate Address
         Detection(DAD).
         """
         return '''<filter name='nova-no-nd-reflection' chain='ipv6'>
@@ -105,7 +103,7 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
 
     def setup_basic_filtering(self, instance, network_info):
         """Set up basic filtering (MAC, IP, and ARP spoofing protection)."""
-        LOG.info(_('Called setup_basic_filtering in nwfilter'),
+        LOG.info(_LI('Called setup_basic_filtering in nwfilter'),
                  instance=instance)
 
         if self.handle_security_groups:
@@ -113,23 +111,20 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
             # anyway.
             return
 
-        LOG.info(_('Ensuring static filters'), instance=instance)
+        LOG.info(_LI('Ensuring static filters'), instance=instance)
         self._ensure_static_filters()
 
-        allow_dhcp = False
+        nodhcp_base_filter = self.get_base_filter_list(instance, False)
+        dhcp_base_filter = self.get_base_filter_list(instance, True)
+
         for vif in network_info:
-            if not vif['network'] or not vif['network']['subnets']:
-                continue
+            _base_filter = nodhcp_base_filter
             for subnet in vif['network']['subnets']:
                 if subnet.get_meta('dhcp_server'):
-                    allow_dhcp = True
+                    _base_filter = dhcp_base_filter
                     break
-
-        base_filter = self.get_base_filter_list(instance, allow_dhcp)
-
-        for vif in network_info:
             self._define_filter(self._get_instance_filter_xml(instance,
-                                                              base_filter,
+                                                              _base_filter,
                                                               vif))
 
     def _get_instance_filter_parameters(self, vif):
@@ -188,8 +183,7 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
         return xml
 
     def get_base_filter_list(self, instance, allow_dhcp):
-        """
-        Obtain a list of base filters to apply to an instance.
+        """Obtain a list of base filters to apply to an instance.
         The return value should be a list of strings, each
         specifying a filter name.  Subclasses can override this
         function to add additional filters as needed.  Additional
@@ -242,7 +236,6 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
 
     def unfilter_instance(self, instance, network_info):
         """Clear out the nwfilter rules."""
-        instance_name = instance['name']
         for vif in network_info:
             nic_id = vif['address'].replace(':', '')
             instance_filter_name = self._instance_filter_name(instance, nic_id)
@@ -256,12 +249,8 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
                     # This happens when the instance filter is still in
                     # use (ie. when the instance has not terminated properly)
                     raise
-                LOG.debug(_('The nwfilter(%s) is not found.'),
+                LOG.debug('The nwfilter(%s) is not found.',
                           instance_filter_name, instance=instance)
-
-    def _define_filters(self, filter_name, filter_children):
-        self._define_filter(self._filter_container(filter_name,
-                                                   filter_children))
 
     @staticmethod
     def _instance_filter_name(instance, nic_id=None):
@@ -278,8 +267,8 @@ class NWFilterFirewall(base_firewall.FirewallDriver):
                 self._conn.nwfilterLookupByName(instance_filter_name)
             except libvirt.libvirtError:
                 name = instance['name']
-                LOG.debug(_('The nwfilter(%(instance_filter_name)s) for'
-                            '%(name)s is not found.'),
+                LOG.debug('The nwfilter(%(instance_filter_name)s) for'
+                          '%(name)s is not found.',
                           {'instance_filter_name': instance_filter_name,
                            'name': name},
                           instance=instance)
@@ -296,7 +285,7 @@ class IptablesFirewallDriver(base_firewall.IptablesFirewallDriver):
         """Set up provider rules and basic NWFilter."""
         self.nwfilter.setup_basic_filtering(instance, network_info)
         if not self.basically_filtered:
-            LOG.debug(_('iptables firewall: Setup Basic Filtering'),
+            LOG.debug('iptables firewall: Setup Basic Filtering',
                       instance=instance)
             self.refresh_provider_fw_rules()
             self.basically_filtered = True
@@ -308,15 +297,13 @@ class IptablesFirewallDriver(base_firewall.IptablesFirewallDriver):
     def unfilter_instance(self, instance, network_info):
         # NOTE(salvatore-orlando):
         # Overriding base class method for applying nwfilter operation
-        if self.instances.pop(instance['id'], None):
-            # NOTE(vish): use the passed info instead of the stored info
-            self.network_infos.pop(instance['id'])
+        if self.instance_info.pop(instance['id'], None):
             self.remove_filters_for_instance(instance)
             self.iptables.apply()
             self.nwfilter.unfilter_instance(instance, network_info)
         else:
-            LOG.info(_('Attempted to unfilter instance which is not '
-                     'filtered'), instance=instance)
+            LOG.info(_LI('Attempted to unfilter instance which is not '
+                         'filtered'), instance=instance)
 
     def instance_filter_exists(self, instance, network_info):
         """Check nova-instance-instance-xxx exists."""

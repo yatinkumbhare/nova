@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
@@ -26,8 +24,6 @@ health.
 
 """
 
-NULL = None
-INIT = 'initializing'
 ACTIVE = 'active'
 BUILDING = 'building'
 DEPLOYING = 'deploying'
@@ -35,3 +31,4 @@ DEPLOYFAIL = 'deploy failed'
 DEPLOYDONE = 'deploy complete'
 DELETED = 'deleted'
 ERROR = 'error'
+PREPARED = 'prepared'

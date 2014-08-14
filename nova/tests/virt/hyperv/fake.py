@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -59,6 +57,10 @@ class PathUtils(object):
     def lookup_root_vhd_path(self, instance_name):
         instance_path = self.get_instance_dir(instance_name)
         return os.path.join(instance_path, 'root.vhd')
+
+    def lookup_configdrive_path(self, instance_name):
+        instance_path = self.get_instance_dir(instance_name)
+        return os.path.join(instance_path, 'configdrive.iso')
 
     def lookup_ephemeral_vhd_path(self, instance_name):
         instance_path = self.get_instance_dir(instance_name)

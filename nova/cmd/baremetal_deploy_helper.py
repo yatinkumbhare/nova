@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # All Rights Reserved.
 #
@@ -18,25 +16,25 @@
 """Starter script for Bare-Metal Deployment Service."""
 
 
-import os
-import sys
-import threading
-import time
-
 import cgi
+import os
 import Queue
 import re
 import socket
 import stat
+import sys
+import threading
+import time
 from wsgiref import simple_server
 
 from nova import config
 from nova import context as nova_context
+from nova.i18n import _
+from nova import objects
 from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
-from nova import unit
+from nova.openstack.common import units
 from nova import utils
 from nova.virt.baremetal import baremetal_states
 from nova.virt.baremetal import db
@@ -45,6 +43,10 @@ from nova.virt.disk import api as disk
 
 QUEUE = Queue.Queue()
 LOG = logging.getLogger(__name__)
+
+
+class BareMetalDeployException(Exception):
+    pass
 
 
 # All functions are called from deploy() directly or indirectly.
@@ -132,7 +134,7 @@ def mkswap(dev, label='swap1'):
 
 
 def mkfs_ephemeral(dev, label="ephemeral0"):
-    #TODO(jogo) support non-default mkfs options as well
+    # TODO(jogo) support non-default mkfs options as well
     disk.mkfs("default", label, dev)
 
 
@@ -177,15 +179,25 @@ def get_dev(address, port, iqn, lun):
 
 def get_image_mb(image_path):
     """Get size of an image in Megabyte."""
-    mb = unit.Mi
+    mb = units.Mi
     image_byte = os.path.getsize(image_path)
     # round up size to MB
     image_mb = int((image_byte + mb - 1) / mb)
     return image_mb
 
 
-def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, image_path):
-    """Creates partitions and write an image to the root partition."""
+def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, image_path,
+                 preserve_ephemeral):
+    """Creates partitions and write an image to the root partition.
+
+    :param preserve_ephemeral: If True, no filesystem is written to the
+        ephemeral block device, preserving whatever content it had (if the
+        partition table has not changed).
+    """
+    def raise_exception(msg):
+        LOG.error(msg)
+        raise BareMetalDeployException(msg)
+
     if ephemeral_mb:
         ephemeral_part = "%s-part1" % dev
         swap_part = "%s-part2" % dev
@@ -195,33 +207,35 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, image_path):
         swap_part = "%s-part2" % dev
 
     if not is_block_device(dev):
-        LOG.warn(_("parent device '%s' not found"), dev)
-        return
+        raise_exception(_("parent device '%s' not found") % dev)
     make_partitions(dev, root_mb, swap_mb, ephemeral_mb)
     if not is_block_device(root_part):
-        LOG.warn(_("root device '%s' not found"), root_part)
-        return
+        raise_exception(_("root device '%s' not found") % root_part)
     if not is_block_device(swap_part):
-        LOG.warn(_("swap device '%s' not found"), swap_part)
-        return
+        raise_exception(_("swap device '%s' not found") % swap_part)
+    if ephemeral_mb and not is_block_device(ephemeral_part):
+        raise_exception(_("ephemeral device '%s' not found") % ephemeral_part)
     dd(image_path, root_part)
     mkswap(swap_part)
-    if ephemeral_mb and not is_block_device(ephemeral_part):
-        LOG.warn(_("ephemeral device '%s' not found"), ephemeral_part)
-    elif ephemeral_mb:
+    if ephemeral_mb and not preserve_ephemeral:
         mkfs_ephemeral(ephemeral_part)
 
     try:
         root_uuid = block_uuid(root_part)
-    except processutils.ProcessExecutionError as err:
+    except processutils.ProcessExecutionError:
         with excutils.save_and_reraise_exception():
             LOG.error(_("Failed to detect root device UUID."))
     return root_uuid
 
 
 def deploy(address, port, iqn, lun, image_path, pxe_config_path,
-           root_mb, swap_mb, ephemeral_mb):
-    """All-in-one function to deploy a node."""
+           root_mb, swap_mb, ephemeral_mb, preserve_ephemeral=False):
+    """All-in-one function to deploy a node.
+
+    :param preserve_ephemeral: If True, no filesystem is written to the
+        ephemeral block device, preserving whatever content it had (if the
+        partition table has not changed).
+    """
     dev = get_dev(address, port, iqn, lun)
     image_mb = get_image_mb(image_path)
     if image_mb > root_mb:
@@ -230,7 +244,7 @@ def deploy(address, port, iqn, lun, image_path, pxe_config_path,
     login_iscsi(address, port, iqn)
     try:
         root_uuid = work_on_disk(dev, root_mb, swap_mb, ephemeral_mb,
-                image_path)
+                image_path, preserve_ephemeral)
     except processutils.ProcessExecutionError as err:
         with excutils.save_and_reraise_exception():
             # Log output if there was a error
@@ -336,6 +350,7 @@ class BareMetalDeploy(object):
                   'root_mb': int(d['root_mb']),
                   'swap_mb': int(d['swap_mb']),
                   'ephemeral_mb': int(d['ephemeral_mb']),
+                  'preserve_ephemeral': d['preserve_ephemeral'],
                  }
         # Restart worker, if needed
         if not self.worker.isAlive():
@@ -354,6 +369,7 @@ def main():
     logging.setup("nova")
     global LOG
     LOG = logging.getLogger('nova.virt.baremetal.deploy_helper')
+    objects.register_all()
     app = BareMetalDeploy()
     srv = simple_server.make_server('', 10000, app)
     srv.serve_forever()

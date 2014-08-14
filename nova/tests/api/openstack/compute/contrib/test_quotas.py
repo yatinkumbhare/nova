@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
@@ -121,7 +119,7 @@ class QuotaSetsTest(test.TestCase):
         self.mox.ReplayAll()
         body = {'quota_set': {'instances': 50, 'cores': 50,
                               'ram': 51200, 'floating_ips': 10,
-                              'fixed_ips': -1, 'metadata_items': 128,
+                              'metadata_items': 128,
                               'injected_files': 5,
                               'injected_file_content_bytes': 10240,
                               'injected_file_path_bytes': 255,
@@ -141,7 +139,7 @@ class QuotaSetsTest(test.TestCase):
         self.mox.ReplayAll()
         body = {'quota_set': {'instances': 0, 'cores': 0,
                               'ram': 0, 'floating_ips': 0,
-                              'fixed_ips': 0, 'metadata_items': 0,
+                              'metadata_items': 0,
                               'injected_files': 0,
                               'injected_file_content_bytes': 0,
                               'injected_file_path_bytes': 0,
@@ -272,6 +270,45 @@ class QuotaSetsTest(test.TestCase):
     def test_quotas_update_invalid_value_non_int(self):
         # when PUT non integer value
         body = {'quota_set': {'instances': test, 'cores': 50,
+                              'ram': {}, 'floating_ips': 10,
+                              'fixed_ips': -1, 'metadata_items': 128,
+                              'injected_files': 5,
+                              'injected_file_content_bytes': 10240,
+                              'injected_file_path_bytes': 255,
+                              'security_groups': 10,
+                              'security_group_rules': 20,
+                              'key_pairs': 100}}
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+        self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
+        self.mox.ReplayAll()
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body)
+
+    def test_quotas_update_invalid_value_with_float(self):
+        # when PUT non integer value
+        body = {'quota_set': {'instances': 50.5, 'cores': 50,
+                              'ram': {}, 'floating_ips': 10,
+                              'fixed_ips': -1, 'metadata_items': 128,
+                              'injected_files': 5,
+                              'injected_file_content_bytes': 10240,
+                              'injected_file_path_bytes': 255,
+                              'security_groups': 10,
+                              'security_group_rules': 20,
+                              'key_pairs': 100}}
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+        self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
+        self.mox.ReplayAll()
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body)
+
+    def test_quotas_update_invalid_value_with_unicode(self):
+        # when PUT non integer value
+        body = {'quota_set': {'instances': u'\u30aa\u30fc\u30d7\u30f3',
+                              'cores': 50,
                               'ram': {}, 'floating_ips': 10,
                               'fixed_ips': -1, 'metadata_items': 128,
                               'injected_files': 5,

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,7 +19,7 @@ from webob import exc
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import strutils
 
 ALIAS = 'OS-DCF'
@@ -176,7 +174,7 @@ class Disk_config(extensions.ExtensionDescriptor):
     name = "DiskConfig"
     alias = ALIAS
     namespace = XMLNS_DCF
-    updated = "2011-09-27T00:00:00+00:00"
+    updated = "2011-09-27T00:00:00Z"
 
     def get_controller_extensions(self):
         servers_extension = extensions.ControllerExtension(

@@ -13,13 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import webob
 
 from nova.api.openstack.compute.plugins.v3 import extended_server_attributes
 from nova import compute
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova import test
@@ -49,7 +49,7 @@ def fake_compute_get_all(*args, **kwargs):
     ]
     fields = instance_obj.INSTANCE_DEFAULT_FIELDS
     return instance_obj._make_instance_list(args[1],
-                                            instance_obj.InstanceList(),
+                                            objects.InstanceList(),
                                             db_list, fields)
 
 
@@ -116,15 +116,3 @@ class ExtendedServerAttributesTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 404)
-
-
-class ExtendedServerAttributesXmlTest(ExtendedServerAttributesTest):
-    content_type = 'application/xml'
-    ext = extended_server_attributes
-    prefix = '{%s}' % ext.ExtendedServerAttributes.namespace
-
-    def _get_server(self, body):
-        return etree.XML(body)
-
-    def _get_servers(self, body):
-        return etree.XML(body).getchildren()

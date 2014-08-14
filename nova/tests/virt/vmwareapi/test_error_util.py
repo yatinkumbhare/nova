@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,15 +13,15 @@
 #    under the License.
 
 from nova import test
+from nova.tests.virt.vmwareapi import fake
 from nova.virt.vmwareapi import error_util
-from nova.virt.vmwareapi import fake
 
 
 class ExpectedMethodFault:
     pass
 
 
-class ErrorUtilTestCase(test.TestCase):
+class ErrorUtilTestCase(test.NoDBTestCase):
     def setUp(self):
         super(ErrorUtilTestCase, self).setUp()
 
@@ -32,7 +30,7 @@ class ErrorUtilTestCase(test.TestCase):
         # perform additional checks on the exception raised, instead of
         # try/catch block in the below tests, but it's available
         # only from  Py 2.7.
-        exp_fault_list = [error_util.FAULT_NOT_AUTHENTICATED]
+        exp_fault_list = [error_util.NOT_AUTHENTICATED]
         try:
             error_util.FaultCheckers.retrievepropertiesex_fault_checker(None)
         except error_util.VimFaultException as e:
@@ -60,3 +58,25 @@ class ErrorUtilTestCase(test.TestCase):
         self.assertIsNone(
             error_util.FaultCheckers.retrievepropertiesex_fault_checker(
                 fake_objects))
+
+    def test_exception_summary_exception_as_list(self):
+        # assert that if a list is fed to the VimException object
+        # that it will error.
+        self.assertRaises(ValueError,
+                          error_util.VimException,
+                          [], ValueError('foo'))
+
+    def test_exception_summary_string(self):
+        e = error_util.VimException("string", ValueError("foo"))
+        string = str(e)
+        self.assertEqual("string: foo", string)
+
+    def test_vim_fault_exception_string(self):
+        self.assertRaises(ValueError,
+                          error_util.VimFaultException,
+                          "bad", ValueError("argument"))
+
+    def test_vim_fault_exception(self):
+        vfe = error_util.VimFaultException([ValueError("example")], "cause")
+        string = str(vfe)
+        self.assertEqual("cause", string)

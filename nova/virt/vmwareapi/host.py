@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright (c) 2013 Hewlett-Packard Development Company, L.P.
 # Copyright (c) 2012 VMware, Inc.
 #
@@ -19,10 +18,10 @@ Management class for host-related functions (start, reboot, etc).
 """
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
-from nova import unit
+from nova.openstack.common import units
 from nova import utils
+from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import vim_util
 from nova.virt.vmwareapi import vm_util
 
@@ -30,16 +29,14 @@ LOG = logging.getLogger(__name__)
 
 
 class Host(object):
-    """
-    Implements host related operations.
-    """
+    """Implements host related operations."""
     def __init__(self, session):
         self._session = session
 
     def host_power_action(self, host, action):
         """Reboots or shuts down the host."""
         host_mor = vm_util.get_host_ref(self._session)
-        LOG.debug(_("%(action)s %(host)s"), {'action': action, 'host': host})
+        LOG.debug("%(action)s %(host)s", {'action': action, 'host': host})
         if action == "reboot":
             host_task = self._session._call_method(
                                     self._session._get_vim(),
@@ -55,14 +52,14 @@ class Host(object):
                                     self._session._get_vim(),
                                     "PowerUpHostFromStandBy_Task", host_mor,
                                     timeoutSec=60)
-        self._session._wait_for_task(host, host_task)
+        self._session._wait_for_task(host_task)
 
     def host_maintenance_mode(self, host, mode):
         """Start/Stop host maintenance window. On start, it triggers
         guest VMs evacuation.
         """
         host_mor = vm_util.get_host_ref(self._session)
-        LOG.debug(_("Set maintenance mod on %(host)s to %(mode)s"),
+        LOG.debug("Set maintenance mod on %(host)s to %(mode)s",
                   {'host': host, 'mode': mode})
         if mode:
             host_task = self._session._call_method(
@@ -75,11 +72,19 @@ class Host(object):
                                     self._session._get_vim(),
                                     "ExitMaintenanceMode_Task",
                                     host_mor, timeout=0)
-        self._session._wait_for_task(host, host_task)
+        self._session._wait_for_task(host_task)
 
     def set_host_enabled(self, _host, enabled):
         """Sets the specified host's ability to accept new instances."""
         pass
+
+
+def _get_ds_capacity_and_freespace(session, cluster=None):
+    try:
+        ds = ds_util.get_datastore(session, cluster)
+        return ds.capacity, ds.freespace
+    except exception.DatastoreNotFound:
+        return 0, 0
 
 
 class HostState(object):
@@ -114,10 +119,7 @@ class HostState(object):
         if summary is None:
             return
 
-        try:
-            ds = vm_util.get_datastore_ref_and_name(self._session)
-        except exception.DatastoreNotFound:
-            ds = (None, None, 0, 0)
+        capacity, freespace = _get_ds_capacity_and_freespace(self._session)
 
         data = {}
         data["vcpus"] = summary.hardware.numCpuThreads
@@ -128,10 +130,10 @@ class HostState(object):
                               "sockets": summary.hardware.numCpuPkgs,
                               "threads": summary.hardware.numCpuThreads}
                 }
-        data["disk_total"] = ds[2] / unit.Gi
-        data["disk_available"] = ds[3] / unit.Gi
+        data["disk_total"] = capacity / units.Gi
+        data["disk_available"] = freespace / units.Gi
         data["disk_used"] = data["disk_total"] - data["disk_available"]
-        data["host_memory_total"] = summary.hardware.memorySize / unit.Mi
+        data["host_memory_total"] = summary.hardware.memorySize / units.Mi
         data["host_memory_free"] = data["host_memory_total"] - \
                                    summary.quickStats.overallMemoryUsage
         data["hypervisor_type"] = summary.config.product.name
@@ -167,12 +169,8 @@ class VCState(object):
 
     def update_status(self):
         """Update the current state of the cluster."""
-        # Get the datastore in the cluster
-        try:
-            ds = vm_util.get_datastore_ref_and_name(self._session,
-                                                    self._cluster)
-        except exception.DatastoreNotFound:
-            ds = (None, None, 0, 0)
+        capacity, freespace = _get_ds_capacity_and_freespace(self._session,
+                                                             self._cluster)
 
         # Get cpu, memory stats from the cluster
         stats = vm_util.get_stats_from_cluster(self._session, self._cluster)
@@ -183,8 +181,8 @@ class VCState(object):
                             "model": stats['cpu']['model'],
                             "topology": {"cores": stats['cpu']['cores'],
                                          "threads": stats['cpu']['vcpus']}}
-        data["disk_total"] = ds[2] / unit.Gi
-        data["disk_available"] = ds[3] / unit.Gi
+        data["disk_total"] = capacity / units.Gi
+        data["disk_available"] = freespace / units.Gi
         data["disk_used"] = data["disk_total"] - data["disk_available"]
         data["host_memory_total"] = stats['mem']['total']
         data["host_memory_free"] = stats['mem']['free']

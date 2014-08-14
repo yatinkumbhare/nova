@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -23,18 +21,22 @@ import webob.dec
 import webob.exc
 
 from nova import context
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova.i18n import _LW
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova.openstack.common.middleware import request_id
 from nova import wsgi
 
 
 auth_opts = [
     cfg.BoolOpt('api_rate_limit',
                 default=False,
-                help='whether to use per-user rate limiting for the api.'),
+                help=('Whether to use per-user rate limiting for the api. '
+                      'This option is only used by v2 api. Rate limiting '
+                      'is removed from v3 api.')),
     cfg.StrOpt('auth_strategy',
-               default='noauth',
+               default='keystone',
                help='The strategy to use for auth: noauth or keystone.'),
     cfg.BoolOpt('use_forwarded_for',
                 default=False,
@@ -48,6 +50,15 @@ CONF.register_opts(auth_opts)
 LOG = logging.getLogger(__name__)
 
 
+def _load_pipeline(loader, pipeline):
+    filters = [loader.get_filter(n) for n in pipeline[:-1]]
+    app = loader.get_app(pipeline[-1])
+    filters.reverse()
+    for filter in filters:
+        app = filter(app)
+    return app
+
+
 def pipeline_factory(loader, global_conf, **local_conf):
     """A paste pipeline replica that keys off of auth_strategy."""
     pipeline = local_conf[CONF.auth_strategy]
@@ -55,12 +66,18 @@ def pipeline_factory(loader, global_conf, **local_conf):
         limit_name = CONF.auth_strategy + '_nolimit'
         pipeline = local_conf.get(limit_name, pipeline)
     pipeline = pipeline.split()
-    filters = [loader.get_filter(n) for n in pipeline[:-1]]
-    app = loader.get_app(pipeline[-1])
-    filters.reverse()
-    for filter in filters:
-        app = filter(app)
-    return app
+    # NOTE (Alex Xu): This is just for configuration file compatibility.
+    # If the configuration file still contains 'ratelimit_v3', just ignore it.
+    # We will remove this code at next release (J)
+    if 'ratelimit_v3' in pipeline:
+        LOG.warn(_LW('ratelimit_v3 is removed from v3 api.'))
+        pipeline.remove('ratelimit_v3')
+    return _load_pipeline(loader, pipeline)
+
+
+def pipeline_factory_v3(loader, global_conf, **local_conf):
+    """A paste pipeline replica that keys off of auth_strategy."""
+    return _load_pipeline(loader, local_conf[CONF.auth_strategy].split())
 
 
 class InjectContext(wsgi.Middleware):
@@ -98,6 +115,8 @@ class NovaKeystoneContext(wsgi.Middleware):
         project_name = req.headers.get('X_TENANT_NAME')
         user_name = req.headers.get('X_USER_NAME')
 
+        req_id = req.environ.get(request_id.ENV_REQUEST_ID)
+
         # Get the auth token
         auth_token = req.headers.get('X_AUTH_TOKEN',
                                      req.headers.get('X_STORAGE_TOKEN'))
@@ -123,7 +142,8 @@ class NovaKeystoneContext(wsgi.Middleware):
                                      roles=roles,
                                      auth_token=auth_token,
                                      remote_address=remote_address,
-                                     service_catalog=service_catalog)
+                                     service_catalog=service_catalog,
+                                     request_id=req_id)
 
         req.environ['nova.context'] = ctx
         return self.application
@@ -137,6 +157,6 @@ class NovaKeystoneContext(wsgi.Middleware):
             # Fallback to deprecated role header:
             roles = req.headers.get('X_ROLE', '')
             if roles:
-                LOG.warn(_("Sourcing roles from deprecated X-Role HTTP "
-                           "header"))
+                LOG.warn(_LW("Sourcing roles from deprecated X-Role HTTP "
+                             "header"))
         return [r.strip() for r in roles.split(',')]

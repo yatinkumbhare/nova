@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 #
 # Copyright (c) 2012 NTT DOCOMO, INC
@@ -25,16 +24,17 @@ from oslo.config import cfg
 
 from nova.compute import flavors
 from nova.compute import power_state
+from nova.compute import task_states
 from nova import context as nova_context
 from nova import exception
+from nova.i18n import _
 from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
+from nova.openstack.common import lockutils
 from nova.openstack.common import log as logging
 from nova.virt.baremetal import baremetal_states
 from nova.virt.baremetal import db
-from nova.virt.baremetal import pxe
 from nova.virt import driver
 from nova.virt import firewall
 from nova.virt.libvirt import imagecache
@@ -50,11 +50,10 @@ opts = [
                help='Baremetal volume driver.'),
     cfg.ListOpt('flavor_extra_specs',
                default=[],
-               help='a list of additional capabilities corresponding to '
+               help='A list of additional capabilities corresponding to '
                'flavor_extra_specs for this compute '
                'host to advertise. Valid entries are name=value, pairs '
-               'For example, "key1:val1, key2:val2"',
-               deprecated_name='instance_type_extra_specs'),
+               'For example, "key1:val1, key2:val2"'),
     cfg.StrOpt('driver',
                default='nova.virt.baremetal.pxe.PXE',
                help='Baremetal driver back-end (pxe or tilera)'),
@@ -113,10 +112,18 @@ class BareMetalDriver(driver.ComputeDriver):
 
     capabilities = {
         "has_imagecache": True,
+        "supports_recreate": False,
         }
+
+    def _do_deprecation_warning(self):
+        LOG.warning(_('The baremetal driver is deprecated, untested, '
+                      'unmaintained and will be replaced by an Ironic '
+                      'driver in the future.'))
 
     def __init__(self, virtapi, read_only=False):
         super(BareMetalDriver, self).__init__(virtapi)
+
+        self._do_deprecation_warning()
 
         self.driver = importutils.import_object(
                 CONF.baremetal.driver, virtapi)
@@ -211,6 +218,9 @@ class BareMetalDriver(driver.ComputeDriver):
         self.firewall_driver.unfilter_instance(
                 instance, network_info)
 
+    def deallocate_networks_on_reschedule(self, instance):
+        return True
+
     def macs_for_instance(self, instance):
         context = nova_context.get_admin_context()
         node_uuid = self._require_node(instance)
@@ -221,10 +231,8 @@ class BareMetalDriver(driver.ComputeDriver):
     def _set_default_ephemeral_device(self, instance):
         flavor = flavors.extract_flavor(instance)
         if flavor['ephemeral_gb']:
-            self.virtapi.instance_update(
-                nova_context.get_admin_context(), instance['uuid'],
-                {'default_ephemeral_device':
-                    '/dev/sda1'})
+            instance.default_ephemeral_device = '/dev/sda1'
+            instance.save()
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None):
@@ -237,14 +245,31 @@ class BareMetalDriver(driver.ComputeDriver):
         node = db.bm_node_associate_and_update(context, node_uuid,
                     {'instance_uuid': instance['uuid'],
                      'instance_name': instance['hostname'],
-                     'task_state': baremetal_states.BUILDING})
+                     'task_state': baremetal_states.BUILDING,
+                     'preserve_ephemeral': False})
+        self._spawn(node, context, instance, image_meta, injected_files,
+            admin_password, network_info=network_info,
+            block_device_info=block_device_info)
 
+    def _spawn(self, node, context, instance, image_meta, injected_files,
+            admin_password, network_info=None, block_device_info=None):
         try:
             self._plug_vifs(instance, network_info, context=context)
             self._attach_block_devices(instance, block_device_info)
             self._start_firewall(instance, network_info)
 
-            self.driver.cache_images(
+            # Caching images is both CPU and I/O expensive. When running many
+            # machines from a single nova-compute server, deploys of multiple
+            # machines can easily thrash the nova-compute server - unlike a
+            # virt hypervisor which is limited by CPU for VMs, baremetal only
+            # uses CPU and I/O when deploying. By only downloading one image
+            # at a time we serialise rather than thrashing, which leads to a
+            # lower average time-to-complete during overload situations, and
+            # a (relatively) insignificant delay for compute servers which
+            # have sufficient IOPS to handle multiple concurrent image
+            # conversions.
+            with lockutils.lock('nova-baremetal-cache-images', external=True):
+                self.driver.cache_images(
                             context, node, instance,
                             admin_password=admin_password,
                             image_meta=image_meta,
@@ -258,6 +283,8 @@ class BareMetalDriver(driver.ComputeDriver):
             self.power_off(instance, node)
             self.power_on(context, instance, network_info, block_device_info,
                           node)
+            _update_state(context, node, instance, baremetal_states.PREPARED)
+
             self.driver.activate_node(context, node, instance)
             _update_state(context, node, instance, baremetal_states.ACTIVE)
         except Exception:
@@ -281,6 +308,54 @@ class BareMetalDriver(driver.ComputeDriver):
                 self._unplug_vifs(instance, network_info)
 
                 _update_state(context, node, None, baremetal_states.DELETED)
+        else:
+            # We no longer need the image since we successfully deployed.
+            self.driver.destroy_images(context, node, instance)
+
+    def rebuild(self, context, instance, image_meta, injected_files,
+                admin_password, bdms, detach_block_devices,
+                attach_block_devices, network_info=None, recreate=False,
+                block_device_info=None, preserve_ephemeral=False):
+        """Destroy and re-make this instance.
+
+        A 'rebuild' effectively purges all existing data from the system and
+        remakes the VM with given 'metadata' and 'personalities'.
+
+        :param context: Security context.
+        :param instance: Instance object.
+        :param image_meta: Image object returned by nova.image.glance that
+                           defines the image from which to boot this instance.
+        :param injected_files: User files to inject into instance.
+        :param admin_password: Administrator password to set in instance.
+        :param bdms: block-device-mappings to use for rebuild
+        :param detach_block_devices: function to detach block devices. See
+            nova.compute.manager.ComputeManager:_rebuild_default_impl for
+            usage.
+        :param attach_block_devices: function to attach block devices. See
+            nova.compute.manager.ComputeManager:_rebuild_default_impl for
+            usage.
+        :param network_info:
+           :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
+        :param block_device_info: Information about block devices to be
+                                  attached to the instance.
+        :param recreate: True if instance should be recreated with same disk.
+        :param preserve_ephemeral: True if the default ephemeral storage
+                                   partition must be preserved on rebuild.
+        """
+
+        instance.task_state = task_states.REBUILD_SPAWNING
+        instance.save(expected_task_state=[task_states.REBUILDING])
+
+        node_uuid = self._require_node(instance)
+        node = db.bm_node_get_by_node_uuid(context, node_uuid)
+        db.bm_node_update(
+            context, node['id'],
+            {'task_state': baremetal_states.BUILDING,
+             'preserve_ephemeral': preserve_ephemeral}
+        )
+        self._spawn(node, context, instance, image_meta, injected_files,
+                    admin_password, network_info=network_info,
+                    block_device_info=block_device_info)
 
     def reboot(self, context, instance, network_info, reboot_type,
                block_device_info=None, bad_volumes_callback=None):
@@ -294,7 +369,8 @@ class BareMetalDriver(driver.ComputeDriver):
                 "for instance %r") % instance['uuid'])
         _update_state(ctx, node, instance, state)
 
-    def destroy(self, context, instance, network_info, block_device_info=None):
+    def destroy(self, context, instance, network_info, block_device_info=None,
+                destroy_disks=True, migrate_data=None):
         context = nova_context.get_admin_context()
 
         try:
@@ -326,6 +402,11 @@ class BareMetalDriver(driver.ComputeDriver):
                     LOG.error(_("Error while recording destroy failure in "
                                 "baremetal database: %s") % e)
 
+    def cleanup(self, context, instance, network_info, block_device_info=None,
+                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+        """Cleanup after instance being destroyed."""
+        pass
+
     def power_off(self, instance, node=None):
         """Power off the specified instance."""
         if not node:
@@ -355,7 +436,7 @@ class BareMetalDriver(driver.ComputeDriver):
         return self.volume_driver.get_volume_connector(instance)
 
     def attach_volume(self, context, connection_info, instance, mountpoint,
-                      encryption=None):
+                      disk_bus=None, device_type=None, encryption=None):
         return self.volume_driver.attach_volume(connection_info,
                                                 instance, mountpoint)
 
@@ -421,7 +502,7 @@ class BareMetalDriver(driver.ComputeDriver):
                'cpu_info': 'baremetal cpu',
                'supported_instances':
                         jsonutils.dumps(self.supported_instances),
-               'stats': self.extra_specs
+               'stats': jsonutils.dumps(self.extra_specs)
                }
         return dic
 
@@ -497,10 +578,10 @@ class BareMetalDriver(driver.ComputeDriver):
 
     def manage_image_cache(self, context, all_instances):
         """Manage the local cache of images."""
-        self.image_cache_manager.verify_base_images(context, all_instances)
+        self.image_cache_manager.update(context, all_instances)
 
-    def get_console_output(self, instance):
-        node = _get_baremetal_node_by_instance_uuid(instance['uuid'])
+    def get_console_output(self, context, instance):
+        node = _get_baremetal_node_by_instance_uuid(instance.uuid)
         return self.driver.get_console_output(node, instance)
 
     def get_available_nodes(self, refresh=False):
@@ -509,17 +590,4 @@ class BareMetalDriver(driver.ComputeDriver):
                 db.bm_node_get_all(context, service_host=CONF.host)]
 
     def dhcp_options_for_instance(self, instance):
-        # NOTE(deva): This only works for PXE driver currently:
-        # If not running the PXE driver, you should not enable
-        # DHCP updates in nova.conf.
-        bootfile_name = pxe.get_pxe_bootfile_name(instance)
-
-        opts = [{'opt_name': 'bootfile-name',
-                 'opt_value': bootfile_name},
-                {'opt_name': 'server-ip-address',
-                 'opt_value': CONF.my_ip},
-                {'opt_name': 'tftp-server',
-                 'opt_value': CONF.my_ip}
-               ]
-
-        return opts
+        return self.driver.dhcp_options_for_instance(instance)

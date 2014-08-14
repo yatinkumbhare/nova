@@ -23,7 +23,7 @@ from nova.api.openstack import extensions as exts
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import utils
 
 
@@ -32,16 +32,18 @@ authorize = exts.extension_authorizer('compute', 'rescue')
 
 
 class RescueController(wsgi.Controller):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, ext_mgr, *args, **kwargs):
         super(RescueController, self).__init__(*args, **kwargs)
         self.compute_api = compute.API()
+        self.ext_mgr = ext_mgr
 
-    def _get_instance(self, context, instance_id):
+    def _get_instance(self, context, instance_id, want_objects=False):
         try:
-            return self.compute_api.get(context, instance_id)
+            return self.compute_api.get(context, instance_id,
+                                        want_objects=want_objects)
         except exception.InstanceNotFound:
             msg = _("Server not found")
-            raise exc.HTTPNotFound(msg)
+            raise exc.HTTPNotFound(explanation=msg)
 
     @wsgi.action('rescue')
     def _rescue(self, req, id, body):
@@ -54,10 +56,16 @@ class RescueController(wsgi.Controller):
         else:
             password = utils.generate_password()
 
-        instance = self._get_instance(context, id)
+        instance = self._get_instance(context, id, want_objects=True)
         try:
+            rescue_image_ref = None
+            if self.ext_mgr.is_loaded("os-extended-rescue-with-image"):
+                if body['rescue'] and 'rescue_image_ref' in body['rescue']:
+                    rescue_image_ref = body['rescue']['rescue_image_ref']
             self.compute_api.rescue(context, instance,
-                                    rescue_password=password)
+                rescue_password=password, rescue_image_ref=rescue_image_ref)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                                                                   'rescue')
@@ -66,6 +74,10 @@ class RescueController(wsgi.Controller):
         except exception.InstanceNotRescuable as non_rescuable:
             raise exc.HTTPBadRequest(
                 explanation=non_rescuable.format_message())
+        except NotImplementedError:
+                msg = _("The rescue operation is not implemented by this "
+                        "cloud.")
+                raise exc.HTTPNotImplemented(explanation=msg)
 
         return {'adminPass': password}
 
@@ -74,12 +86,18 @@ class RescueController(wsgi.Controller):
         """Unrescue an instance."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = self._get_instance(context, id)
+        instance = self._get_instance(context, id, want_objects=True)
         try:
             self.compute_api.unrescue(context, instance)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                                                                   'unrescue')
+        except NotImplementedError:
+            msg = _("The unrescue operation is not implemented by this cloud.")
+            raise exc.HTTPNotImplemented(explanation=msg)
+
         return webob.Response(status_int=202)
 
 
@@ -89,9 +107,9 @@ class Rescue(exts.ExtensionDescriptor):
     name = "Rescue"
     alias = "os-rescue"
     namespace = "http://docs.openstack.org/compute/ext/rescue/api/v1.1"
-    updated = "2011-08-18T00:00:00+00:00"
+    updated = "2011-08-18T00:00:00Z"
 
     def get_controller_extensions(self):
-        controller = RescueController()
+        controller = RescueController(self.ext_mgr)
         extension = exts.ControllerExtension(self, 'servers', controller)
         return [extension]

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
@@ -388,33 +386,6 @@ def stub_out_db_instance_api(stubs, injected=True):
                  flavorid=5,
                  rxtx_factor=1.0,
                  swap=0)}
-
-    flat_network_fields = {'id': 'fake_flat',
-                           'bridge': 'xenbr0',
-                           'label': 'fake_flat_network',
-                           'netmask': '255.255.255.0',
-                           'cidr_v6': 'fe80::a00:0/120',
-                           'netmask_v6': '120',
-                           'gateway': '10.0.0.1',
-                           'gateway_v6': 'fe80::a00:1',
-                           'broadcast': '10.0.0.255',
-                           'dns': '10.0.0.2',
-                           'ra_server': None,
-                           'injected': injected}
-
-    vlan_network_fields = {'id': 'fake_vlan',
-                           'bridge': 'br111',
-                           'label': 'fake_vlan_network',
-                           'netmask': '255.255.255.0',
-                           'cidr_v6': 'fe80::a00:0/120',
-                           'netmask_v6': '120',
-                           'gateway': '10.0.0.1',
-                           'gateway_v6': 'fe80::a00:1',
-                           'broadcast': '10.0.0.255',
-                           'dns': '10.0.0.2',
-                           'ra_server': None,
-                           'vlan': 111,
-                           'injected': False}
 
     fixed_ip_fields = {'address': '10.0.0.3',
                        'address_v6': 'fe80::a00:3',

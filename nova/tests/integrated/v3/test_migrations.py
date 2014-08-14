@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright 2012 Nebula, Inc.
 # Copyright 2013 IBM Corp.
 #
@@ -37,7 +36,9 @@ class MigrationsSamplesJsonTest(api_sample_base.ApiSampleTestBaseV3):
                 'old_instance_type_id': 1,
                 'new_instance_type_id': 2,
                 'created_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
-                'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 2)
+                'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
+                'deleted_at': None,
+                'deleted': False
             },
             {
                 'id': 5678,
@@ -51,7 +52,9 @@ class MigrationsSamplesJsonTest(api_sample_base.ApiSampleTestBaseV3):
                 'old_instance_type_id': 5,
                 'new_instance_type_id': 6,
                 'created_at': datetime.datetime(2013, 10, 22, 13, 42, 2),
-                'updated_at': datetime.datetime(2013, 10, 22, 13, 42, 2)
+                'updated_at': datetime.datetime(2013, 10, 22, 13, 42, 2),
+                'deleted_at': None,
+                'deleted': False
             }
         ]
         return fake_migrations
@@ -67,7 +70,3 @@ class MigrationsSamplesJsonTest(api_sample_base.ApiSampleTestBaseV3):
 
         self.assertEqual(response.status, 200)
         self._verify_response('migrations-get', subs, response, 200)
-
-
-class MigrationsSamplesXmlTest(MigrationsSamplesJsonTest):
-    ctype = 'xml'

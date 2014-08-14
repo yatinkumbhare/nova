@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -63,7 +61,7 @@ class ConsolesController(object):
 
     @extensions.expected_errors(404)
     @wsgi.response(201)
-    def create(self, req, server_id):
+    def create(self, req, server_id, body):
         """Creates a new console."""
         try:
             self.console_api.create_console(
@@ -100,7 +98,6 @@ class Consoles(extensions.V3APIExtensionBase):
 
     name = "Consoles"
     alias = "consoles"
-    namespace = "http://docs.openstack.org/compute/core/consoles/v3"
     version = 1
 
     def get_resources(self):

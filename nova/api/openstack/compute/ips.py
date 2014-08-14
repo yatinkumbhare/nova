@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -22,7 +20,7 @@ from nova.api.openstack import common
 from nova.api.openstack.compute.views import addresses as view_addresses
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 def make_network(elem):
@@ -69,12 +67,6 @@ class Controller(wsgi.Controller):
             msg = _("Instance does not exist")
             raise exc.HTTPNotFound(explanation=msg)
         return instance
-
-    def create(self, req, server_id, body):
-        raise exc.HTTPNotImplemented()
-
-    def delete(self, req, server_id, id):
-        raise exc.HTTPNotImplemented()
 
     @wsgi.serializers(xml=AddressesTemplate)
     def index(self, req, server_id):

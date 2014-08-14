@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -33,8 +31,8 @@ from oslo.config import cfg
 from nova.api.ec2 import ec2utils
 import nova.cert.rpcapi
 from nova import exception
+from nova.i18n import _
 from nova.image import glance
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
 from nova import utils
@@ -45,27 +43,27 @@ LOG = logging.getLogger(__name__)
 s3_opts = [
     cfg.StrOpt('image_decryption_dir',
                default='/tmp',
-               help='parent dir for tempdir used for image decryption'),
+               help='Parent directory for tempdir used for image decryption'),
     cfg.StrOpt('s3_host',
                default='$my_ip',
-               help='hostname or ip for OpenStack to use when accessing '
-                    'the s3 api'),
+               help='Hostname or IP for OpenStack to use when accessing '
+                    'the S3 api'),
     cfg.IntOpt('s3_port',
                default=3333,
-               help='port used when accessing the s3 api'),
+               help='Port used when accessing the S3 api'),
     cfg.StrOpt('s3_access_key',
                default='notchecked',
-               help='access key to use for s3 server for images'),
+               help='Access key to use for S3 server for images'),
     cfg.StrOpt('s3_secret_key',
                default='notchecked',
-               help='secret key to use for s3 server for images'),
+               help='Secret key to use for S3 server for images'),
     cfg.BoolOpt('s3_use_ssl',
                default=False,
-               help='whether to use ssl when talking to s3'),
+               help='Whether to use SSL when talking to S3'),
     cfg.BoolOpt('s3_affix_tenant',
                default=False,
-               help='whether to affix the tenant id to the access key '
-                    'when downloading from s3'),
+               help='Whether to affix the tenant id to the access key '
+                    'when downloading from S3'),
     ]
 
 CONF = cfg.CONF
@@ -162,7 +160,7 @@ class S3ImageService(object):
         return self._translate_uuid_to_id(context, image)
 
     def detail(self, context, **kwargs):
-        #NOTE(bcwaldon): sort asc to make sure we assign lower ids
+        # NOTE(bcwaldon): sort asc to make sure we assign lower ids
         # to older images
         kwargs.setdefault('sort_dir', 'asc')
         images = self.service.detail(context, **kwargs)
@@ -266,7 +264,7 @@ class S3ImageService(object):
                          'properties': properties})
         metadata['properties']['image_state'] = 'pending'
 
-        #TODO(bcwaldon): right now, this removes user-defined ids.
+        # TODO(bcwaldon): right now, this removes user-defined ids.
         # We need to re-enable this.
         metadata.pop('id', None)
 

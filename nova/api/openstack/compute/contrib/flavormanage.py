@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -20,16 +18,14 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.compute import flavors
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 authorize = extensions.extension_authorizer('compute', 'flavormanage')
 
 
 class FlavorManageController(wsgi.Controller):
-    """
-    The Flavor Lifecycle API controller for the OpenStack API.
-    """
+    """The Flavor Lifecycle API controller for the OpenStack API."""
     _view_builder_class = flavors_view.ViewBuilder
 
     def __init__(self):
@@ -75,9 +71,6 @@ class FlavorManageController(wsgi.Controller):
                                     flavorid=flavorid, swap=swap,
                                     rxtx_factor=rxtx_factor,
                                     is_public=is_public)
-            if not flavor['is_public']:
-                flavors.add_flavor_access(flavor['flavorid'],
-                                          context.project_id, context)
             req.cache_db_flavor(flavor)
         except (exception.FlavorExists,
                 exception.FlavorIdExists) as err:
@@ -89,15 +82,13 @@ class FlavorManageController(wsgi.Controller):
 
 
 class Flavormanage(extensions.ExtensionDescriptor):
-    """
-    Flavor create/delete API support
-    """
+    """Flavor create/delete API support."""
 
     name = "FlavorManage"
     alias = "os-flavor-manage"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "flavor_manage/api/v1.1")
-    updated = "2012-01-19T00:00:00+00:00"
+    updated = "2012-01-19T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = FlavorManageController()

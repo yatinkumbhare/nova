@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -27,12 +25,14 @@ from nova.conductor import rpcapi as conductor_rpcapi
 from nova import config
 import nova.db.api
 from nova import exception
+from nova.i18n import _
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
+from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
 from nova import utils
+from nova import version
 
 CONF = cfg.CONF
 CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
@@ -55,10 +55,12 @@ def block_db_access():
 
 
 def main():
-    objects.register_all()
     config.parse_args(sys.argv)
     logging.setup('nova')
     utils.monkey_patch()
+    objects.register_all()
+
+    gmr.TextGuruMeditation.setup_autorun(version)
 
     if not CONF.conductor.use_local:
         block_db_access()
@@ -67,6 +69,6 @@ def main():
 
     server = service.Service.create(binary='nova-compute',
                                     topic=CONF.compute_topic,
-                                    db_allowed=False)
+                                    db_allowed=CONF.conductor.use_local)
     service.serve(server)
     service.wait()

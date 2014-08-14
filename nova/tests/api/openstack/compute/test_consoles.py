@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # Copyright 2011 Piston Cloud Computing, Inc.
 # All Rights Reserved.
@@ -144,7 +142,7 @@ class ConsolesControllerTest(test.NoDBTestCase):
         self.stubs.Set(console.api.API, 'create_console', fake_create_console)
 
         req = fakes.HTTPRequest.blank(self.url)
-        self.controller.create(req, self.uuid)
+        self.controller.create(req, self.uuid, None)
 
     def test_show_console(self):
         def fake_get_console(cons_self, context, instance_id, console_id):

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
@@ -24,12 +22,13 @@ import uuid
 
 from sqlalchemy.sql.expression import asc
 from sqlalchemy.sql.expression import literal_column
+from sqlalchemy.sql import null
 
 import nova.context
 from nova.db.sqlalchemy import api as sqlalchemy_api
 from nova import exception
+from nova.i18n import _
 from nova.openstack.common.db import exception as db_exc
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
 from nova.virt.baremetal.db.sqlalchemy import models
@@ -93,7 +92,7 @@ def bm_node_get_all(context, service_host=None):
 @sqlalchemy_api.require_admin_context
 def bm_node_get_associated(context, service_host=None):
     query = model_query(context, models.BareMetalNode, read_deleted="no").\
-                filter(models.BareMetalNode.instance_uuid != None)
+                filter(models.BareMetalNode.instance_uuid != null())
     if service_host:
         query = query.filter_by(service_host=service_host)
     return query.all()
@@ -102,7 +101,7 @@ def bm_node_get_associated(context, service_host=None):
 @sqlalchemy_api.require_admin_context
 def bm_node_get_unassociated(context, service_host=None):
     query = model_query(context, models.BareMetalNode, read_deleted="no").\
-                filter(models.BareMetalNode.instance_uuid == None)
+                filter(models.BareMetalNode.instance_uuid == null())
     if service_host:
         query = query.filter_by(service_host=service_host)
     return query.all()
@@ -112,7 +111,7 @@ def bm_node_get_unassociated(context, service_host=None):
 def bm_node_find_free(context, service_host=None,
                       cpus=None, memory_mb=None, local_gb=None):
     query = model_query(context, models.BareMetalNode, read_deleted="no")
-    query = query.filter(models.BareMetalNode.instance_uuid == None)
+    query = query.filter(models.BareMetalNode.instance_uuid == null())
     if service_host:
         query = query.filter_by(service_host=service_host)
     if cpus is not None:
@@ -190,7 +189,7 @@ def bm_node_update(context, bm_node_id, values):
 def bm_node_associate_and_update(context, node_uuid, values):
     """Associate an instance to a node safely
 
-    Associate an instance to a node only if that node is not yet assocated.
+    Associate an instance to a node only if that node is not yet associated.
     Allow the caller to set any other fields they require in the same
     operation. For example, this is used to set the node's task_state to
     BUILDING at the beginning of driver.spawn().

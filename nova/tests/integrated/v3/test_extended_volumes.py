@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright 2012 Nebula, Inc.
 # Copyright 2013 IBM Corp.
 #
@@ -18,7 +17,10 @@ from nova.compute import api as compute_api
 from nova.compute import manager as compute_manager
 from nova import context
 from nova import db
+from nova import objects
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_block_device
+from nova.tests import fake_instance
 from nova.tests.integrated.v3 import test_servers
 from nova.volume import cinder
 
@@ -28,25 +30,31 @@ class ExtendedVolumesSampleJsonTests(test_servers.ServersSampleBase):
 
     def _stub_compute_api_get_instance_bdms(self, server_id):
 
-        def fake_compute_api_get_instance_bdms(self, context, instance):
+        def fake_bdms_get_all_by_instance(context, instance_uuid,
+                                          use_slave=False):
             bdms = [
-                {'volume_id': 'a26887c6-c47b-4654-abb5-dfadf7d3f803',
-                'instance_uuid': server_id,
-                'device_name': '/dev/sdd'},
-                {'volume_id': 'a26887c6-c47b-4654-abb5-dfadf7d3f804',
-                'instance_uuid': server_id,
-                'device_name': '/dev/sdc'}
+                fake_block_device.FakeDbBlockDeviceDict(
+                {'id': 1, 'volume_id': 'a26887c6-c47b-4654-abb5-dfadf7d3f803',
+                'instance_uuid': server_id, 'source_type': 'volume',
+                'destination_type': 'volume', 'device_name': '/dev/sdd'}),
+                fake_block_device.FakeDbBlockDeviceDict(
+                {'id': 2, 'volume_id': 'a26887c6-c47b-4654-abb5-dfadf7d3f804',
+                'instance_uuid': server_id, 'source_type': 'volume',
+                'destination_type': 'volume', 'device_name': '/dev/sdc'})
             ]
             return bdms
 
-        self.stubs.Set(compute_api.API, "get_instance_bdms",
-                       fake_compute_api_get_instance_bdms)
+        self.stubs.Set(db, 'block_device_mapping_get_all_by_instance',
+                       fake_bdms_get_all_by_instance)
 
     def _stub_compute_api_get(self):
-
-        def fake_compute_api_get(self, context, instance_id,
-                                 want_objects=False):
-            return {'uuid': instance_id}
+        def fake_compute_api_get(self, context, instance_id, **kwargs):
+            want_objects = kwargs.get('want_objects')
+            if want_objects:
+                return fake_instance.fake_instance_obj(
+                        context, **{'uuid': instance_id})
+            else:
+                return {'uuid': instance_id}
 
         self.stubs.Set(compute_api.API, 'get', fake_compute_api_get)
 
@@ -80,12 +88,16 @@ class ExtendedVolumesSampleJsonTests(test_servers.ServersSampleBase):
         self.stubs.Set(compute_manager.ComputeManager,
                        'attach_volume',
                        lambda *a, **k: None)
+        self.stubs.Set(objects.BlockDeviceMapping, 'get_by_volume_id',
+                       classmethod(lambda *a, **k: None))
 
         volume = fakes.stub_volume_get(None, context.get_admin_context(),
                                        'a26887c6-c47b-4654-abb5-dfadf7d3f803')
         subs = {
             'volume_id': volume['id'],
-            'device': device_name
+            'device': device_name,
+            'disk_bus': 'ide',
+            'device_type': 'cdrom'
         }
         server_id = self._post_server()
         response = self._do_post('servers/%s/action'
@@ -137,7 +149,3 @@ class ExtendedVolumesSampleJsonTests(test_servers.ServersSampleBase):
                                  'swap-volume-req', subs)
         self.assertEqual(response.status, 202)
         self.assertEqual(response.read(), '')
-
-
-class ExtendedVolumesSampleXmlTests(ExtendedVolumesSampleJsonTests):
-    ctype = 'xml'

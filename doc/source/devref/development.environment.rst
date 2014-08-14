@@ -35,12 +35,12 @@ Virtual environments
 --------------------
 
 Nova development uses a set of shell scripts in DevStack. Virtual
-enviroments with venv are also available with the source code.
+environments with venv are also available with the source code.
 
 The easiest way to build a fully functional development environment is
 with DevStack. Create a machine (such as a VM or Vagrant box) running a
 distribution supported by DevStack and install DevStack there. For
-example, there is a Vagrant script for DevStack at https://github.com/jogo/DevstackUp.
+example, there is a Vagrant script for DevStack at http://git.openstack.org/cgit/openstack-dev/devstack-vagrant/.
 
  .. note::
 
@@ -60,15 +60,19 @@ Install the prerequisite packages.
 
 On Ubuntu::
 
-  sudo apt-get install python-dev libssl-dev python-pip git-core libxml2-dev libxslt-dev
+  sudo apt-get install python-dev libssl-dev python-pip git-core libxml2-dev libxslt-dev pkg-config libffi-dev libpq-dev libmysqlclient-dev libvirt-dev
 
 On Ubuntu Precise (12.04) you may also need to add the following packages::
 
   sudo apt-get build-dep python-mysqldb
+  # enable cloud-archive to get the latest libvirt
+  sudo apt-get install python-software-properties
+  sudo add-apt-repository cloud-archive:icehouse
+  sudo apt-get install libvirt-dev
 
 On Fedora-based distributions (e.g., Fedora/RHEL/CentOS/Scientific Linux)::
 
-  sudo yum install python-devel openssl-devel python-pip git gcc libxslt-devel mysql-devel python-pip postgresql-devel
+  sudo yum install python-devel openssl-devel python-pip git gcc libxslt-devel mysql-devel postgresql-devel libffi-devel libvirt-devel
   sudo pip-python install tox
 
 
@@ -101,46 +105,43 @@ Grab the code from GitHub::
 
 Running unit tests
 ------------------
-The unit tests will run by default inside a virtualenv in the ``.venv``
-directory. Run the unit tests by doing::
 
-    ./run_tests.sh
+See :doc:`unit_tests` for details.
 
-The first time you run them, you will be asked if you want to create a virtual
-environment (hit "y")::
 
-    No virtual environment found...create one? (Y/n)
+Using a remote debugger
+-----------------------
 
-See :doc:`unit_tests` for more details.
+Some modern IDE such as pycharm (commercial) or Eclipse (open source) support remote debugging.  In order to run nova with remote debugging, start the nova process
+with the following parameters
+--remote_debug-host <host IP where the debugger is running>
+--remote_debug-port <port it is listening on>
 
-.. _virtualenv:
+Before you start your nova process, start the remote debugger using the instructions for that debugger.
+For pycharm - http://blog.jetbrains.com/pycharm/2010/12/python-remote-debug-with-pycharm/
+For Eclipse - http://pydev.org/manual_adv_remote_debugger.html
 
-Manually installing and using the virtualenv
---------------------------------------------
+More detailed instructions are located here - http://novaremotedebug.blogspot.com
 
-You can manually install the virtual environment instead of having
-``run_tests.sh`` do it for you::
+Using fake computes for tests
+-----------------------------
 
-  python tools/install_venv.py
+The number of instances supported by fake computes is not limited by physical
+constraints. It allows you to perform stress tests on a deployment with few
+resources (typically a laptop). But you must avoid using scheduler filters
+limiting the number of instances per compute (like RamFilter, DiskFilter,
+AggregateCoreFilter), otherwise they will limit the number of instances per
+compute.
 
-This will install all of the Python packages listed in the
-``requirements.txt`` file into your virtualenv. There will also be some
-additional packages (pip, setuptools, greenlet) that are installed
-by the ``tools/install_venv.py`` file into the virutalenv.
 
-If all goes well, you should get a message something like this::
+Fake computes can also be used in multi hypervisor-type deployments in order to
+take advantage of fake and "real" computes during tests:
 
-  Nova development environment setup is complete.
+* create many fake instances for stress tests
+* create some "real" instances for functional tests
 
-To activate the Nova virtualenv for the extent of your current shell session
-you can run::
-
-     $ source .venv/bin/activate
-
-Or, if you prefer, you can run commands in the virtualenv on a case by case
-basis by running::
-
-     $ tools/with_venv.sh <your command>
+Fake computes can be used for testing Nova itself but also applications on top
+of it.
 
 Contributing Your Work
 ----------------------

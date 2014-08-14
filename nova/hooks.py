@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -25,22 +23,22 @@ post)
 Hook objects are loaded by HookLoaders.  Each named hook may invoke multiple
 Hooks.
 
-Example Hook object:
+Example Hook object::
 
-class MyHook(object):
-    def pre(self, *args, **kwargs):
-        # do stuff before wrapped callable runs
+    | class MyHook(object):
+    |    def pre(self, *args, **kwargs):
+    |       # do stuff before wrapped callable runs
+    |
+    |   def post(self, rv, *args, **kwargs):
+    |       # do stuff after wrapped callable runs
 
-    def post(self, rv, *args, **kwargs):
-        # do stuff after wrapped callable runs
+Example Hook object with function parameters::
 
-Example Hook object with function parameters:
-
-class MyHookWithFunction(object):
-    def pre(self, f, *args, **kwargs):
-        # do stuff with wrapped function info
-    def post(self, f, *args, **kwards):
-        # do stuff with wrapped function info
+    | class MyHookWithFunction(object):
+    |   def pre(self, f, *args, **kwargs):
+    |       # do stuff with wrapped function info
+    |   def post(self, f, *args, **kwargs):
+    |       # do stuff with wrapped function info
 
 """
 
@@ -48,13 +46,21 @@ import functools
 
 import stevedore
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _LE
 from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 NS = 'nova.hooks'
 
 _HOOKS = {}  # hook name => hook manager
+
+
+class FatalHookException(Exception):
+    """Exception which should be raised by hooks to indicate that normal
+    execution of the hooked function should be terminated. Raised exception
+    will be logged and reraised.
+    """
+    pass
 
 
 class HookManager(stevedore.hook.HookManager):
@@ -67,24 +73,42 @@ class HookManager(stevedore.hook.HookManager):
             obj = e.obj
             pre = getattr(obj, 'pre', None)
             if pre:
-                LOG.debug(_("Running %(name)s pre-hook: %(obj)s"),
+                LOG.debug("Running %(name)s pre-hook: %(obj)s",
                           {'name': name, 'obj': obj})
-                if f:
-                    pre(f, *args, **kwargs)
-                else:
-                    pre(*args, **kwargs)
+                try:
+                    if f:
+                        pre(f, *args, **kwargs)
+                    else:
+                        pre(*args, **kwargs)
+                except FatalHookException:
+                    msg = _LE("Fatal Exception running %(name)s "
+                              "pre-hook: %(obj)s")
+                    LOG.exception(msg, {'name': name, 'obj': obj})
+                    raise
+                except Exception:
+                    msg = _LE("Exception running %(name)s pre-hook: %(obj)s")
+                    LOG.exception(msg, {'name': name, 'obj': obj})
 
     def run_post(self, name, rv, args, kwargs, f=None):
         for e in reversed(self.extensions):
             obj = e.obj
             post = getattr(obj, 'post', None)
             if post:
-                LOG.debug(_("Running %(name)s post-hook: %(obj)s"),
+                LOG.debug("Running %(name)s post-hook: %(obj)s",
                           {'name': name, 'obj': obj})
-                if f:
-                    post(f, rv, *args, **kwargs)
-                else:
-                    post(rv, *args, **kwargs)
+                try:
+                    if f:
+                        post(f, rv, *args, **kwargs)
+                    else:
+                        post(rv, *args, **kwargs)
+                except FatalHookException:
+                    msg = _LE("Fatal Exception running %(name)s "
+                              "post-hook: %(obj)s")
+                    LOG.exception(msg, {'name': name, 'obj': obj})
+                    raise
+                except Exception:
+                    msg = _LE("Exception running %(name)s post-hook: %(obj)s")
+                    LOG.exception(msg, {'name': name, 'obj': obj})
 
 
 def add_hook(name, pass_function=False):
@@ -93,6 +117,8 @@ def add_hook(name, pass_function=False):
     """
 
     def outer(f):
+        f.__hook_name__ = name
+
         @functools.wraps(f)
         def inner(*args, **kwargs):
             manager = _HOOKS.setdefault(name, HookManager(name))

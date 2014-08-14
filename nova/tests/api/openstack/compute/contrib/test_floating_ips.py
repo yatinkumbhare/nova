@@ -17,6 +17,7 @@
 import uuid
 
 from lxml import etree
+import mock
 import webob
 
 from nova.api.openstack.compute.contrib import floating_ips
@@ -58,7 +59,8 @@ def network_api_get_floating_ips_by_project(self, context):
              'fixed_ip': None}]
 
 
-def compute_api_get(self, context, instance_id):
+def compute_api_get(self, context, instance_id, expected_attrs=None,
+                    want_objects=False):
     return dict(uuid=FAKE_UUID, id=instance_id, instance_type_id=1, host='bob')
 
 
@@ -318,10 +320,38 @@ class FloatingIpTest(test.TestCase):
 
         req = fakes.HTTPRequest.blank('/v2/fake/os-floating-ips')
         ex = self.assertRaises(webob.exc.HTTPNotFound,
-            self.controller.create, req, {'pool': 'non_existant_pool'})
+            self.controller.create, req, {'pool': 'non_existent_pool'})
 
-        self.assertIn('No more floating ips in pool non_existant_pool',
+        self.assertIn('No more floating ips in pool non_existent_pool',
                       ex.explanation)
+
+    @mock.patch('nova.network.api.API.allocate_floating_ip',
+                side_effect=exception.FloatingIpLimitExceeded())
+    def test_floating_ip_allocate_over_quota(self, allocate_mock):
+        req = fakes.HTTPRequest.blank('/v2/fake/os-floating-ips')
+        ex = self.assertRaises(webob.exc.HTTPForbidden,
+                               self.controller.create, req)
+
+        self.assertIn('IP allocation over quota', ex.explanation)
+
+    @mock.patch('nova.network.api.API.allocate_floating_ip',
+                side_effect=exception.FloatingIpLimitExceeded())
+    def test_floating_ip_allocate_quota_exceed_in_pool(self, allocate_mock):
+        req = fakes.HTTPRequest.blank('/v2/fake/os-floating-ips')
+        ex = self.assertRaises(webob.exc.HTTPForbidden,
+            self.controller.create, req, {'pool': 'non_existent_pool'})
+
+        self.assertIn('IP allocation over quota in pool non_existent_pool.',
+                      ex.explanation)
+
+    @mock.patch('nova.network.api.API.allocate_floating_ip',
+                side_effect=exception.FloatingIpPoolNotFound())
+    def test_floating_ip_create_with_unknown_pool(self, allocate_mock):
+        req = fakes.HTTPRequest.blank('/v2/fake/os-floating-ips')
+        ex = self.assertRaises(webob.exc.HTTPNotFound,
+            self.controller.create, req, {'pool': 'non_existent_pool'})
+
+        self.assertIn('Floating ip pool not found.', ex.explanation)
 
     def test_floating_ip_allocate(self):
         def fake1(*args, **kwargs):
@@ -364,7 +394,22 @@ class FloatingIpTest(test.TestCase):
 
         req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
         rsp = self.manager._add_floating_ip(req, 'test_inst', body)
-        self.assertTrue(rsp.status_int == 202)
+        self.assertEqual(202, rsp.status_int)
+
+    def test_floating_ip_associate_invalid_instance(self):
+
+        def fake_get(self, context, id, expected_attrs=None,
+                     want_objects=False):
+            raise exception.InstanceNotFound(instance_id=id)
+
+        self.stubs.Set(compute.api.API, "get", fake_get)
+
+        body = dict(addFloatingIp=dict(address=self.floating_ip))
+
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
+        self.assertRaises(webob.exc.HTTPNotFound,
+                          self.manager._add_floating_ip, req, 'test_inst',
+                          body)
 
     def test_not_extended_floating_ip_associate_fixed(self):
         # Check that fixed_address is ignored if os-extended-floating-ips
@@ -383,13 +428,14 @@ class FloatingIpTest(test.TestCase):
 
         req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
         rsp = self.manager._add_floating_ip(req, 'test_inst', body)
-        self.assertTrue(rsp.status_int == 202)
+        self.assertEqual(202, rsp.status_int)
 
     def test_associate_not_allocated_floating_ip_to_instance(self):
         def fake_associate_floating_ip(self, context, instance,
                               floating_address, fixed_address,
                               affect_auto_assigned=False):
-            raise exception.NotAuthorized()
+            raise exception.FloatingIpNotFoundForAddress(
+                address=floating_address)
         self.stubs.Set(network.api.API, "associate_floating_ip",
                        fake_associate_floating_ip)
         floating_ip = '10.10.10.11'
@@ -404,6 +450,15 @@ class FloatingIpTest(test.TestCase):
         self.assertEqual(res_dict['itemNotFound']['message'],
                        "floating ip not found")
 
+    @mock.patch.object(network.api.API, 'associate_floating_ip',
+                       side_effect=exception.Forbidden)
+    def test_associate_floating_ip_forbidden(self, associate_mock):
+        body = dict(addFloatingIp=dict(address='10.10.10.11'))
+        req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
+        self.assertRaises(webob.exc.HTTPForbidden,
+                          self.manager._add_floating_ip, req, 'test_inst',
+                          body)
+
     def test_floating_ip_disassociate(self):
         def get_instance_by_floating_ip_addr(self, context, address):
             if address == '10.10.10.10':
@@ -416,7 +471,7 @@ class FloatingIpTest(test.TestCase):
 
         req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
         rsp = self.manager._remove_floating_ip(req, 'test_inst', body)
-        self.assertTrue(rsp.status_int == 202)
+        self.assertEqual(202, rsp.status_int)
 
     def test_floating_ip_disassociate_missing(self):
         body = dict(removeFloatingIp=dict(address='10.10.10.10'))
@@ -527,7 +582,7 @@ class FloatingIpTest(test.TestCase):
                 return 'test_inst'
 
         def network_api_disassociate(self, context, instance, address):
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
 
         self.stubs.Set(network.api.API, "get_floating_ip_by_address",
                        fake_get_floating_ip_addr_auto_assigned)
@@ -645,7 +700,7 @@ class ExtendedFloatingIpTest(test.TestCase):
 
         req = fakes.HTTPRequest.blank('/v2/fake/servers/test_inst/action')
         rsp = self.manager._add_floating_ip(req, 'test_inst', body)
-        self.assertTrue(rsp.status_int == 202)
+        self.assertEqual(202, rsp.status_int)
 
     def test_extended_floating_ip_associate_fixed_not_allocated(self):
         def fake_associate_floating_ip(*args, **kwargs):

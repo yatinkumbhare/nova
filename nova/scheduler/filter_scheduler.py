@@ -25,10 +25,11 @@ from oslo.config import cfg
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova import exception
-from nova import notifier
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova import objects
 from nova.openstack.common import log as logging
 from nova.pci import pci_request
+from nova import rpc
 from nova.scheduler import driver
 from nova.scheduler import scheduler_options
 from nova.scheduler import utils as scheduler_utils
@@ -59,17 +60,22 @@ class FilterScheduler(driver.Scheduler):
         super(FilterScheduler, self).__init__(*args, **kwargs)
         self.options = scheduler_options.SchedulerOptions()
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
-        self.notifier = notifier.get_notifier('scheduler')
+        self.notifier = rpc.get_notifier('scheduler')
+        self._supports_affinity = scheduler_utils.validate_filter(
+            'ServerGroupAffinityFilter')
+        self._supports_anti_affinity = scheduler_utils.validate_filter(
+            'ServerGroupAntiAffinityFilter')
 
+    # NOTE(alaski): Remove this method when the scheduler rpc interface is
+    # bumped to 4.x as it is no longer used.
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,
                               requested_networks, is_first_time,
                               filter_properties, legacy_bdm_in_spec):
-        """This method is called from nova.compute.api to provision
-        an instance.  We first create a build plan (a list of WeightedHosts)
-        and then provision.
+        """Provisions instances that needs to be scheduled
 
-        Returns a list of the instances created.
+        Applies filters and weighters on request properties to get a list of
+        compute hosts and calls them to spawn instance(s).
         """
         payload = dict(request_spec=request_spec)
         self.notifier.info(context, 'scheduler.run_instance.start', payload)
@@ -79,10 +85,15 @@ class FilterScheduler(driver.Scheduler):
                     "uuids: %(instance_uuids)s"),
                   {'num_instances': len(instance_uuids),
                    'instance_uuids': instance_uuids})
-        LOG.debug(_("Request Spec: %s") % request_spec)
+        LOG.debug("Request Spec: %s" % request_spec)
 
+        # check retry policy.  Rather ugly use of instance_uuids[0]...
+        # but if we've exceeded max retries... then we really only
+        # have a single instance.
+        scheduler_utils.populate_retry(filter_properties,
+                                       instance_uuids[0])
         weighed_hosts = self._schedule(context, request_spec,
-                                       filter_properties, instance_uuids)
+                                       filter_properties)
 
         # NOTE: Pop instance_uuids as individual creates do not need the
         # set of uuids. Do not pop before here as the upper exception
@@ -127,21 +138,11 @@ class FilterScheduler(driver.Scheduler):
 
         self.notifier.info(context, 'scheduler.run_instance.end', payload)
 
-    def select_hosts(self, context, request_spec, filter_properties):
-        """Selects a filtered set of hosts."""
-        instance_uuids = request_spec.get('instance_uuids')
-        hosts = [host.obj.host for host in self._schedule(context,
-            request_spec, filter_properties, instance_uuids)]
-        if not hosts:
-            raise exception.NoValidHost(reason="")
-        return hosts
-
     def select_destinations(self, context, request_spec, filter_properties):
         """Selects a filtered set of hosts and nodes."""
         num_instances = request_spec['num_instances']
-        instance_uuids = request_spec.get('instance_uuids')
         selected_hosts = self._schedule(context, request_spec,
-                                        filter_properties, instance_uuids)
+                                        filter_properties)
 
         # Couldn't fulfill the request_spec
         if len(selected_hosts) < num_instances:
@@ -165,18 +166,9 @@ class FilterScheduler(driver.Scheduler):
                            'scheduler.run_instance.scheduled', payload)
 
         # Update the metadata if necessary
-        scheduler_hints = filter_properties.get('scheduler_hints') or {}
-        group = scheduler_hints.get('group', None)
-        values = None
-        if group:
-            values = request_spec['instance_properties']['system_metadata']
-            values.update({'group': group})
-            values = {'system_metadata': values}
-
         try:
             updated_instance = driver.instance_update_db(context,
-                    instance_uuid, extra_values=values)
-
+                                                         instance_uuid)
         except exception.InstanceNotFound:
             LOG.warning(_("Instance disappeared during scheduling"),
                         context=context, instance_uuid=instance_uuid)
@@ -214,96 +206,45 @@ class FilterScheduler(driver.Scheduler):
         if pci_requests:
             filter_properties['pci_requests'] = pci_requests
 
-    def _max_attempts(self):
-        max_attempts = CONF.scheduler_max_attempts
-        if max_attempts < 1:
-            raise exception.NovaException(_("Invalid value for "
-                "'scheduler_max_attempts', must be >= 1"))
-        return max_attempts
+    def _setup_instance_group(self, context, filter_properties):
+        update_group_hosts = False
+        scheduler_hints = filter_properties.get('scheduler_hints') or {}
+        group_hint = scheduler_hints.get('group', None)
+        if group_hint:
+            group = objects.InstanceGroup.get_by_hint(context, group_hint)
+            policies = set(('anti-affinity', 'affinity'))
+            if any((policy in policies) for policy in group.policies):
+                if ('affinity' in group.policies and
+                        not self._supports_affinity):
+                        msg = _("ServerGroupAffinityFilter not configured")
+                        LOG.error(msg)
+                        raise exception.NoValidHost(reason=msg)
+                if ('anti-affinity' in group.policies and
+                        not self._supports_anti_affinity):
+                        msg = _("ServerGroupAntiAffinityFilter not configured")
+                        LOG.error(msg)
+                        raise exception.NoValidHost(reason=msg)
+                update_group_hosts = True
+                filter_properties.setdefault('group_hosts', set())
+                user_hosts = set(filter_properties['group_hosts'])
+                group_hosts = set(group.get_hosts(context))
+                filter_properties['group_hosts'] = user_hosts | group_hosts
+                filter_properties['group_policies'] = group.policies
+        return update_group_hosts
 
-    def _log_compute_error(self, instance_uuid, retry):
-        """If the request contained an exception from a previous compute
-        build/resize operation, log it to aid debugging
-        """
-        exc = retry.pop('exc', None)  # string-ified exception from compute
-        if not exc:
-            return  # no exception info from a previous attempt, skip
-
-        hosts = retry.get('hosts', None)
-        if not hosts:
-            return  # no previously attempted hosts, skip
-
-        last_host, last_node = hosts[-1]
-        LOG.error(_('Error from last host: %(last_host)s (node %(last_node)s):'
-                    ' %(exc)s'),
-                  {'last_host': last_host,
-                   'last_node': last_node,
-                   'exc': exc},
-                  instance_uuid=instance_uuid)
-
-    def _populate_retry(self, filter_properties, instance_properties):
-        """Populate filter properties with history of retries for this
-        request. If maximum retries is exceeded, raise NoValidHost.
-        """
-        max_attempts = self._max_attempts()
-        force_hosts = filter_properties.get('force_hosts', [])
-        force_nodes = filter_properties.get('force_nodes', [])
-
-        if max_attempts == 1 or force_hosts or force_nodes:
-            # re-scheduling is disabled.
-            return
-
-        retry = filter_properties.pop('retry', {})
-        # retry is enabled, update attempt count:
-        if retry:
-            retry['num_attempts'] += 1
-        else:
-            retry = {
-                'num_attempts': 1,
-                'hosts': []  # list of compute hosts tried
-            }
-        filter_properties['retry'] = retry
-
-        instance_uuid = instance_properties.get('uuid')
-        self._log_compute_error(instance_uuid, retry)
-
-        if retry['num_attempts'] > max_attempts:
-            msg = (_('Exceeded max scheduling attempts %(max_attempts)d for '
-                     'instance %(instance_uuid)s')
-                   % {'max_attempts': max_attempts,
-                      'instance_uuid': instance_uuid})
-            raise exception.NoValidHost(reason=msg)
-
-    def _schedule(self, context, request_spec, filter_properties,
-                  instance_uuids=None):
+    def _schedule(self, context, request_spec, filter_properties):
         """Returns a list of hosts that meet the required specs,
         ordered by their fitness.
         """
         elevated = context.elevated()
         instance_properties = request_spec['instance_properties']
         instance_type = request_spec.get("instance_type", None)
+        instance_uuids = request_spec.get("instance_uuids", None)
 
-        # Get the group
-        update_group_hosts = False
-        scheduler_hints = filter_properties.get('scheduler_hints') or {}
-        group = scheduler_hints.get('group', None)
-        if group:
-            group_hosts = self.group_hosts(elevated, group)
-            update_group_hosts = True
-            if 'group_hosts' not in filter_properties:
-                filter_properties.update({'group_hosts': []})
-            configured_hosts = filter_properties['group_hosts']
-            filter_properties['group_hosts'] = configured_hosts + group_hosts
+        update_group_hosts = self._setup_instance_group(context,
+                filter_properties)
 
         config_options = self._get_configuration_options()
-
-        # check retry policy.  Rather ugly use of instance_uuids[0]...
-        # but if we've exceeded max retries... then we really only
-        # have a single instance.
-        properties = instance_properties.copy()
-        if instance_uuids:
-            properties['uuid'] = instance_uuids[0]
-        self._populate_retry(filter_properties, properties)
 
         filter_properties.update({'context': context,
                                   'request_spec': request_spec,
@@ -321,7 +262,7 @@ class FilterScheduler(driver.Scheduler):
         # Note: remember, we are using an iterator here. So only
         # traverse this list once. This can bite you if the hosts
         # are being scanned in a filter or weighing function.
-        hosts = self.host_manager.get_all_host_states(elevated)
+        hosts = self._get_all_host_states(elevated)
 
         selected_hosts = []
         if instance_uuids:
@@ -336,12 +277,12 @@ class FilterScheduler(driver.Scheduler):
                 # Can't get any more locally.
                 break
 
-            LOG.debug(_("Filtered %(hosts)s"), {'hosts': hosts})
+            LOG.debug("Filtered %(hosts)s", {'hosts': hosts})
 
             weighed_hosts = self.host_manager.get_weighed_hosts(hosts,
                     filter_properties)
 
-            LOG.debug(_("Weighed %(hosts)s"), {'hosts': weighed_hosts})
+            LOG.debug("Weighed %(hosts)s", {'hosts': weighed_hosts})
 
             scheduler_host_subset_size = CONF.scheduler_host_subset_size
             if scheduler_host_subset_size > len(weighed_hosts):
@@ -357,5 +298,9 @@ class FilterScheduler(driver.Scheduler):
             # will change for the next instance.
             chosen_host.obj.consume_from_instance(instance_properties)
             if update_group_hosts is True:
-                filter_properties['group_hosts'].append(chosen_host.obj.host)
+                filter_properties['group_hosts'].add(chosen_host.obj.host)
         return selected_hosts
+
+    def _get_all_host_states(self, context):
+        """Template method, so a subclass can implement caching."""
+        return self.host_manager.get_all_host_states(context)

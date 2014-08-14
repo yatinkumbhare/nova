@@ -13,17 +13,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
+import contextlib
+import copy
 import uuid
 
+import mock
 import mox
 from neutronclient.common import exceptions
 from neutronclient.v2_0 import client
 from oslo.config import cfg
+import six
 
 from nova.compute import flavors
-from nova.conductor import api as conductor_api
 from nova import context
 from nova import exception
 from nova.network import model
@@ -31,16 +33,16 @@ from nova.network import neutronv2
 from nova.network.neutronv2 import api as neutronapi
 from nova.network.neutronv2 import constants
 from nova.openstack.common import jsonutils
-from nova.openstack.common import local
 from nova import test
+from nova.tests import fake_instance
 from nova import utils
 
 CONF = cfg.CONF
 
-#NOTE: Neutron client raises Exception which is discouraged by HACKING.
-#      We set this variable here and use it for assertions below to avoid
-#      the hacking checks until we can make neutron client throw a custom
-#      exception class instead.
+# NOTE: Neutron client raises Exception which is discouraged by HACKING.
+#       We set this variable here and use it for assertions below to avoid
+#       the hacking checks until we can make neutron client throw a custom
+#       exception class instead.
 NEUTRON_CLIENT_EXCEPTION = Exception
 
 
@@ -93,17 +95,17 @@ class MyComparator(mox.Comparator):
 
 class TestNeutronClient(test.TestCase):
     def test_withtoken(self):
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
+        self.flags(url='http://anyhost/', group='neutron')
+        self.flags(url_timeout=30, group='neutron')
         my_context = context.RequestContext('userid',
                                             'my_tenantid',
                                             auth_token='token')
         self.mox.StubOutWithMock(client.Client, "__init__")
         client.Client.__init__(
-            auth_strategy=None,
-            endpoint_url=CONF.neutron_url,
+            auth_strategy=CONF.neutron.auth_strategy,
+            endpoint_url=CONF.neutron.url,
             token=my_context.auth_token,
-            timeout=CONF.neutron_url_timeout,
+            timeout=CONF.neutron.url_timeout,
             insecure=False,
             ca_cert=None).AndReturn(None)
         self.mox.ReplayAll()
@@ -116,18 +118,18 @@ class TestNeutronClient(test.TestCase):
                           my_context)
 
     def test_withtoken_context_is_admin(self):
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
+        self.flags(url='http://anyhost/', group='neutron')
+        self.flags(url_timeout=30, group='neutron')
         my_context = context.RequestContext('userid',
                                             'my_tenantid',
                                             auth_token='token',
                                             is_admin=True)
         self.mox.StubOutWithMock(client.Client, "__init__")
         client.Client.__init__(
-            auth_strategy=None,
-            endpoint_url=CONF.neutron_url,
+            auth_strategy=CONF.neutron.auth_strategy,
+            endpoint_url=CONF.neutron.url,
             token=my_context.auth_token,
-            timeout=CONF.neutron_url_timeout,
+            timeout=CONF.neutron.url_timeout,
             insecure=False,
             ca_cert=None).AndReturn(None)
         self.mox.ReplayAll()
@@ -137,12 +139,53 @@ class TestNeutronClient(test.TestCase):
         neutronv2.get_client(my_context)
 
     def test_withouttoken_keystone_connection_error(self):
-        self.flags(neutron_auth_strategy='keystone')
-        self.flags(neutron_url='http://anyhost/')
+        self.flags(auth_strategy='keystone', group='neutron')
+        self.flags(url='http://anyhost/', group='neutron')
         my_context = context.RequestContext('userid', 'my_tenantid')
         self.assertRaises(NEUTRON_CLIENT_EXCEPTION,
                           neutronv2.get_client,
                           my_context)
+
+    def test_reuse_admin_token(self):
+        self.flags(url='http://anyhost/', group='neutron')
+        self.flags(url_timeout=30, group='neutron')
+        token_store = neutronv2.AdminTokenStore.get()
+        token_store.admin_auth_token = 'new_token'
+        my_context = context.RequestContext('userid', 'my_tenantid',
+                                            auth_token='token')
+        with contextlib.nested(
+            mock.patch.object(client.Client, "list_networks",
+                              side_effect=mock.Mock),
+            mock.patch.object(client.Client, 'get_auth_info',
+                              return_value={'auth_token': 'new_token1'}),
+            ):
+            client1 = neutronv2.get_client(my_context, True)
+            client1.list_networks(retrieve_all=False)
+            self.assertEqual('new_token1', token_store.admin_auth_token)
+            client1 = neutronv2.get_client(my_context, True)
+            client1.list_networks(retrieve_all=False)
+            self.assertEqual('new_token1', token_store.admin_auth_token)
+
+    def test_admin_token_updated(self):
+        self.flags(url='http://anyhost/', group='neutron')
+        self.flags(url_timeout=30, group='neutron')
+        token_store = neutronv2.AdminTokenStore.get()
+        token_store.admin_auth_token = 'new_token'
+        tokens = [{'auth_token': 'new_token1'}, {'auth_token': 'new_token'}]
+        my_context = context.RequestContext('userid', 'my_tenantid',
+                                            auth_token='token')
+        with contextlib.nested(
+            mock.patch.object(client.Client, "list_networks",
+                              side_effect=mock.Mock),
+            mock.patch.object(client.Client, 'get_auth_info',
+                              side_effect=tokens.pop),
+            ):
+            client1 = neutronv2.get_client(my_context, True)
+            client1.list_networks(retrieve_all=False)
+            self.assertEqual('new_token', token_store.admin_auth_token)
+            client1 = neutronv2.get_client(my_context, True)
+            client1.list_networks(retrieve_all=False)
+            self.assertEqual('new_token1', token_store.admin_auth_token)
 
 
 class TestNeutronv2Base(test.TestCase):
@@ -166,11 +209,13 @@ class TestNeutronv2Base(test.TestCase):
                          'security_groups': []}
         self.nets1 = [{'id': 'my_netid1',
                       'name': 'my_netname1',
+                      'subnets': ['mysubnid1'],
                       'tenant_id': 'my_tenantid'}]
         self.nets2 = []
         self.nets2.append(self.nets1[0])
         self.nets2.append({'id': 'my_netid2',
                            'name': 'my_netname2',
+                           'subnets': ['mysubnid2'],
                            'tenant_id': 'my_tenantid'})
         self.nets3 = self.nets2 + [{'id': 'my_netid3',
                                     'name': 'my_netname3',
@@ -178,14 +223,32 @@ class TestNeutronv2Base(test.TestCase):
         self.nets4 = [{'id': 'his_netid4',
                       'name': 'his_netname4',
                       'tenant_id': 'his_tenantid'}]
+        # A network request with external networks
+        self.nets5 = self.nets1 + [{'id': 'the-external-one',
+                                    'name': 'out-of-this-world',
+                                    'router:external': True,
+                                    'tenant_id': 'should-be-an-admin'}]
+        # A network request with a duplicate
+        self.nets6 = []
+        self.nets6.append(self.nets1[0])
+        self.nets6.append(self.nets1[0])
+        # A network request with a combo
+        self.nets7 = []
+        self.nets7.append(self.nets2[1])
+        self.nets7.append(self.nets1[0])
+        self.nets7.append(self.nets2[1])
+        self.nets7.append(self.nets1[0])
 
-        self.nets = [self.nets1, self.nets2, self.nets3, self.nets4]
+        self.nets = [self.nets1, self.nets2, self.nets3,
+                     self.nets4, self.nets5, self.nets6, self.nets7]
 
         self.port_address = '10.0.1.2'
         self.port_data1 = [{'network_id': 'my_netid1',
                            'device_id': self.instance2['uuid'],
                            'device_owner': 'compute:nova',
                            'id': 'my_portid1',
+                           'status': 'DOWN',
+                           'admin_state_up': True,
                            'fixed_ips': [{'ip_address': self.port_address,
                                           'subnet_id': 'my_subid1'}],
                            'mac_address': 'my_mac1', }]
@@ -193,12 +256,16 @@ class TestNeutronv2Base(test.TestCase):
                              'fixed_ip_address': self.port_address,
                              'floating_ip_address': '172.0.1.2'}]
         self.dhcp_port_data1 = [{'fixed_ips': [{'ip_address': '10.0.1.9',
-                                               'subnet_id': 'my_subid1'}]}]
+                                               'subnet_id': 'my_subid1'}],
+                                 'status': 'ACTIVE',
+                                 'admin_state_up': True}]
         self.port_address2 = '10.0.2.2'
         self.port_data2 = []
         self.port_data2.append(self.port_data1[0])
         self.port_data2.append({'network_id': 'my_netid2',
                                 'device_id': self.instance['uuid'],
+                                'admin_state_up': True,
+                                'status': 'ACTIVE',
                                 'device_owner': 'compute:nova',
                                 'id': 'my_portid2',
                                 'fixed_ips':
@@ -212,6 +279,8 @@ class TestNeutronv2Base(test.TestCase):
                                  'floating_ip_address': '172.0.2.2'})
         self.port_data3 = [{'network_id': 'my_netid1',
                            'device_id': 'device_id3',
+                           'status': 'DOWN',
+                           'admin_state_up': True,
                            'device_owner': 'compute:nova',
                            'id': 'my_portid3',
                            'fixed_ips': [],  # no fixed ip
@@ -287,7 +356,7 @@ class TestNeutronv2Base(test.TestCase):
             neutronv2.get_client(
                 mox.IgnoreArg(), admin=True).MultipleTimes().AndReturn(
                 self.moxed_client)
-            api._refresh_neutron_extensions_cache()
+            api._refresh_neutron_extensions_cache(mox.IgnoreArg())
         else:
             self.mox.StubOutWithMock(api, '_populate_neutron_extension_values')
         self.mox.StubOutWithMock(api, '_has_port_binding_extension')
@@ -299,30 +368,49 @@ class TestNeutronv2Base(test.TestCase):
         if macs:
             macs = set(macs)
         req_net_ids = []
+        ordered_networks = []
+        port = {}
         if 'requested_networks' in kwargs:
-            for id, fixed_ip, port_id in kwargs['requested_networks']:
+            for n_id, fixed_ip, port_id in kwargs['requested_networks']:
                 if port_id:
-                    self.moxed_client.show_port(port_id).AndReturn(
-                        {'port': {'id': 'my_portid1',
-                                  'network_id': 'my_netid1',
-                                  'mac_address': 'my_mac1',
-                                  'device_id': kwargs.get('_device') and
-                                               self.instance2['uuid'] or ''}})
-
-                    ports['my_netid1'] = self.port_data1[0]
-                    id = 'my_netid1'
-                    if macs is not None:
-                        macs.discard('my_mac1')
+                    if port_id == 'my_portid3':
+                        self.moxed_client.show_port(port_id).AndReturn(
+                            {'port': {'id': 'my_portid3',
+                                      'network_id': 'my_netid1',
+                                      'mac_address': 'my_mac1',
+                                      'device_id': kwargs.get('_device') and
+                                                   self.instance2['uuid'] or
+                                                   ''}})
+                        ports['my_netid1'] = [self.port_data1[0],
+                                            self.port_data3[0]]
+                        ports[port_id] = self.port_data3[0]
+                        n_id = 'my_netid1'
+                        if macs is not None:
+                            macs.discard('my_mac1')
+                    else:
+                        self.moxed_client.show_port(port_id).AndReturn(
+                            {'port': {'id': 'my_portid1',
+                                      'network_id': 'my_netid1',
+                                      'mac_address': 'my_mac1',
+                                      'device_id': kwargs.get('_device') and
+                                                   self.instance2['uuid'] or
+                                                   ''}})
+                        ports[port_id] = self.port_data1[0]
+                        n_id = 'my_netid1'
+                        if macs is not None:
+                            macs.discard('my_mac1')
                 else:
-                    fixed_ips[id] = fixed_ip
-                req_net_ids.append(id)
-            expected_network_order = req_net_ids
+                    fixed_ips[n_id] = fixed_ip
+                req_net_ids.append(n_id)
+                ordered_networks.append((n_id, fixed_ip, port_id))
         else:
-            expected_network_order = [n['id'] for n in nets]
+            for n in nets:
+                ordered_networks.append((n['id'], None, None))
         if kwargs.get('_break') == 'pre_list_networks':
             self.mox.ReplayAll()
             return api
-        search_ids = [net['id'] for net in nets if net['id'] in req_net_ids]
+        # search all req_net_ids as in api.py
+        search_ids = req_net_ids
 
         if search_ids:
             mox_list_params = {'id': mox.SameElementsAs(search_ids)}
@@ -336,31 +424,52 @@ class TestNeutronv2Base(test.TestCase):
             mox_list_params = {'shared': True}
             self.moxed_client.list_networks(
                 **mox_list_params).AndReturn({'networks': []})
-        for net_id in expected_network_order:
+
+        if (('requested_networks' not in kwargs
+            or kwargs['requested_networks'] == [(None, None, None)])
+            and len(nets) > 1):
+                self.mox.ReplayAll()
+                return api
+
+        ports_in_requested_net_order = []
+        nets_in_requested_net_order = []
+        for net_id, fixed_ip, port_id in ordered_networks:
             port_req_body = {
                 'port': {
                     'device_id': self.instance['uuid'],
                     'device_owner': 'compute:nova',
                 },
             }
+            # Network lookup for available network_id
+            network = None
+            for net in nets:
+                if net['id'] == net_id:
+                    network = net
+                    break
+            # if net_id did not pass validate_networks() and not available
+            # here then skip it safely not continuing with a None Network
+            else:
+                continue
             if has_portbinding:
                 port_req_body['port']['binding:host_id'] = (
                     self.instance.get('host'))
-            port = ports.get(net_id, None)
             if not has_portbinding:
-                api._populate_neutron_extension_values(
+                api._populate_neutron_extension_values(mox.IgnoreArg(),
                     self.instance, mox.IgnoreArg()).AndReturn(None)
             else:
                 # since _populate_neutron_extension_values() will call
                 # _has_port_binding_extension()
-                api._has_port_binding_extension().AndReturn(has_portbinding)
-            api._has_port_binding_extension().AndReturn(has_portbinding)
-            if port:
-                port_id = port['id']
+                api._has_port_binding_extension(mox.IgnoreArg()).\
+                                                     AndReturn(has_portbinding)
+            api._has_port_binding_extension(mox.IgnoreArg()).\
+                                                 AndReturn(has_portbinding)
+            if port_id:
+                port = ports[port_id]
                 self.moxed_client.update_port(port_id,
                                               MyComparator(port_req_body)
                                               ).AndReturn(
                                                   {'port': port})
+                ports_in_requested_net_order.append(port_id)
             else:
                 fixed_ip = fixed_ips.get(net_id)
                 if fixed_ip:
@@ -383,11 +492,15 @@ class TestNeutronv2Base(test.TestCase):
                     return api
                 self.moxed_client.create_port(
                     MyComparator(port_req_body)).AndReturn(res_port)
+                ports_in_requested_net_order.append(res_port['port']['id'])
+
+            nets_in_requested_net_order.append(network)
 
         api.get_instance_nw_info(mox.IgnoreArg(),
                                  self.instance,
-                                 networks=nets).AndReturn(
-                                       self._returned_nw_info)
+                                 networks=nets_in_requested_net_order,
+                                 port_ids=ports_in_requested_net_order
+                                ).AndReturn(self._returned_nw_info)
         self.mox.ReplayAll()
         return api
 
@@ -403,8 +516,10 @@ class TestNeutronv2Base(test.TestCase):
         self.assertEqual('my_mac%s' % id_suffix, nw_inf[index]['address'])
         self.assertEqual('10.0.%s.0/24' % id_suffix,
             nw_inf[index]['network']['subnets'][0]['cidr'])
-        self.assertTrue(model.IP(address='8.8.%s.1' % id_suffix) in
-                        nw_inf[index]['network']['subnets'][0]['dns'])
+
+        ip_addr = model.IP(address='8.8.%s.1' % id_suffix,
+                           version=4, type='dns')
+        self.assertIn(ip_addr, nw_inf[index]['network']['subnets'][0]['dns'])
 
     def _get_instance_nw_info(self, number):
         api = neutronapi.API()
@@ -413,27 +528,25 @@ class TestNeutronv2Base(test.TestCase):
                                           self.instance['uuid'],
                                           mox.IgnoreArg())
         port_data = number == 1 and self.port_data1 or self.port_data2
-        self.mox.StubOutWithMock(conductor_api.API,
-                                 'instance_get_by_uuid')
-
+        nets = number == 1 and self.nets1 or self.nets2
         net_info_cache = []
         for port in port_data:
-            net_info_cache.append({"network": {"id": port['network_id']}})
-        info_cache = {'info_cache': {'network_info':
-                                     jsonutils.dumps(net_info_cache)}}
+            net_info_cache.append({"network": {"id": port['network_id']},
+                                   "id": port['id']})
 
-        api.conductor_api.instance_get_by_uuid(
-            mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(info_cache)
+        instance = copy.copy(self.instance)
+        # This line here does not wrap net_info_cache in jsonutils.dumps()
+        # intentionally to test the other code path when it's not unicode.
+        instance['info_cache'] = {'network_info': net_info_cache}
+
         self.moxed_client.list_ports(
             tenant_id=self.instance['project_id'],
             device_id=self.instance['uuid']).AndReturn(
                 {'ports': port_data})
+        net_ids = [port['network_id'] for port in port_data]
         nets = number == 1 and self.nets1 or self.nets2
         self.moxed_client.list_networks(
-            tenant_id=self.instance['project_id'],
-            shared=False).AndReturn({'networks': nets})
-        self.moxed_client.list_networks(
-            shared=True).AndReturn({'networks': []})
+            id=net_ids).AndReturn({'networks': nets})
         for i in xrange(1, number + 1):
             float_data = number == 1 and self.float_data1 or self.float_data2
             for ip in port_data[i - 1]['fixed_ips']:
@@ -452,7 +565,7 @@ class TestNeutronv2Base(test.TestCase):
                 device_owner='network:dhcp').AndReturn(
                     {'ports': []})
         self.mox.ReplayAll()
-        nw_inf = api.get_instance_nw_info(self.context, self.instance)
+        nw_inf = api.get_instance_nw_info(self.context, instance)
         for i in xrange(0, number):
             self._verify_nw_info(nw_inf, i)
 
@@ -482,91 +595,161 @@ class TestNeutronv2(TestNeutronv2Base):
             self.moxed_client)
         self._get_instance_nw_info(2)
 
-    def test_get_instance_nw_info_with_nets(self):
-        # Test get instance_nw_info with networks passed in.
-        api = neutronapi.API()
-        self.mox.StubOutWithMock(api.db, 'instance_info_cache_update')
-        api.db.instance_info_cache_update(
-            mox.IgnoreArg(),
-            self.instance['uuid'], mox.IgnoreArg())
-        self.moxed_client.list_ports(
-            tenant_id=self.instance['project_id'],
-            device_id=self.instance['uuid']).AndReturn(
-                {'ports': self.port_data1})
-        port_data = self.port_data1
-        for ip in port_data[0]['fixed_ips']:
-            self.moxed_client.list_floatingips(
-                fixed_ip_address=ip['ip_address'],
-                port_id=port_data[0]['id']).AndReturn(
-                    {'floatingips': self.float_data1})
-        self.moxed_client.list_subnets(
-            id=mox.SameElementsAs(['my_subid1'])).AndReturn(
-                {'subnets': self.subnet_data1})
-        self.moxed_client.list_ports(
-            network_id='my_netid1',
-            device_owner='network:dhcp').AndReturn(
-                {'ports': self.dhcp_port_data1})
-        neutronv2.get_client(mox.IgnoreArg(),
-                             admin=True).MultipleTimes().AndReturn(
-            self.moxed_client)
-        self.mox.ReplayAll()
-        self.instance['info_cache'] = {'network_info': []}
-        nw_inf = api.get_instance_nw_info(self.context,
-                                          self.instance,
-                                          networks=self.nets1)
-        self._verify_nw_info(nw_inf, 0)
-
-    def test_get_instance_nw_info_with_nets_and_info_cache(self):
+    def test_get_instance_nw_info_with_nets_add_interface(self):
         # This tests that adding an interface to an instance does not
         # remove the first instance from the instance.
-        api = neutronapi.API()
-        self.mox.StubOutWithMock(api.db, 'instance_info_cache_update')
-        api.db.instance_info_cache_update(
-            mox.IgnoreArg(),
-            self.instance['uuid'], mox.IgnoreArg())
-        self.moxed_client.list_ports(
-            tenant_id=self.instance['project_id'],
-            device_id=self.instance['uuid']).AndReturn(
-                {'ports': self.port_data1})
-        port_data = self.port_data1
-        for ip in port_data[0]['fixed_ips']:
-            self.moxed_client.list_floatingips(
-                fixed_ip_address=ip['ip_address'],
-                port_id=port_data[0]['id']).AndReturn(
-                    {'floatingips': self.float_data1})
-        self.moxed_client.list_subnets(
-            id=mox.SameElementsAs(['my_subid1'])).AndReturn(
-                {'subnets': self.subnet_data1})
-        self.moxed_client.list_ports(
-            network_id='my_netid1',
-            device_owner='network:dhcp').AndReturn(
-                {'ports': self.dhcp_port_data1})
-        neutronv2.get_client(mox.IgnoreArg(),
-                             admin=True).MultipleTimes().AndReturn(
-            self.moxed_client)
-        self.mox.ReplayAll()
         network_model = model.Network(id='network_id',
                                       bridge='br-int',
                                       injected='injected',
                                       label='fake_network',
-                                      tenant_name='fake_tenant')
-
-        self.instance['info_cache'] = {
-            'network_info': [{'id': 'port_id',
+                                      tenant_id='fake_tenant')
+        network_cache = {'info_cache': {
+            'network_info': [{'id': self.port_data2[0]['id'],
                               'address': 'mac_address',
                               'network': network_model,
                               'type': 'ovs',
                               'ovs_interfaceid': 'ovs_interfaceid',
-                              'devname': 'devname'}]}
-        nw_inf = api.get_instance_nw_info(self.context,
-                                          self.instance,
-                                          networks=self.nets1)
-        self.assertEqual(2, len(nw_inf))
-        for k, v in self.instance['info_cache']['network_info'][0].iteritems():
-            self.assertEqual(nw_inf[0][k], v)
-        # remove first inf and verify that the second interface is correct
-        del nw_inf[0]
-        self._verify_nw_info(nw_inf, 0)
+                              'devname': 'devname'}]}}
+
+        self._fake_get_instance_nw_info_helper(network_cache,
+                                               self.port_data2,
+                                               self.nets2,
+                                               [self.port_data2[1]['id']])
+
+    def test_get_instance_nw_info_remove_ports_from_neutron(self):
+        # This tests that when a port is removed in neutron it
+        # is also removed from the nova.
+        network_model = model.Network(id=self.port_data2[0]['network_id'],
+                                      bridge='br-int',
+                                      injected='injected',
+                                      label='fake_network',
+                                      tenant_id='fake_tenant')
+        network_cache = {'info_cache': {
+            'network_info': [{'id': 'network_id',
+                              'address': 'mac_address',
+                              'network': network_model,
+                              'type': 'ovs',
+                              'ovs_interfaceid': 'ovs_interfaceid',
+                              'devname': 'devname'}]}}
+
+        self._fake_get_instance_nw_info_helper(network_cache,
+                                               self.port_data2,
+                                               None,
+                                               None)
+
+    def test_get_instance_nw_info_ignores_neturon_ports(self):
+        # Tests that only ports in the network_cache are updated
+        # and ports returned from neutron that match the same
+        # instance_id/device_id are ignored.
+        port_data2 = copy.copy(self.port_data2)
+
+        # set device_id on the ports to be the same.
+        port_data2[1]['device_id'] = port_data2[0]['device_id']
+        network_model = model.Network(id='network_id',
+                                      bridge='br-int',
+                                      injected='injected',
+                                      label='fake_network',
+                                      tenant_id='fake_tenant')
+        network_cache = {'info_cache': {
+            'network_info': [{'id': 'network_id',
+                              'address': 'mac_address',
+                              'network': network_model,
+                              'type': 'ovs',
+                              'ovs_interfaceid': 'ovs_interfaceid',
+                              'devname': 'devname'}]}}
+
+        self._fake_get_instance_nw_info_helper(network_cache,
+                                               port_data2,
+                                               None,
+                                               None)
+
+    def _fake_get_instance_nw_info_helper(self, network_cache,
+                                          current_neutron_ports,
+                                          networks=None, port_ids=None):
+        """Helper function to test get_instance_nw_info.
+
+        :param network_cache - data already in the nova network cache.
+        :param current_neutron_ports - updated list of ports from neutron.
+        :param networks - networks of ports being added to instance.
+        :param port_ids - new ports being added to instance.
+        """
+
+        # keep a copy of the original ports/networks to pass to
+        # get_instance_nw_info() as the code below changes them.
+        original_port_ids = copy.copy(port_ids)
+        original_networks = copy.copy(networks)
+
+        api = neutronapi.API()
+        self.mox.StubOutWithMock(api.db, 'instance_info_cache_update')
+        api.db.instance_info_cache_update(
+            mox.IgnoreArg(),
+            self.instance['uuid'], mox.IgnoreArg())
+        neutronv2.get_client(mox.IgnoreArg(),
+                             admin=True).MultipleTimes().AndReturn(
+            self.moxed_client)
+        self.moxed_client.list_ports(
+            tenant_id=self.instance['project_id'],
+            device_id=self.instance['uuid']).AndReturn(
+                {'ports': current_neutron_ports})
+
+        ifaces = network_cache['info_cache']['network_info']
+
+        if port_ids is None:
+            port_ids = [iface['id'] for iface in ifaces]
+            net_ids = [iface['network']['id'] for iface in ifaces]
+            nets = [{'id': iface['network']['id'],
+                     'name': iface['network']['label'],
+                     'tenant_id': iface['network']['meta']['tenant_id']}
+                    for iface in ifaces]
+        if networks is None:
+            self.moxed_client.list_networks(
+                id=net_ids).AndReturn({'networks': nets})
+        else:
+            networks = networks + [
+                dict(id=iface['network']['id'],
+                     name=iface['network']['label'],
+                     tenant_id=iface['network']['meta']['tenant_id'])
+                for iface in ifaces]
+            port_ids = [iface['id'] for iface in ifaces] + port_ids
+
+        index = 0
+
+        current_neutron_port_map = {}
+        for current_neutron_port in current_neutron_ports:
+            current_neutron_port_map[current_neutron_port['id']] = (
+                current_neutron_port)
+        for port_id in port_ids:
+            current_neutron_port = current_neutron_port_map.get(port_id)
+            if current_neutron_port:
+                for ip in current_neutron_port['fixed_ips']:
+                    self.moxed_client.list_floatingips(
+                        fixed_ip_address=ip['ip_address'],
+                        port_id=current_neutron_port['id']).AndReturn(
+                            {'floatingips': [self.float_data2[index]]})
+                    self.moxed_client.list_subnets(
+                        id=mox.SameElementsAs([ip['subnet_id']])
+                        ).AndReturn(
+                            {'subnets': [self.subnet_data_n[index]]})
+                    self.moxed_client.list_ports(
+                        network_id=current_neutron_port['network_id'],
+                        device_owner='network:dhcp').AndReturn(
+                        {'ports': self.dhcp_port_data1})
+                    index += 1
+        self.mox.ReplayAll()
+
+        self.instance['info_cache'] = network_cache
+        instance = copy.copy(self.instance)
+        instance['info_cache'] = network_cache['info_cache']
+        nw_infs = api.get_instance_nw_info(self.context,
+                                           instance,
+                                           networks=original_networks,
+                                           port_ids=original_port_ids)
+
+        self.assertEqual(index, len(nw_infs))
+        # ensure that nic ordering is preserved
+        for iface_index in range(index):
+            self.assertEqual(nw_infs[iface_index]['id'],
+                             port_ids[iface_index])
 
     def test_get_instance_nw_info_without_subnet(self):
         # Test get instance_nw_info for a port without subnet.
@@ -580,31 +763,25 @@ class TestNeutronv2(TestNeutronv2Base):
             device_id=self.instance['uuid']).AndReturn(
                 {'ports': self.port_data3})
         self.moxed_client.list_networks(
-            shared=False,
-            tenant_id=self.instance['project_id']).AndReturn(
+            id=[self.port_data1[0]['network_id']]).AndReturn(
                 {'networks': self.nets1})
-        self.moxed_client.list_networks(
-            shared=True).AndReturn({'networks': []})
         neutronv2.get_client(mox.IgnoreArg(),
                              admin=True).MultipleTimes().AndReturn(
             self.moxed_client)
 
-        self.mox.StubOutWithMock(conductor_api.API,
-                                 'instance_get_by_uuid')
-
         net_info_cache = []
         for port in self.port_data3:
-            net_info_cache.append({"network": {"id": port['network_id']}})
-        info_cache = {'info_cache': {'network_info':
-                                     jsonutils.dumps(net_info_cache)}}
-
-        api.conductor_api.instance_get_by_uuid(
-            mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(info_cache)
+            net_info_cache.append({"network": {"id": port['network_id']},
+                                   "id": port['id']})
+        instance = copy.copy(self.instance)
+        instance['info_cache'] = {'network_info':
+                                  six.text_type(
+                                    jsonutils.dumps(net_info_cache))}
 
         self.mox.ReplayAll()
 
         nw_inf = api.get_instance_nw_info(self.context,
-                                          self.instance)
+                                          instance)
 
         id_suffix = 3
         self.assertEqual(0, len(nw_inf.fixed_ips()))
@@ -618,33 +795,34 @@ class TestNeutronv2(TestNeutronv2Base):
 
         # Note: Don't want the default get_client from setUp()
         self.mox.ResetAll()
-        neutronv2.get_client(mox.IgnoreArg(),
-                             admin=True).AndReturn(
+        neutronv2.get_client(mox.IgnoreArg()).AndReturn(
             self.moxed_client)
         self.moxed_client.list_extensions().AndReturn(
-            {'extensions': [{'name': 'nvp-qos'}]})
+            {'extensions': [{'name': constants.QOS_QUEUE}]})
         self.mox.ReplayAll()
-        api._refresh_neutron_extensions_cache()
-        self.assertEqual({'nvp-qos': {'name': 'nvp-qos'}}, api.extensions)
+        api._refresh_neutron_extensions_cache(mox.IgnoreArg())
+        self.assertEqual(
+            {constants.QOS_QUEUE: {'name': constants.QOS_QUEUE}},
+            api.extensions)
 
     def test_populate_neutron_extension_values_rxtx_factor(self):
         api = neutronapi.API()
 
         # Note: Don't want the default get_client from setUp()
         self.mox.ResetAll()
-        neutronv2.get_client(mox.IgnoreArg(),
-                             admin=True).AndReturn(
+        neutronv2.get_client(mox.IgnoreArg()).AndReturn(
             self.moxed_client)
         self.moxed_client.list_extensions().AndReturn(
-            {'extensions': [{'name': 'nvp-qos'}]})
+            {'extensions': [{'name': constants.QOS_QUEUE}]})
         self.mox.ReplayAll()
-        instance_type = flavors.get_default_flavor()
-        instance_type['rxtx_factor'] = 1
+        flavor = flavors.get_default_flavor()
+        flavor['rxtx_factor'] = 1
         sys_meta = utils.dict_to_metadata(
-            flavors.save_flavor_info({}, instance_type))
+            flavors.save_flavor_info({}, flavor))
         instance = {'system_metadata': sys_meta}
         port_req_body = {'port': {}}
-        api._populate_neutron_extension_values(instance, port_req_body)
+        api._populate_neutron_extension_values(self.context, instance,
+                                               port_req_body)
         self.assertEqual(port_req_body['port']['rxtx_factor'], 1)
 
     def test_allocate_for_instance_1(self):
@@ -653,7 +831,10 @@ class TestNeutronv2(TestNeutronv2Base):
 
     def test_allocate_for_instance_2(self):
         # Allocate one port in two networks env.
-        self._allocate_for_instance(2)
+        api = self._stub_allocate_for_instance(net_idx=2)
+        self.assertRaises(exception.NetworkAmbiguous,
+                          api.allocate_for_instance,
+                          self.context, self.instance)
 
     def test_allocate_for_instance_accepts_macs_kwargs_None(self):
         # The macs kwarg should be accepted as None.
@@ -729,6 +910,23 @@ class TestNeutronv2(TestNeutronv2Base):
                           self.instance, requested_networks=requested_networks,
                           macs=set(['unknown:mac']))
 
+    def test_allocate_for_instance_without_requested_networks(self):
+        api = self._stub_allocate_for_instance(net_idx=3)
+        self.assertRaises(exception.NetworkAmbiguous,
+                          api.allocate_for_instance,
+                          self.context, self.instance)
+
+    def test_allocate_for_instance_with_requested_non_available_network(self):
+        """verify that a non available network is ignored.
+        self.nets2 (net_idx=2) is composed of self.nets3[0] and self.nets3[1]
+        Do not create a port on a non available network self.nets3[2].
+       """
+        requested_networks = [
+            (net['id'], None, None)
+            for net in (self.nets3[0], self.nets3[2], self.nets3[1])]
+        self._allocate_for_instance(net_idx=2,
+                                    requested_networks=requested_networks)
+
     def test_allocate_for_instance_with_requested_networks(self):
         # specify only first and last network
         requested_networks = [
@@ -744,7 +942,7 @@ class TestNeutronv2(TestNeutronv2Base):
                                     requested_networks=requested_networks)
 
     def test_allocate_for_instance_with_requested_networks_with_port(self):
-        requested_networks = [(None, None, 'myportid1')]
+        requested_networks = [(None, None, 'my_portid1')]
         self._allocate_for_instance(net_idx=1,
                                     requested_networks=requested_networks)
 
@@ -771,13 +969,13 @@ class TestNeutronv2(TestNeutronv2Base):
         api = neutronapi.API()
         self.mox.StubOutWithMock(api, '_populate_neutron_extension_values')
         self.mox.StubOutWithMock(api, '_has_port_binding_extension')
-        api._has_port_binding_extension().MultipleTimes().AndReturn(False)
+        api._has_port_binding_extension(mox.IgnoreArg()).MultipleTimes().\
+                                                         AndReturn(False)
+        requested_networks = [
+            (net['id'], None, None)
+            for net in (self.nets2[0], self.nets2[1])]
         self.moxed_client.list_networks(
-            tenant_id=self.instance['project_id'],
-            shared=False).AndReturn(
-                {'networks': self.nets2})
-        self.moxed_client.list_networks(shared=True).AndReturn(
-                {'networks': []})
+            id=['my_netid1', 'my_netid2']).AndReturn({'networks': self.nets2})
         index = 0
         for network in self.nets2:
             binding_port_req_body = {
@@ -796,15 +994,13 @@ class TestNeutronv2(TestNeutronv2Base):
             port_req_body['port'].update(binding_port_req_body['port'])
             port = {'id': 'portid_' + network['id']}
 
-            api._populate_neutron_extension_values(
+            api._populate_neutron_extension_values(self.context,
                 self.instance, binding_port_req_body).AndReturn(None)
             if index == 0:
                 self.moxed_client.create_port(
                     MyComparator(port_req_body)).AndReturn({'port': port})
             else:
-                NeutronOverQuota = exceptions.NeutronClientException(
-                            message="Quota exceeded for resources: ['port']",
-                            status_code=409)
+                NeutronOverQuota = exceptions.OverQuotaClient()
                 self.moxed_client.create_port(
                     MyComparator(port_req_body)).AndRaise(NeutronOverQuota)
             index += 1
@@ -812,7 +1008,8 @@ class TestNeutronv2(TestNeutronv2Base):
         self.mox.ReplayAll()
         self.assertRaises(exception.PortLimitExceeded,
                           api.allocate_for_instance,
-                          self.context, self.instance)
+                          self.context, self.instance,
+                          requested_networks=requested_networks)
 
     def test_allocate_for_instance_ex2(self):
         """verify we have no port to delete
@@ -822,15 +1019,21 @@ class TestNeutronv2(TestNeutronv2Base):
         In this case, the code should not delete any ports.
         """
         api = neutronapi.API()
+        self.mox.StubOutWithMock(api, '_populate_neutron_extension_values')
+        self.mox.StubOutWithMock(api, '_has_port_binding_extension')
+        api._has_port_binding_extension(mox.IgnoreArg()).MultipleTimes().\
+                                                         AndReturn(False)
+        requested_networks = [
+            (net['id'], None, None)
+            for net in (self.nets2[0], self.nets2[1])]
         self.moxed_client.list_networks(
-            tenant_id=self.instance['project_id'],
-            shared=False).AndReturn(
-                {'networks': self.nets2})
-        self.moxed_client.list_networks(shared=True).AndReturn(
-                {'networks': []})
-        neutronv2.get_client(mox.IgnoreArg(),
-                             admin=True).AndReturn(
-            self.moxed_client)
+            id=['my_netid1', 'my_netid2']).AndReturn({'networks': self.nets2})
+        binding_port_req_body = {
+            'port': {
+                'device_id': self.instance['uuid'],
+                'device_owner': 'compute:nova',
+            },
+        }
         port_req_body = {
             'port': {
                 'network_id': self.nets2[0]['id'],
@@ -839,12 +1042,15 @@ class TestNeutronv2(TestNeutronv2Base):
                 'tenant_id': self.instance['project_id'],
             },
         }
+        api._populate_neutron_extension_values(self.context,
+            self.instance, binding_port_req_body).AndReturn(None)
         self.moxed_client.create_port(
             MyComparator(port_req_body)).AndRaise(
                 Exception("fail to create port"))
         self.mox.ReplayAll()
         self.assertRaises(NEUTRON_CLIENT_EXCEPTION, api.allocate_for_instance,
-                          self.context, self.instance)
+                          self.context, self.instance,
+                          requested_networks=requested_networks)
 
     def test_allocate_for_instance_no_port_or_network(self):
         class BailOutEarly(Exception):
@@ -880,18 +1086,48 @@ class TestNeutronv2(TestNeutronv2Base):
                           api.allocate_for_instance, self.context,
                           self.instance, requested_networks=requested_networks)
 
-    def _deallocate_for_instance(self, number):
+    def _deallocate_for_instance(self, number, requested_networks=None):
+        api = neutronapi.API()
         port_data = number == 1 and self.port_data1 or self.port_data2
+        ret_data = copy.deepcopy(port_data)
+        if requested_networks:
+            for net, fip, port in requested_networks:
+                ret_data.append({'network_id': net,
+                                 'device_id': self.instance['uuid'],
+                                 'device_owner': 'compute:nova',
+                                 'id': port,
+                                 'status': 'DOWN',
+                                 'admin_state_up': True,
+                                 'fixed_ips': [],
+                                 'mac_address': 'fake_mac', })
         self.moxed_client.list_ports(
             device_id=self.instance['uuid']).AndReturn(
-                {'ports': port_data})
-        for port in port_data:
+                {'ports': ret_data})
+        if requested_networks:
+            for net, fip, port in requested_networks:
+                self.moxed_client.update_port(port)
+        for port in reversed(port_data):
             self.moxed_client.delete_port(port['id'])
 
+        self.mox.StubOutWithMock(api.db, 'instance_info_cache_update')
+        api.db.instance_info_cache_update(self.context,
+                                          self.instance['uuid'],
+                                          {'network_info': '[]'})
         self.mox.ReplayAll()
 
         api = neutronapi.API()
-        api.deallocate_for_instance(self.context, self.instance)
+        api.deallocate_for_instance(self.context, self.instance,
+                                    requested_networks=requested_networks)
+
+    def test_deallocate_for_instance_1_with_requested(self):
+        requested = [('fake-net', 'fake-fip', 'fake-port')]
+        # Test to deallocate in one port env.
+        self._deallocate_for_instance(1, requested_networks=requested)
+
+    def test_deallocate_for_instance_2_with_requested(self):
+        requested = [('fake-net', 'fake-fip', 'fake-port')]
+        # Test to deallocate in one port env.
+        self._deallocate_for_instance(2, requested_networks=requested)
 
     def test_deallocate_for_instance_1(self):
         # Test to deallocate in one port env.
@@ -901,20 +1137,36 @@ class TestNeutronv2(TestNeutronv2Base):
         # Test to deallocate in two ports env.
         self._deallocate_for_instance(2)
 
+    def test_deallocate_for_instance_port_not_found(self):
+        port_data = self.port_data1
+        self.moxed_client.list_ports(
+            device_id=self.instance['uuid']).AndReturn(
+                {'ports': port_data})
+
+        NeutronNotFound = neutronv2.exceptions.NeutronClientException(
+                                                            status_code=404)
+        for port in reversed(port_data):
+            self.moxed_client.delete_port(port['id']).AndRaise(
+                                                        NeutronNotFound)
+        self.mox.ReplayAll()
+
+        api = neutronapi.API()
+        api.deallocate_for_instance(self.context, self.instance)
+
     def _test_deallocate_port_for_instance(self, number):
         port_data = number == 1 and self.port_data1 or self.port_data2
+        nets = number == 1 and self.nets1 or self.nets2
         self.moxed_client.delete_port(port_data[0]['id'])
-        self.mox.StubOutWithMock(conductor_api.API,
-                                 'instance_get_by_uuid')
 
         net_info_cache = []
         for port in port_data:
-            net_info_cache.append({"network": {"id": port['network_id']}})
-        info_cache = {'info_cache': {'network_info':
-                                     jsonutils.dumps(net_info_cache)}}
+            net_info_cache.append({"network": {"id": port['network_id']},
+                                   "id": port['id']})
+        instance = copy.copy(self.instance)
+        instance['info_cache'] = {'network_info':
+                                  six.text_type(
+                                    jsonutils.dumps(net_info_cache))}
         api = neutronapi.API()
-        api.conductor_api.instance_get_by_uuid(
-            mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(info_cache)
         neutronv2.get_client(mox.IgnoreArg(), admin=True).AndReturn(
             self.moxed_client)
         self.moxed_client.list_ports(
@@ -923,12 +1175,9 @@ class TestNeutronv2(TestNeutronv2Base):
                 {'ports': port_data[1:]})
         neutronv2.get_client(mox.IgnoreArg()).MultipleTimes().AndReturn(
             self.moxed_client)
-        self.moxed_client.list_networks(
-            tenant_id=self.instance['project_id'],
-            shared=False).AndReturn(
-                {'networks': [self.nets2[1]]})
-        self.moxed_client.list_networks(shared=True).AndReturn(
-            {'networks': []})
+        net_ids = [port['network_id'] for port in port_data]
+        self.moxed_client.list_networks(id=net_ids).AndReturn(
+            {'networks': nets})
         float_data = number == 1 and self.float_data1 or self.float_data2
         for data in port_data[1:]:
             for ip in data['fixed_ips']:
@@ -941,7 +1190,7 @@ class TestNeutronv2(TestNeutronv2Base):
 
         self.mox.ReplayAll()
 
-        nwinfo = api.deallocate_port_for_instance(self.context, self.instance,
+        nwinfo = api.deallocate_port_for_instance(self.context, instance,
                                                   port_data[0]['id'])
         self.assertEqual(len(nwinfo), len(port_data[1:]))
         if len(port_data) > 1:
@@ -967,32 +1216,58 @@ class TestNeutronv2(TestNeutronv2Base):
         neutronapi.API().show_port(self.context, 'foo')
 
     def test_validate_networks(self):
-        requested_networks = [('my_netid1', 'test', None),
-                              ('my_netid2', 'test2', None)]
+        requested_networks = [('my_netid1', None, None),
+                              ('my_netid2', None, None)]
         ids = ['my_netid1', 'my_netid2']
         self.moxed_client.list_networks(
             id=mox.SameElementsAs(ids)).AndReturn(
                 {'networks': self.nets2})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                    {'ports': []})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                    {'quota': {'port': 50}})
         self.mox.ReplayAll()
         api = neutronapi.API()
-        api.validate_networks(self.context, requested_networks)
+        api.validate_networks(self.context, requested_networks, 1)
+
+    def test_validate_networks_without_port_quota_on_network_side(self):
+        requested_networks = [('my_netid1', None, None),
+                              ('my_netid2', None, None)]
+        ids = ['my_netid1', 'my_netid2']
+        self.moxed_client.list_networks(
+            id=mox.SameElementsAs(ids)).AndReturn(
+                {'networks': self.nets2})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                    {'ports': []})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                    {'quota': {}})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        api.validate_networks(self.context, requested_networks, 1)
 
     def test_validate_networks_ex_1(self):
-        requested_networks = [('my_netid1', 'test', None)]
+        requested_networks = [('my_netid1', None, None)]
         self.moxed_client.list_networks(
             id=mox.SameElementsAs(['my_netid1'])).AndReturn(
                 {'networks': self.nets1})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                    {'ports': []})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                    {'quota': {'port': 50}})
         self.mox.ReplayAll()
         api = neutronapi.API()
         try:
-            api.validate_networks(self.context, requested_networks)
+            api.validate_networks(self.context, requested_networks, 1)
         except exception.NetworkNotFound as ex:
             self.assertIn("my_netid2", str(ex))
 
     def test_validate_networks_ex_2(self):
-        requested_networks = [('my_netid1', 'test', None),
-                              ('my_netid2', 'test2', None),
-                              ('my_netid3', 'test3', None)]
+        requested_networks = [('my_netid1', None, None),
+                              ('my_netid2', None, None),
+                              ('my_netid3', None, None)]
         ids = ['my_netid1', 'my_netid2', 'my_netid3']
         self.moxed_client.list_networks(
             id=mox.SameElementsAs(ids)).AndReturn(
@@ -1000,13 +1275,14 @@ class TestNeutronv2(TestNeutronv2Base):
         self.mox.ReplayAll()
         api = neutronapi.API()
         try:
-            api.validate_networks(self.context, requested_networks)
+            api.validate_networks(self.context, requested_networks, 1)
         except exception.NetworkNotFound as ex:
             self.assertIn("my_netid2, my_netid3", str(ex))
 
-    def test_validate_networks_duplicate(self):
+    def test_validate_networks_duplicate_disable(self):
         """Verify that the correct exception is thrown when duplicate
-           network ids are passed to validate_networks.
+        network ids are passed to validate_networks, when nova config flag
+        allow_duplicate_networks is set to its default value: False
         """
         requested_networks = [('my_netid1', None, None),
                               ('my_netid1', None, None)]
@@ -1015,8 +1291,59 @@ class TestNeutronv2(TestNeutronv2Base):
         neutronv2.get_client(None)
         api = neutronapi.API()
         self.assertRaises(exception.NetworkDuplicated,
-                          api.validate_networks,
-                          self.context, requested_networks)
+                      api.validate_networks,
+                      self.context, requested_networks, 1)
+
+    def test_validate_networks_duplicate_enable(self):
+        """Verify that no duplicateNetworks exception is thrown when duplicate
+        network ids are passed to validate_networks, when nova config flag
+        allow_duplicate_networks is set to its non default value: True
+        """
+        self.flags(allow_duplicate_networks=True, group='neutron')
+        requested_networks = [('my_netid1', None, None),
+                              ('my_netid1', None, None)]
+        ids = ['my_netid1', 'my_netid1']
+
+        self.moxed_client.list_networks(
+            id=mox.SameElementsAs(ids)).AndReturn(
+                 {'networks': self.nets1})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                 {'ports': []})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                {'quota': {'port': 50}})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        api.validate_networks(self.context, requested_networks, 1)
+
+    def test_allocate_for_instance_with_requested_networks_duplicates(self):
+        # specify a duplicate network to allocate to instance
+        self.flags(allow_duplicate_networks=True, group='neutron')
+        requested_networks = [
+            (net['id'], None, None)
+            for net in (self.nets6[0], self.nets6[1])]
+        self._allocate_for_instance(net_idx=6,
+                                    requested_networks=requested_networks)
+
+    def test_allocate_for_instance_requested_networks_duplicates_port(self):
+        # specify first port and last port that are in same network
+        self.flags(allow_duplicate_networks=True, group='neutron')
+        requested_networks = [
+            (None, None, port['id'])
+            for port in (self.port_data1[0], self.port_data3[0])]
+        self._allocate_for_instance(net_idx=6,
+                                    requested_networks=requested_networks)
+
+    def test_allocate_for_instance_requested_networks_duplicates_combo(self):
+        # specify a combo net_idx=7 : net2, port in net1, net2, port in net1
+        self.flags(allow_duplicate_networks=True, group='neutron')
+        requested_networks = [
+            ('my_netid2', None, None),
+            (None, None, self.port_data1[0]['id']),
+            ('my_netid2', None, None),
+            (None, None, self.port_data3[0]['id'])]
+        self._allocate_for_instance(net_idx=7,
+                                    requested_networks=requested_networks)
 
     def test_validate_networks_not_specified(self):
         requested_networks = []
@@ -1031,7 +1358,7 @@ class TestNeutronv2(TestNeutronv2Base):
         api = neutronapi.API()
         self.assertRaises(exception.NetworkAmbiguous,
                           api.validate_networks,
-                          self.context, requested_networks)
+                          self.context, requested_networks, 1)
 
     def test_validate_networks_port_not_found(self):
         # Verify that the correct exception is thrown when a non existent
@@ -1049,7 +1376,7 @@ class TestNeutronv2(TestNeutronv2Base):
         api = neutronapi.API()
         self.assertRaises(exception.PortNotFound,
                           api.validate_networks,
-                          self.context, requested_networks)
+                          self.context, requested_networks, 1)
 
     def test_validate_networks_port_show_rasies_non404(self):
         # Verify that the correct exception is thrown when a non existent
@@ -1067,7 +1394,7 @@ class TestNeutronv2(TestNeutronv2Base):
         api = neutronapi.API()
         self.assertRaises(neutronv2.exceptions.NeutronClientException,
                           api.validate_networks,
-                          self.context, requested_networks)
+                          self.context, requested_networks, 1)
 
     def test_validate_networks_port_in_use(self):
         requested_networks = [(None, None, self.port_data3[0]['id'])]
@@ -1079,10 +1406,73 @@ class TestNeutronv2(TestNeutronv2Base):
         api = neutronapi.API()
         self.assertRaises(exception.PortInUse,
                           api.validate_networks,
-                          self.context, requested_networks)
+                          self.context, requested_networks, 1)
 
-    def test_validate_networks_ports_in_same_network(self):
+    def test_validate_networks_port_no_subnet_id(self):
         port_a = self.port_data3[0]
+        port_a['device_id'] = None
+        port_a['device_owner'] = None
+
+        requested_networks = [(None, None, port_a['id'])]
+        self.moxed_client.show_port(port_a['id']).AndReturn({'port': port_a})
+
+        self.mox.ReplayAll()
+
+        api = neutronapi.API()
+        self.assertRaises(exception.PortRequiresFixedIP,
+                          api.validate_networks,
+                          self.context, requested_networks, 1)
+
+    def test_validate_networks_no_subnet_id(self):
+        requested_networks = [('his_netid4', None, None)]
+        ids = ['his_netid4']
+        self.moxed_client.list_networks(
+            id=mox.SameElementsAs(ids)).AndReturn(
+                {'networks': self.nets4})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        self.assertRaises(exception.NetworkRequiresSubnet,
+                          api.validate_networks,
+                          self.context, requested_networks, 1)
+
+    def test_validate_networks_ports_in_same_network_disable(self):
+        """Verify that duplicateNetworks exception is thrown when ports on same
+        duplicate network are passed to validate_networks, when nova config
+        flag allow_duplicate_networks is set to its default False
+        """
+        self.flags(allow_duplicate_networks=False, group='neutron')
+        port_a = self.port_data3[0]
+        port_a['fixed_ips'] = {'ip_address': '10.0.0.2',
+                           'subnet_id': 'subnet_id'}
+        port_b = self.port_data1[0]
+        self.assertEqual(port_a['network_id'], port_b['network_id'])
+        for port in [port_a, port_b]:
+            port['device_id'] = None
+            port['device_owner'] = None
+
+        requested_networks = [(None, None, port_a['id']),
+                             (None, None, port_b['id'])]
+        self.moxed_client.show_port(port_a['id']).AndReturn(
+                                                  {'port': port_a})
+        self.moxed_client.show_port(port_b['id']).AndReturn(
+                                                  {'port': port_b})
+
+        self.mox.ReplayAll()
+
+        api = neutronapi.API()
+        self.assertRaises(exception.NetworkDuplicated,
+                          api.validate_networks,
+                          self.context, requested_networks, 1)
+
+    def test_validate_networks_ports_in_same_network_enable(self):
+        """Verify that duplicateNetworks exception is not thrown when ports
+        on same duplicate network are passed to validate_networks, when nova
+        config flag allow_duplicate_networks is set to its True
+        """
+        self.flags(allow_duplicate_networks=True, group='neutron')
+        port_a = self.port_data3[0]
+        port_a['fixed_ips'] = {'ip_address': '10.0.0.2',
+                               'subnet_id': 'subnet_id'}
         port_b = self.port_data1[0]
         self.assertEqual(port_a['network_id'], port_b['network_id'])
         for port in [port_a, port_b]:
@@ -1091,18 +1481,140 @@ class TestNeutronv2(TestNeutronv2Base):
 
         requested_networks = [(None, None, port_a['id']),
                               (None, None, port_b['id'])]
-        self.moxed_client.show_port(port_a['id']).AndReturn({'port': port_a})
-        self.moxed_client.show_port(port_b['id']).AndReturn({'port': port_b})
+        self.moxed_client.show_port(port_a['id']).AndReturn(
+                                                 {'port': port_a})
+        self.moxed_client.show_port(port_b['id']).AndReturn(
+                                                 {'port': port_b})
 
         self.mox.ReplayAll()
 
         api = neutronapi.API()
-        self.assertRaises(exception.NetworkDuplicated,
-                          api.validate_networks,
-                          self.context, requested_networks)
+        api.validate_networks(self.context, requested_networks, 1)
 
     def test_validate_networks_ports_not_in_same_network(self):
         port_a = self.port_data3[0]
+        port_a['fixed_ips'] = {'ip_address': '10.0.0.2',
+                               'subnet_id': 'subnet_id'}
+        port_b = self.port_data2[1]
+        self.assertNotEqual(port_a['network_id'], port_b['network_id'])
+        for port in [port_a, port_b]:
+            port['device_id'] = None
+            port['device_owner'] = None
+
+        requested_networks = [(None, None, port_a['id']),
+                              (None, None, port_b['id'])]
+        self.moxed_client.show_port(port_a['id']).AndReturn({'port': port_a})
+        self.moxed_client.show_port(port_b['id']).AndReturn({'port': port_b})
+        self.mox.ReplayAll()
+
+        api = neutronapi.API()
+        api.validate_networks(self.context, requested_networks, 1)
+
+    def test_validate_networks_no_quota(self):
+        # Test validation for a request for one instance needing
+        # two ports, where the quota is 2 and 2 ports are in use
+        #  => instances which can be created = 0
+        requested_networks = [('my_netid1', None, None),
+                              ('my_netid2', None, None)]
+        ids = ['my_netid1', 'my_netid2']
+        self.moxed_client.list_networks(
+            id=mox.SameElementsAs(ids)).AndReturn(
+                {'networks': self.nets2})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                    {'ports': self.port_data2})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                    {'quota': {'port': 2}})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        max_count = api.validate_networks(self.context,
+                                          requested_networks, 1)
+        self.assertEqual(max_count, 0)
+
+    def test_validate_networks_with_ports_and_networks(self):
+        # Test validation for a request for one instance needing
+        # one port allocated via nova with another port being passed in.
+        port_b = self.port_data2[1]
+        port_b['device_id'] = None
+        port_b['device_owner'] = None
+        requested_networks = [('my_netid1', None, None),
+                              (None, None, port_b['id'])]
+        self.moxed_client.show_port(port_b['id']).AndReturn({'port': port_b})
+        ids = ['my_netid1']
+        self.moxed_client.list_networks(
+            id=mox.SameElementsAs(ids)).AndReturn(
+                {'networks': self.nets1})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                    {'ports': self.port_data2})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                    {'quota': {'port': 5}})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        max_count = api.validate_networks(self.context,
+                                          requested_networks, 1)
+        self.assertEqual(max_count, 1)
+
+    def test_validate_networks_one_port_and_no_networks(self):
+        # Test that show quota is not called if no networks are
+        # passed in and only ports.
+        port_b = self.port_data2[1]
+        port_b['device_id'] = None
+        port_b['device_owner'] = None
+        requested_networks = [(None, None, port_b['id'])]
+        self.moxed_client.show_port(port_b['id']).AndReturn({'port': port_b})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        max_count = api.validate_networks(self.context,
+                                          requested_networks, 1)
+        self.assertEqual(max_count, 1)
+
+    def test_validate_networks_some_quota(self):
+        # Test validation for a request for two instance needing
+        # two ports each, where the quota is 5 and 2 ports are in use
+        #  => instances which can be created = 1
+        requested_networks = [('my_netid1', None, None),
+                              ('my_netid2', None, None)]
+        ids = ['my_netid1', 'my_netid2']
+        self.moxed_client.list_networks(
+            id=mox.SameElementsAs(ids)).AndReturn(
+                {'networks': self.nets2})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                    {'ports': self.port_data2})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                    {'quota': {'port': 5}})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        max_count = api.validate_networks(self.context,
+                                          requested_networks, 2)
+        self.assertEqual(max_count, 1)
+
+    def test_validate_networks_unlimited_quota(self):
+        # Test validation for a request for two instance needing
+        # two ports each, where the quota is -1 (unlimited)
+        #  => instances which can be created = 1
+        requested_networks = [('my_netid1', None, None),
+                              ('my_netid2', None, None)]
+        ids = ['my_netid1', 'my_netid2']
+        self.moxed_client.list_networks(
+            id=mox.SameElementsAs(ids)).AndReturn(
+                {'networks': self.nets2})
+        self.moxed_client.list_ports(tenant_id='my_tenantid').AndReturn(
+                    {'ports': self.port_data2})
+        self.moxed_client.show_quota(
+            tenant_id='my_tenantid').AndReturn(
+                    {'quota': {'port': -1}})
+        self.mox.ReplayAll()
+        api = neutronapi.API()
+        max_count = api.validate_networks(self.context,
+                                          requested_networks, 2)
+        self.assertEqual(max_count, 2)
+
+    def test_validate_networks_no_quota_but_ports_supplied(self):
+        port_a = self.port_data3[0]
+        port_a['fixed_ips'] = {'ip_address': '10.0.0.2',
+                               'subnet_id': 'subnet_id'}
         port_b = self.port_data2[1]
         self.assertNotEqual(port_a['network_id'], port_b['network_id'])
         for port in [port_a, port_b]:
@@ -1114,14 +1626,12 @@ class TestNeutronv2(TestNeutronv2Base):
         self.moxed_client.show_port(port_a['id']).AndReturn({'port': port_a})
         self.moxed_client.show_port(port_b['id']).AndReturn({'port': port_b})
 
-        search_opts = {'id': [port_a['network_id'], port_b['network_id']]}
-        self.moxed_client.list_networks(
-            **search_opts).AndReturn({'networks': self.nets2})
-
         self.mox.ReplayAll()
 
         api = neutronapi.API()
-        api.validate_networks(self.context, requested_networks)
+        max_count = api.validate_networks(self.context,
+                                          requested_networks, 1)
+        self.assertEqual(max_count, 1)
 
     def _mock_list_ports(self, port_data=None):
         if port_data is None:
@@ -1161,7 +1671,8 @@ class TestNeutronv2(TestNeutronv2Base):
                           api.get_fixed_ip_by_address,
                           self.context, address)
 
-    def _get_available_networks(self, prv_nets, pub_nets, req_ids=None):
+    def _get_available_networks(self, prv_nets, pub_nets,
+                                req_ids=None, context=None):
         api = neutronapi.API()
         nets = prv_nets + pub_nets
         if req_ids:
@@ -1178,9 +1689,10 @@ class TestNeutronv2(TestNeutronv2Base):
                 **mox_list_params).AndReturn({'networks': pub_nets})
 
         self.mox.ReplayAll()
-        rets = api._get_available_networks(self.context,
-                                           self.instance['project_id'],
-                                           req_ids)
+        rets = api._get_available_networks(
+            context if context else self.context,
+            self.instance['project_id'],
+            req_ids)
         self.assertEqual(rets, nets)
 
     def test_get_available_networks_all_private(self):
@@ -1199,6 +1711,20 @@ class TestNeutronv2(TestNeutronv2Base):
         req_ids = [net['id'] for net in (self.nets3[0], self.nets3[-1])]
         self._get_available_networks(prv_nets, pub_nets, req_ids)
 
+    def test_get_available_networks_with_externalnet_fails(self):
+        req_ids = [net['id'] for net in self.nets5]
+        self.assertRaises(
+            exception.ExternalNetworkAttachForbidden,
+            self._get_available_networks,
+            self.nets5, pub_nets=[], req_ids=req_ids)
+
+    def test_get_available_networks_with_externalnet_admin_ctx(self):
+        admin_ctx = context.RequestContext('userid', 'my_tenantid',
+                                           is_admin=True)
+        req_ids = [net['id'] for net in self.nets5]
+        self._get_available_networks(self.nets5, pub_nets=[],
+                                     req_ids=req_ids, context=admin_ctx)
+
     def test_get_floating_ip_pools(self):
         api = neutronapi.API()
         search_opts = {'router:external': True}
@@ -1206,8 +1732,7 @@ class TestNeutronv2(TestNeutronv2Base):
             AndReturn({'networks': [self.fip_pool, self.fip_pool_nova]})
         self.mox.ReplayAll()
         pools = api.get_floating_ip_pools(self.context)
-        expected = [{'name': self.fip_pool['name']},
-                    {'name': self.fip_pool_nova['name']}]
+        expected = [self.fip_pool['name'], self.fip_pool_nova['name']]
         self.assertEqual(expected, pools)
 
     def _get_expected_fip_model(self, fip_data, idx=0):
@@ -1366,6 +1891,38 @@ class TestNeutronv2(TestNeutronv2Base):
         fip = api.allocate_floating_ip(self.context, 'ext_net')
         self.assertEqual(fip, self.fip_unassociated['floating_ip_address'])
 
+    def test_allocate_floating_ip_addr_gen_fail(self):
+        api = neutronapi.API()
+        pool_name = self.fip_pool['name']
+        pool_id = self.fip_pool['id']
+        search_opts = {'router:external': True,
+                       'fields': 'id',
+                       'name': pool_name}
+        self.moxed_client.list_networks(**search_opts).\
+            AndReturn({'networks': [self.fip_pool]})
+        self.moxed_client.create_floatingip(
+            {'floatingip': {'floating_network_id': pool_id}}).\
+            AndRaise(exceptions.IpAddressGenerationFailureClient)
+        self.mox.ReplayAll()
+        self.assertRaises(exception.NoMoreFloatingIps,
+                          api.allocate_floating_ip, self.context, 'ext_net')
+
+    def test_allocate_floating_ip_exhausted_fail(self):
+        api = neutronapi.API()
+        pool_name = self.fip_pool['name']
+        pool_id = self.fip_pool['id']
+        search_opts = {'router:external': True,
+                       'fields': 'id',
+                       'name': pool_name}
+        self.moxed_client.list_networks(**search_opts).\
+            AndReturn({'networks': [self.fip_pool]})
+        self.moxed_client.create_floatingip(
+            {'floatingip': {'floating_network_id': pool_id}}).\
+            AndRaise(exceptions.ExternalIpAddressExhaustedClient)
+        self.mox.ReplayAll()
+        self.assertRaises(exception.NoMoreFloatingIps,
+                          api.allocate_floating_ip, self.context, 'ext_net')
+
     def test_allocate_floating_ip_with_pool_id(self):
         api = neutronapi.API()
         pool_id = self.fip_pool['id']
@@ -1454,7 +2011,6 @@ class TestNeutronv2(TestNeutronv2Base):
     def test_reassociate_floating_ip(self):
         api = neutronapi.API()
         address = self.fip_associated['floating_ip_address']
-        old_fixed_address = self.fip_associated['fixed_ip_address']
         new_fixed_address = self.port_address
         fip_id = self.fip_associated['id']
 
@@ -1632,7 +2188,7 @@ class TestNeutronv2(TestNeutronv2Base):
 
     def test_nw_info_build_network_ovs(self):
         net, iid = self._test_nw_info_build_network(model.VIF_TYPE_OVS)
-        self.assertEqual(net['bridge'], CONF.neutron_ovs_bridge)
+        self.assertEqual(net['bridge'], CONF.neutron.ovs_bridge)
         self.assertNotIn('should_create_bridge', net)
         self.assertEqual(iid, 'port-id')
 
@@ -1648,21 +2204,64 @@ class TestNeutronv2(TestNeutronv2Base):
         self.assertNotIn('should_create_bridge', net)
         self.assertIsNone(iid)
 
+    def test_nw_info_build_no_match(self):
+        fake_port = {
+            'fixed_ips': [{'ip_address': '1.1.1.1'}],
+            'id': 'port-id',
+            'network_id': 'net-id1',
+            'tenant_id': 'tenant',
+            'binding:vif_type': model.VIF_TYPE_OVS,
+            }
+        fake_subnets = [model.Subnet(cidr='1.0.0.0/8')]
+        fake_nets = [{'id': 'net-id2', 'name': 'foo', 'tenant_id': 'tenant'}]
+        api = neutronapi.API()
+        self.mox.ReplayAll()
+        neutronv2.get_client('fake')
+        net, iid = api._nw_info_build_network(fake_port, fake_nets,
+                                              fake_subnets)
+        self.assertEqual(fake_subnets, net['subnets'])
+        self.assertEqual('net-id1', net['id'])
+        self.assertEqual('net-id1', net['id'])
+        self.assertEqual('tenant', net['meta']['tenant_id'])
+
     def test_build_network_info_model(self):
         api = neutronapi.API()
         fake_inst = {'project_id': 'fake', 'uuid': 'uuid',
                      'info_cache': {'network_info': []}}
         fake_ports = [
-            {'id': 'port0',
+            # admin_state_up=True and status='ACTIVE' thus vif.active=True
+            {'id': 'port1',
              'network_id': 'net-id',
+             'admin_state_up': True,
+             'status': 'ACTIVE',
              'fixed_ips': [{'ip_address': '1.1.1.1'}],
              'mac_address': 'de:ad:be:ef:00:01',
              'binding:vif_type': model.VIF_TYPE_BRIDGE,
              },
+            # admin_state_up=False and status='DOWN' thus vif.active=True
+            {'id': 'port2',
+             'network_id': 'net-id',
+             'admin_state_up': False,
+             'status': 'DOWN',
+             'fixed_ips': [{'ip_address': '1.1.1.1'}],
+             'mac_address': 'de:ad:be:ef:00:02',
+             'binding:vif_type': model.VIF_TYPE_BRIDGE,
+             },
+            # admin_state_up=True and status='DOWN' thus vif.active=False
+             {'id': 'port0',
+             'network_id': 'net-id',
+             'admin_state_up': True,
+             'status': 'DOWN',
+             'fixed_ips': [{'ip_address': '1.1.1.1'}],
+             'mac_address': 'de:ad:be:ef:00:03',
+             'binding:vif_type': model.VIF_TYPE_BRIDGE,
+             },
             # This does not match the networks we provide below,
             # so it should be ignored (and is here to verify that)
-            {'id': 'port1',
+            {'id': 'port3',
              'network_id': 'other-net-id',
+             'admin_state_up': True,
+             'status': 'DOWN',
              },
             ]
         fake_subnets = [model.Subnet(cidr='1.0.0.0/8')]
@@ -1677,24 +2276,69 @@ class TestNeutronv2(TestNeutronv2Base):
         self.moxed_client.list_ports(
             tenant_id='fake', device_id='uuid').AndReturn(
                 {'ports': fake_ports})
+
         self.mox.StubOutWithMock(api, '_get_floating_ips_by_fixed_and_port')
-        api._get_floating_ips_by_fixed_and_port(
-            self.moxed_client, '1.1.1.1', 'port0').AndReturn(
-                [{'floating_ip_address': '10.0.0.1'}])
         self.mox.StubOutWithMock(api, '_get_subnets_from_port')
-        api._get_subnets_from_port(self.context, fake_ports[0]).AndReturn(
-            fake_subnets)
+        requested_ports = [fake_ports[2], fake_ports[0], fake_ports[1]]
+        for requested_port in requested_ports:
+            api._get_floating_ips_by_fixed_and_port(
+                self.moxed_client, '1.1.1.1', requested_port['id']).AndReturn(
+                    [{'floating_ip_address': '10.0.0.1'}])
+        for requested_port in requested_ports:
+            api._get_subnets_from_port(self.context, requested_port
+                ).AndReturn(fake_subnets)
+
         self.mox.ReplayAll()
         neutronv2.get_client('fake')
-        nw_info = api._build_network_info_model(self.context, fake_inst,
-                                                fake_nets)
-        self.assertEqual(len(nw_info), 1)
-        self.assertEqual(nw_info[0]['id'], 'port0')
-        self.assertEqual(nw_info[0]['address'], 'de:ad:be:ef:00:01')
-        self.assertEqual(nw_info[0]['devname'], 'tapport0')
-        self.assertIsNone(nw_info[0]['ovs_interfaceid'])
-        self.assertEqual(nw_info[0]['type'], model.VIF_TYPE_BRIDGE)
-        self.assertEqual(nw_info[0]['network']['bridge'], 'brqnet-id')
+        nw_infos = api._build_network_info_model(self.context, fake_inst,
+                                                 fake_nets,
+                                                 [fake_ports[2]['id'],
+                                                  fake_ports[0]['id'],
+                                                  fake_ports[1]['id']])
+        self.assertEqual(len(nw_infos), 3)
+        index = 0
+        for nw_info in nw_infos:
+            self.assertEqual(nw_info['address'],
+                             requested_ports[index]['mac_address'])
+            self.assertEqual(nw_info['devname'], 'tapport' + str(index))
+            self.assertIsNone(nw_info['ovs_interfaceid'])
+            self.assertEqual(nw_info['type'], model.VIF_TYPE_BRIDGE)
+            self.assertEqual(nw_info['network']['bridge'], 'brqnet-id')
+            index += 1
+
+        self.assertEqual(nw_infos[0]['active'], False)
+        self.assertEqual(nw_infos[1]['active'], True)
+        self.assertEqual(nw_infos[2]['active'], True)
+
+        self.assertEqual(nw_infos[0]['id'], 'port0')
+        self.assertEqual(nw_infos[1]['id'], 'port1')
+        self.assertEqual(nw_infos[2]['id'], 'port2')
+
+    def test_get_subnets_from_port(self):
+        api = neutronapi.API()
+
+        port_data = copy.copy(self.port_data1[0])
+        subnet_data1 = copy.copy(self.subnet_data1)
+        subnet_data1[0]['host_routes'] = [
+            {'destination': '192.168.0.0/24', 'nexthop': '1.0.0.10'}
+        ]
+
+        self.moxed_client.list_subnets(
+            id=[port_data['fixed_ips'][0]['subnet_id']]
+        ).AndReturn({'subnets': subnet_data1})
+        self.moxed_client.list_ports(
+            network_id=subnet_data1[0]['network_id'],
+            device_owner='network:dhcp').AndReturn({'ports': []})
+        self.mox.ReplayAll()
+
+        subnets = api._get_subnets_from_port(self.context, port_data)
+
+        self.assertEqual(len(subnets), 1)
+        self.assertEqual(len(subnets[0]['routes']), 1)
+        self.assertEqual(subnets[0]['routes'][0]['cidr'],
+                         subnet_data1[0]['host_routes'][0]['destination'])
+        self.assertEqual(subnets[0]['routes'][0]['gateway']['address'],
+                         subnet_data1[0]['host_routes'][0]['nexthop'])
 
     def test_get_all_empty_list_networks(self):
         api = neutronapi.API()
@@ -1703,8 +2347,212 @@ class TestNeutronv2(TestNeutronv2Base):
         networks = api.get_all(self.context)
         self.assertEqual(networks, [])
 
+    def test_get_floating_ips_by_fixed_address(self):
+        # NOTE(lbragstad): We need to reset the mocks in order to assert
+        # a NotImplementedError is raised when calling the method under test.
+        self.mox.ResetAll()
+        fake_fixed = '192.168.1.4'
+        api = neutronapi.API()
+        self.assertRaises(NotImplementedError,
+                          api.get_floating_ips_by_fixed_address,
+                          self.context, fake_fixed)
+
+
+class TestNeutronv2WithMock(test.TestCase):
+    """Used to test Neutron V2 API with mock."""
+
+    def setUp(self):
+        super(TestNeutronv2WithMock, self).setUp()
+        self.api = neutronapi.API()
+        self.context = context.RequestContext(
+            'fake-user', 'fake-project',
+            auth_token='bff4a5a6b9eb4ea2a6efec6eefb77936')
+
+    def _test_validate_networks_fixed_ip_no_dup(self, nets, requested_networks,
+                                                ids, list_port_values):
+
+        def _fake_list_ports(**search_opts):
+            for args, return_value in list_port_values:
+                if args == search_opts:
+                    return return_value
+            self.fail('Unexpected call to list_ports %s' % search_opts)
+
+        with contextlib.nested(
+            mock.patch.object(client.Client, 'list_ports',
+                              side_effect=_fake_list_ports),
+            mock.patch.object(client.Client, 'list_networks',
+                              return_value={'networks': nets}),
+            mock.patch.object(client.Client, 'show_quota',
+                              return_value={'quota': {'port': 50}})) as (
+                list_ports_mock, list_networks_mock, show_quota_mock):
+
+            self.api.validate_networks(self.context, requested_networks, 1)
+
+            self.assertEqual(len(list_port_values),
+                             len(list_ports_mock.call_args_list))
+            list_networks_mock.assert_called_once_with(id=ids)
+            show_quota_mock.assert_called_once_with(tenant_id='fake-project')
+
+    def test_validate_networks_fixed_ip_no_dup1(self):
+        # Test validation for a request for a network with a
+        # fixed ip that is not already in use because no fixed ips in use
+
+        nets1 = [{'id': 'my_netid1',
+                  'name': 'my_netname1',
+                  'subnets': ['mysubnid1'],
+                  'tenant_id': 'fake-project'}]
+
+        requested_networks = [('my_netid1', '10.0.1.2', None)]
+        ids = ['my_netid1']
+        list_port_values = [({'network_id': 'my_netid1',
+                              'fixed_ips': 'ip_address=10.0.1.2',
+                              'fields': 'device_id'},
+                             {'ports': []}),
+                            ({'tenant_id': 'fake-project'},
+                             {'ports': []})]
+        self._test_validate_networks_fixed_ip_no_dup(nets1, requested_networks,
+                                                     ids, list_port_values)
+
+    def test_validate_networks_fixed_ip_no_dup2(self):
+        # Test validation for a request for a network with a
+        # fixed ip that is not already in use because not used on this net id
+
+        nets2 = [{'id': 'my_netid1',
+                  'name': 'my_netname1',
+                  'subnets': ['mysubnid1'],
+                  'tenant_id': 'fake-project'},
+                 {'id': 'my_netid2',
+                  'name': 'my_netname2',
+                  'subnets': ['mysubnid2'],
+                  'tenant_id': 'fake-project'}]
+
+        requested_networks = [('my_netid1', '10.0.1.2', None),
+                              ('my_netid2', '10.0.1.3', None)]
+        ids = ['my_netid1', 'my_netid2']
+        list_port_values = [({'network_id': 'my_netid1',
+                              'fixed_ips': 'ip_address=10.0.1.2',
+                              'fields': 'device_id'},
+                             {'ports': []}),
+                            ({'network_id': 'my_netid2',
+                              'fixed_ips': 'ip_address=10.0.1.3',
+                              'fields': 'device_id'},
+                             {'ports': []}),
+
+                            ({'tenant_id': 'fake-project'},
+                             {'ports': []})]
+
+        self._test_validate_networks_fixed_ip_no_dup(nets2, requested_networks,
+                                                     ids, list_port_values)
+
+    def test_validate_networks_fixed_ip_dup(self):
+        # Test validation for a request for a network with a
+        # fixed ip that is already in use
+
+        requested_networks = [('my_netid1', '10.0.1.2', None)]
+        list_port_mock_params = {'network_id': 'my_netid1',
+                                 'fixed_ips': 'ip_address=10.0.1.2',
+                                 'fields': 'device_id'}
+        list_port_mock_return = {'ports': [({'device_id': 'my_deviceid'})]}
+
+        with mock.patch.object(client.Client, 'list_ports',
+                               return_value=list_port_mock_return) as (
+            list_ports_mock):
+
+            self.assertRaises(exception.FixedIpAlreadyInUse,
+                              self.api.validate_networks,
+                              self.context, requested_networks, 1)
+
+            list_ports_mock.assert_called_once_with(**list_port_mock_params)
+
+    def test_allocate_floating_ip_exceed_limit(self):
+        # Verify that the correct exception is thrown when quota exceed
+        pool_name = 'dummy'
+        api = neutronapi.API()
+        with contextlib.nested(
+            mock.patch.object(client.Client, 'create_floatingip'),
+            mock.patch.object(api,
+                '_get_floating_ip_pool_id_by_name_or_id')) as (
+            create_mock, get_mock):
+            create_mock.side_effect = neutronv2.exceptions.OverQuotaClient()
+
+            self.assertRaises(exception.FloatingIpLimitExceeded,
+                          api.allocate_floating_ip,
+                          self.context, pool_name)
+
+    def test_create_port_for_instance_no_more_ip(self):
+        instance = fake_instance.fake_instance_obj(self.context)
+        net = {'id': 'my_netid1',
+               'name': 'my_netname1',
+               'subnets': ['mysubnid1'],
+               'tenant_id': instance['project_id']}
+
+        with mock.patch.object(client.Client, 'create_port',
+            side_effect=exceptions.IpAddressGenerationFailureClient()) as (
+            create_port_mock):
+            zone = 'compute:%s' % instance['availability_zone']
+            port_req_body = {'port': {'device_id': instance['uuid'],
+                                      'device_owner': zone}}
+            self.assertRaises(exception.NoMoreFixedIps,
+                              self.api._create_port,
+                              neutronv2.get_client(self.context),
+                              instance, net['id'], port_req_body)
+            create_port_mock.assert_called_once_with(port_req_body)
+
+    @mock.patch.object(client.Client, 'create_port',
+                       side_effect=exceptions.MacAddressInUseClient())
+    def test_create_port_for_instance_mac_address_in_use(self,
+                                                         create_port_mock):
+        # Create fake data.
+        instance = fake_instance.fake_instance_obj(self.context)
+        net = {'id': 'my_netid1',
+               'name': 'my_netname1',
+               'subnets': ['mysubnid1'],
+               'tenant_id': instance['project_id']}
+        zone = 'compute:%s' % instance['availability_zone']
+        port_req_body = {'port': {'device_id': instance['uuid'],
+                                  'device_owner': zone,
+                                  'mac_address': 'XX:XX:XX:XX:XX:XX'}}
+        available_macs = set(['XX:XX:XX:XX:XX:XX'])
+        # Run the code.
+        self.assertRaises(exception.PortInUse,
+                          self.api._create_port,
+                          neutronv2.get_client(self.context),
+                          instance, net['id'], port_req_body,
+                          available_macs=available_macs)
+        # Assert the calls.
+        create_port_mock.assert_called_once_with(port_req_body)
+
+    def test_get_network_detail_not_found(self):
+        api = neutronapi.API()
+        expected_exc = exceptions.NetworkNotFoundClient()
+        network_uuid = '02cacbca-7d48-4a2c-8011-43eecf8a9786'
+        with mock.patch.object(client.Client, 'show_network',
+                               side_effect=expected_exc) as (
+            fake_show_network):
+            self.assertRaises(exception.NetworkNotFound,
+                              api.get,
+                              self.context,
+                              network_uuid)
+            fake_show_network.assert_called_once_with(network_uuid)
+
 
 class TestNeutronv2ModuleMethods(test.TestCase):
+
+    def test_gather_port_ids_and_networks_wrong_params(self):
+        api = neutronapi.API()
+
+        # Test with networks not None and port_ids is None
+        self.assertRaises(exception.NovaException,
+                          api._gather_port_ids_and_networks,
+                          'fake_context', 'fake_instance',
+                          [{'network': {'name': 'foo'}}], None)
+
+        # Test with networks is None and port_ids not None
+        self.assertRaises(exception.NovaException,
+                          api._gather_port_ids_and_networks,
+                          'fake_context', 'fake_instance',
+                          None, ['list', 'of', 'port_ids'])
+
     def test_ensure_requested_network_ordering_no_preference_ids(self):
         l = [1, 2, 3]
 
@@ -1741,7 +2589,7 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
 
     def test_populate_neutron_extension_values_binding(self):
         api = neutronapi.API()
-        neutronv2.get_client(mox.IgnoreArg(), admin=True).AndReturn(
+        neutronv2.get_client(mox.IgnoreArg()).AndReturn(
                 self.moxed_client)
         self.moxed_client.list_extensions().AndReturn(
             {'extensions': [{'name': constants.PORTBINDING_EXT}]})
@@ -1749,20 +2597,23 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
         host_id = 'my_host_id'
         instance = {'host': host_id}
         port_req_body = {'port': {}}
-        api._populate_neutron_extension_values(instance, port_req_body)
+        api._populate_neutron_extension_values(self.context, instance,
+                                               port_req_body)
         self.assertEqual(port_req_body['port']['binding:host_id'], host_id)
 
     def test_migrate_instance_finish_binding_false(self):
         api = neutronapi.API()
         self.mox.StubOutWithMock(api, '_has_port_binding_extension')
-        api._has_port_binding_extension(refresh_cache=True).AndReturn(False)
+        api._has_port_binding_extension(mox.IgnoreArg(),
+                                        refresh_cache=True).AndReturn(False)
         self.mox.ReplayAll()
         api.migrate_instance_finish(self.context, None, None)
 
     def test_migrate_instance_finish_binding_true(self):
         api = neutronapi.API()
         self.mox.StubOutWithMock(api, '_has_port_binding_extension')
-        api._has_port_binding_extension(refresh_cache=True).AndReturn(True)
+        api._has_port_binding_extension(mox.IgnoreArg(),
+                                        refresh_cache=True).AndReturn(True)
         neutronv2.get_client(mox.IgnoreArg(), admin=True).AndReturn(
             self.moxed_client)
         search_opts = {'device_id': self.instance['uuid'],
@@ -1781,7 +2632,8 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
     def test_migrate_instance_finish_binding_true_exception(self):
         api = neutronapi.API()
         self.mox.StubOutWithMock(api, '_has_port_binding_extension')
-        api._has_port_binding_extension(refresh_cache=True).AndReturn(True)
+        api._has_port_binding_extension(mox.IgnoreArg(),
+                                        refresh_cache=True).AndReturn(True)
         neutronv2.get_client(mox.IgnoreArg(), admin=True).AndReturn(
             self.moxed_client)
         search_opts = {'device_id': self.instance['uuid'],
@@ -1799,6 +2651,12 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
         self.assertRaises(NEUTRON_CLIENT_EXCEPTION,
                           api.migrate_instance_finish,
                           self.context, self.instance, migration)
+
+    def test_associate_not_implemented(self):
+        api = neutronapi.API()
+        self.assertRaises(NotImplementedError,
+                          api.associate,
+                          self.context, 'id')
 
 
 class TestNeutronv2ExtraDhcpOpts(TestNeutronv2Base):
@@ -1822,103 +2680,65 @@ class TestNeutronv2ExtraDhcpOpts(TestNeutronv2Base):
 
 
 class TestNeutronClientForAdminScenarios(test.TestCase):
-    def test_get_cached_neutron_client_for_admin(self):
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
-        my_context = context.RequestContext('userid',
-                                            'my_tenantid',
+
+    def _test_get_client_for_admin(self, use_id=False, admin_context=False):
+
+        def client_mock(*args, **kwargs):
+            client.Client.httpclient = mock.MagicMock()
+
+        self.flags(auth_strategy=None, group='neutron')
+        self.flags(url='http://anyhost/', group='neutron')
+        self.flags(url_timeout=30, group='neutron')
+        if use_id:
+            self.flags(admin_tenant_id='admin_tenant_id', group='neutron')
+            self.flags(admin_user_id='admin_user_id', group='neutron')
+
+        if admin_context:
+            my_context = context.get_admin_context()
+        else:
+            my_context = context.RequestContext('userid', 'my_tenantid',
                                             auth_token='token')
+        self.mox.StubOutWithMock(client.Client, "__init__")
+        kwargs = {
+            'auth_url': CONF.neutron.admin_auth_url,
+            'password': CONF.neutron.admin_password,
+            'endpoint_url': CONF.neutron.url,
+            'auth_strategy': None,
+            'timeout': CONF.neutron.url_timeout,
+            'insecure': False,
+            'ca_cert': None,
+            'token': None}
+        if use_id:
+            kwargs['tenant_id'] = CONF.neutron.admin_tenant_id
+            kwargs['user_id'] = CONF.neutron.admin_user_id
+        else:
+            kwargs['tenant_name'] = CONF.neutron.admin_tenant_name
+            kwargs['username'] = CONF.neutron.admin_username
+        client.Client.__init__(**kwargs).WithSideEffects(client_mock)
+        self.mox.ReplayAll()
 
-        # Make multiple calls and ensure we get the same
-        # client back again and again
-        client = neutronv2.get_client(my_context, True)
-        client2 = neutronv2.get_client(my_context, True)
-        client3 = neutronv2.get_client(my_context, True)
-        self.assertEqual(client, client2)
-        self.assertEqual(client, client3)
-
-        # clear the cache
-        local.strong_store.neutron_client = None
-
-        # A new client should be created now
-        client4 = neutronv2.get_client(my_context, True)
-        self.assertNotEqual(client, client4)
-
-    def test_get_neutron_client_for_non_admin(self):
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
-        my_context = context.RequestContext('userid',
-                                            'my_tenantid',
-                                            auth_token='token')
-
-        # Multiple calls should return different clients
-        client = neutronv2.get_client(my_context)
-        client2 = neutronv2.get_client(my_context)
-        self.assertNotEqual(client, client2)
-
-    def test_get_neutron_client_for_non_admin_and_no_token(self):
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
-        my_context = context.RequestContext('userid',
-                                            'my_tenantid')
-
-        self.assertRaises(exceptions.Unauthorized,
-                          neutronv2.get_client,
-                          my_context)
+        # clean global
+        token_store = neutronv2.AdminTokenStore.get()
+        token_store.admin_auth_token = None
+        if admin_context:
+            # Note that the context does not contain a token but is
+            # an admin context  which will force an elevation to admin
+            # credentials.
+            neutronv2.get_client(my_context)
+        else:
+            # Note that the context is not elevated, but the True is passed in
+            # which will force an elevation to admin credentials even though
+            # the context has an auth_token.
+            neutronv2.get_client(my_context, True)
 
     def test_get_client_for_admin(self):
+        self._test_get_client_for_admin()
 
-        self.flags(neutron_auth_strategy=None)
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
-        my_context = context.RequestContext('userid', 'my_tenantid',
-                                            auth_token='token')
-        self.mox.StubOutWithMock(client.Client, "__init__")
-        client.Client.__init__(
-            auth_url=CONF.neutron_admin_auth_url,
-            password=CONF.neutron_admin_password,
-            tenant_name=CONF.neutron_admin_tenant_name,
-            username=CONF.neutron_admin_username,
-            endpoint_url=CONF.neutron_url,
-            auth_strategy=None,
-            timeout=CONF.neutron_url_timeout,
-            insecure=False,
-            ca_cert=None).AndReturn(None)
-        self.mox.ReplayAll()
-
-        # clear the cache
-        if hasattr(local.strong_store, 'neutron_client'):
-            delattr(local.strong_store, 'neutron_client')
-
-        # Note that the context is not elevated, but the True is passed in
-        # which will force an elevation to admin credentials even though
-        # the context has an auth_token.
-        neutronv2.get_client(my_context, True)
+    def test_get_client_for_admin_with_id(self):
+        self._test_get_client_for_admin(use_id=True)
 
     def test_get_client_for_admin_context(self):
+        self._test_get_client_for_admin(admin_context=True)
 
-        self.flags(neutron_auth_strategy=None)
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
-        my_context = context.get_admin_context()
-        self.mox.StubOutWithMock(client.Client, "__init__")
-        client.Client.__init__(
-            auth_url=CONF.neutron_admin_auth_url,
-            password=CONF.neutron_admin_password,
-            tenant_name=CONF.neutron_admin_tenant_name,
-            username=CONF.neutron_admin_username,
-            endpoint_url=CONF.neutron_url,
-            auth_strategy=None,
-            timeout=CONF.neutron_url_timeout,
-            insecure=False,
-            ca_cert=None).AndReturn(None)
-        self.mox.ReplayAll()
-
-        # clear the cache
-        if hasattr(local.strong_store, 'neutron_client'):
-            delattr(local.strong_store, 'neutron_client')
-
-        # Note that the context does not contain a token but is
-        # an admin context  which will force an elevation to admin
-        # credentials.
-        neutronv2.get_client(my_context)
+    def test_get_client_for_admin_context_with_id(self):
+        self._test_get_client_for_admin(use_id=True, admin_context=True)

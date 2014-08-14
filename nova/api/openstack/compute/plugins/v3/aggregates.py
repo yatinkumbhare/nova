@@ -16,16 +16,16 @@
 """The Aggregate admin API extension."""
 
 import datetime
-import functools
 
-import six
 from webob import exc
 
+from nova.api.openstack.compute.schemas.v3 import aggregates
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
+from nova.api import validation
 from nova.compute import api as compute_api
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova import utils
 
@@ -38,24 +38,6 @@ def _get_context(req):
     return req.environ['nova.context']
 
 
-def get_host_from_body(fn):
-    """Makes sure that the host exists."""
-    @functools.wraps(fn)
-    def wrapped(self, req, id, body, *args, **kwargs):
-        if not self.is_valid_body(body, fn.wsgi_action):
-            raise exc.HTTPBadRequest(explanation=_("Invalid request body"))
-        host = body[fn.wsgi_action].get('host')
-        if host is None:
-            raise exc.HTTPBadRequest(
-                explanation=_("Could not find host to be set in "
-                              "request body"))
-        if not isinstance(host, six.string_types):
-            raise exc.HTTPBadRequest(
-                explanation=_("The value of host must be a string"))
-        return fn(self, req, id, host, *args, **kwargs)
-    return wrapped
-
-
 class AggregateController(wsgi.Controller):
     """The Host Aggregates API controller for the OpenStack API."""
     def __init__(self):
@@ -65,30 +47,23 @@ class AggregateController(wsgi.Controller):
     def index(self, req):
         """Returns a list a host aggregate's id, name, availability_zone."""
         context = _get_context(req)
-        authorize(context)
+        authorize(context, action='index')
         aggregates = self.api.get_aggregate_list(context)
         return {'aggregates': [self._marshall_aggregate(a)['aggregate']
                                for a in aggregates]}
 
     @extensions.expected_errors((400, 409))
     @wsgi.response(201)
+    @validation.schema(aggregates.create)
     def create(self, req, body):
-        """Creates an aggregate, given its name and availability_zone."""
+        """Creates an aggregate, given its name and
+        optional availability zone.
+        """
         context = _get_context(req)
-        authorize(context)
-        if not self.is_valid_body(body, 'aggregate'):
-            raise exc.HTTPBadRequest(explanation=_("Invalid request body"))
-        try:
-            host_aggregate = body["aggregate"]
-            name = host_aggregate["name"]
-            avail_zone = host_aggregate["availability_zone"]
-        except KeyError as e:
-            msg = _("Could not find %s parameter in the request") % e.args[0]
-            raise exc.HTTPBadRequest(explanation=msg)
-        try:
-            utils.check_string_length(name, "Aggregate name", 1, 255)
-        except exception.InvalidInput as e:
-            raise exc.HTTPBadRequest(explanation=e.format_message())
+        authorize(context, action='create')
+        host_aggregate = body["aggregate"]
+        name = host_aggregate["name"]
+        avail_zone = host_aggregate.get("availability_zone")
 
         try:
             aggregate = self.api.create_aggregate(context, name, avail_zone)
@@ -102,62 +77,55 @@ class AggregateController(wsgi.Controller):
     def show(self, req, id):
         """Shows the details of an aggregate, hosts and metadata included."""
         context = _get_context(req)
-        authorize(context)
+        authorize(context, action='show')
         try:
             aggregate = self.api.get_aggregate(context, id)
         except exception.AggregateNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         return self._marshall_aggregate(aggregate)
 
-    @extensions.expected_errors((400, 404))
+    @extensions.expected_errors((400, 404, 409))
+    @validation.schema(aggregates.update)
     def update(self, req, id, body):
         """Updates the name and/or availability_zone of given aggregate."""
         context = _get_context(req)
-        authorize(context)
-        if not self.is_valid_body(body, 'aggregate'):
-            raise exc.HTTPBadRequest(explanation=_("Invalid request body"))
+        authorize(context, action='update')
         updates = body["aggregate"]
-        if len(updates) < 1:
-            raise exc.HTTPBadRequest(
-                explanation=_("Request body is empty"))
-        for key in updates.keys():
-            if key not in ["name", "availability_zone"]:
-                msg = _("Invalid key %s in request body.") % key
-                raise exc.HTTPBadRequest(explanation=msg)
-
-        if 'name' in updates:
-            try:
-                utils.check_string_length(updates['name'], "Aggregate name", 1,
-                                          255)
-            except exception.InvalidInput as e:
-                raise exc.HTTPBadRequest(explanation=e.format_message())
 
         try:
             aggregate = self.api.update_aggregate(context, id, updates)
+        except exception.AggregateNameExists as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.AggregateNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
+        except exception.InvalidAggregateAction as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
         return self._marshall_aggregate(aggregate)
 
-    @extensions.expected_errors(404)
+    @extensions.expected_errors((400, 404))
     @wsgi.response(204)
     def delete(self, req, id):
         """Removes an aggregate by id."""
         context = _get_context(req)
-        authorize(context)
+        authorize(context, action='delete')
         try:
             self.api.delete_aggregate(context, id)
         except exception.AggregateNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
+        except exception.InvalidAggregateAction as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
     @extensions.expected_errors((400, 404, 409))
-    @get_host_from_body
     @wsgi.action('add_host')
     @wsgi.response(202)
-    def _add_host(self, req, id, host):
+    @validation.schema(aggregates.add_host)
+    def _add_host(self, req, id, body):
         """Adds a host to the specified aggregate."""
+        host = body['add_host']['host']
+
         context = _get_context(req)
-        authorize(context)
+        authorize(context, action='add_host')
         try:
             aggregate = self.api.add_host_to_aggregate(context, id, host)
         except (exception.AggregateNotFound,
@@ -169,13 +137,15 @@ class AggregateController(wsgi.Controller):
         return self._marshall_aggregate(aggregate)
 
     @extensions.expected_errors((400, 404, 409))
-    @get_host_from_body
     @wsgi.action('remove_host')
     @wsgi.response(202)
-    def _remove_host(self, req, id, host):
+    @validation.schema(aggregates.remove_host)
+    def _remove_host(self, req, id, body):
         """Removes a host from the specified aggregate."""
+        host = body['remove_host']['host']
+
         context = _get_context(req)
-        authorize(context)
+        authorize(context, action='remove_host')
         try:
             aggregate = self.api.remove_host_from_aggregate(context, id, host)
         except (exception.AggregateNotFound, exception.AggregateHostNotFound,
@@ -194,18 +164,32 @@ class AggregateController(wsgi.Controller):
     def _set_metadata(self, req, id, body):
         """Replaces the aggregate's existing metadata with new metadata."""
         context = _get_context(req)
-        authorize(context)
+        authorize(context, action='set_metadata')
         if not self.is_valid_body(body, 'set_metadata'):
             raise exc.HTTPBadRequest(explanation=_("Invalid request body"))
         if not self.is_valid_body(body["set_metadata"], "metadata"):
             raise exc.HTTPBadRequest(
                 explanation=_("Invalid request format for metadata"))
         metadata = body["set_metadata"]["metadata"]
+
+        # The metadata should be a dict
+        if not isinstance(metadata, dict):
+            msg = _('The value of metadata must be a dict')
+            raise exc.HTTPBadRequest(explanation=msg)
+        try:
+            for key, value in metadata.items():
+                utils.check_string_length(key, "metadata.key", 1, 255)
+                if value is not None:
+                    utils.check_string_length(value, "metadata.value", 0, 255)
+        except exception.InvalidInput as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
         try:
             aggregate = self.api.update_aggregate_metadata(context,
                                                            id, metadata)
         except exception.AggregateNotFound as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
+        except exception.InvalidAggregateAction as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
         return self._marshall_aggregate(aggregate)
 
@@ -224,7 +208,6 @@ class Aggregates(extensions.V3APIExtensionBase):
 
     name = "Aggregates"
     alias = ALIAS
-    namespace = "http://docs.openstack.org/compute/ext/aggregates/api/v3"
     version = 1
 
     def get_resources(self):

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Red Hat, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,7 +13,7 @@
 # under the License.
 """Support for mounting images with the loop device."""
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.disk.mount import api
@@ -38,7 +36,7 @@ class LoopMount(api.Mount):
             return False
 
         self.device = out.strip()
-        LOG.debug(_("Got loop device %s"), self.device)
+        LOG.debug("Got loop device %s", self.device)
         self.linked = True
         return True
 
@@ -56,7 +54,7 @@ class LoopMount(api.Mount):
         # NOTE(mikal): On some kernels, losetup -d will intermittently fail,
         # thus leaking a loop device unless the losetup --detach is retried:
         # https://lkml.org/lkml/2012/9/28/62
-        LOG.debug(_("Release loop device %s"), self.device)
+        LOG.debug("Release loop device %s", self.device)
         utils.execute('losetup', '--detach', self.device, run_as_root=True,
                       attempts=3)
         self.linked = False

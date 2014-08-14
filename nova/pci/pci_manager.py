@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 Intel, Inc.
 # Copyright (c) 2013 OpenStack Foundation
 # All Rights Reserved.
@@ -22,13 +20,12 @@ from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
 from nova import exception
-from nova.objects import instance
-from nova.objects import pci_device
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova import objects
 from nova.openstack.common import log as logging
+from nova.pci import pci_device
 from nova.pci import pci_request
 from nova.pci import pci_stats
-from nova.pci import pci_utils
 
 LOG = logging.getLogger(__name__)
 
@@ -58,10 +55,10 @@ class PciDevTracker(object):
         self.node_id = node_id
         self.stats = pci_stats.PciDeviceStats()
         if node_id:
-            self.pci_devs = pci_device.PciDeviceList.get_by_compute_node(
-                context, node_id)
+            self.pci_devs = list(
+                objects.PciDeviceList.get_by_compute_node(context, node_id))
         else:
-            self.pci_devs = pci_device.PciDeviceList()
+            self.pci_devs = []
         self._initial_instance_usage()
 
     def _initial_instance_usage(self):
@@ -76,46 +73,6 @@ class PciDevTracker(object):
             elif dev['status'] == 'available':
                 self.stats.add_device(dev)
 
-    def _filter_devices_for_spec(self, request_spec, pci_devs):
-        return [p for p in pci_devs
-                if pci_utils.pci_device_prop_match(p, request_spec)]
-
-    def _get_free_devices_for_request(self, pci_request, pci_devs):
-        count = pci_request.get('count', 1)
-        spec = pci_request.get('spec', [])
-        devs = self._filter_devices_for_spec(spec, pci_devs)
-        if len(devs) < count:
-            return None
-        else:
-            return devs[:count]
-
-    @property
-    def free_devs(self):
-        return [dev for dev in self.pci_devs if dev.status == 'available']
-
-    def get_free_devices_for_requests(self, pci_requests):
-        """Select free pci devices for requests
-
-        Pci_requests is a list of pci_request dictionaries. Each dictionary
-        has three keys:
-            count: number of pci devices required, default 1
-            spec: the pci properties that the devices should meet
-            alias_name: alias the pci_request is translated from, optional
-
-        If any single pci_request cannot find any free devices, then the
-        entire request list will fail.
-        """
-        alloc = []
-
-        for request in pci_requests:
-            available = self._get_free_devices_for_request(
-                request,
-                [p for p in self.free_devs if p not in alloc])
-            if not available:
-                return []
-            alloc.extend(available)
-        return alloc
-
     @property
     def all_devs(self):
         return self.pci_devs
@@ -125,8 +82,8 @@ class PciDevTracker(object):
             if dev.obj_what_changed():
                 dev.save(context)
 
-        self.pci_devs.objects = [dev for dev in self.pci_devs
-                                 if dev['status'] != 'deleted']
+        self.pci_devs = [dev for dev in self.pci_devs
+                         if dev['status'] != 'deleted']
 
     @property
     def pci_stats(self):
@@ -151,17 +108,20 @@ class PciDevTracker(object):
         for existed in self.pci_devs:
             if existed['address'] in exist_addrs - new_addrs:
                 try:
-                    existed.remove()
+                    pci_device.remove(existed)
                 except exception.PciDeviceInvalidStatus as e:
-                    LOG.warn(_("Trying to remove device with %(status)s"
-                        "ownership %(instance_uuid)s"), existed)
+                    LOG.warn(_("Trying to remove device with %(status)s "
+                               "ownership %(instance_uuid)s because of "
+                               "%(pci_exception)s"), {'status': existed.status,
+                                  'instance_uuid': existed.instance_uuid,
+                                  'pci_exception': e.format_message()})
                     # Note(yjiang5): remove the device by force so that
                     # db entry is cleaned in next sync.
                     existed.status = 'removed'
                 else:
                     # Note(yjiang5): no need to update stats if an assigned
                     # device is hot removed.
-                    self.stats.consume_device(existed)
+                    self.stats.remove_device(existed)
             else:
                 new_value = next((dev for dev in devices if
                     dev['address'] == existed['address']))
@@ -181,13 +141,13 @@ class PciDevTracker(object):
                     # by force in future.
                     self.stale[dev['address']] = dev
                 else:
-                    existed.update_device(new_value)
+                    pci_device.update_device(existed, new_value)
 
         for dev in [dev for dev in devices if
                     dev['address'] in new_addrs - exist_addrs]:
             dev['compute_node_id'] = self.node_id
-            dev_obj = pci_device.PciDevice.create(dev)
-            self.pci_devs.objects.append(dev_obj)
+            dev_obj = objects.PciDevice.create(dev)
+            self.pci_devs.append(dev_obj)
             self.stats.add_device(dev_obj)
 
     def _claim_instance(self, instance, prefix=''):
@@ -195,23 +155,22 @@ class PciDevTracker(object):
             instance, prefix)
         if not pci_requests:
             return None
-        devs = self.get_free_devices_for_requests(pci_requests)
+        devs = self.stats.consume_requests(pci_requests)
         if not devs:
             raise exception.PciDeviceRequestFailed(pci_requests)
         for dev in devs:
-            dev.claim(instance)
-            self.stats.consume_device(dev)
+            pci_device.claim(dev, instance)
         return devs
 
     def _allocate_instance(self, instance, devs):
         for dev in devs:
-            dev.allocate(instance)
+            pci_device.allocate(dev, instance)
 
     def _free_device(self, dev, instance=None):
-        dev.free(instance)
+        pci_device.free(dev, instance)
         stale = self.stale.pop(dev['address'], None)
         if stale:
-            dev.update_device(stale)
+            pci_device.update_device(dev, stale)
         self.stats.add_device(dev)
 
     def _free_instance(self, instance):
@@ -311,9 +270,9 @@ class PciDevTracker(object):
 
 def get_instance_pci_devs(inst):
     """Get the devices assigned to the instances."""
-    if isinstance(inst, instance.Instance):
+    if isinstance(inst, objects.Instance):
         return inst.pci_devices
     else:
         ctxt = context.get_admin_context()
-        return pci_device.PciDeviceList.get_by_instance_uuid(
+        return objects.PciDeviceList.get_by_instance_uuid(
             ctxt, inst['uuid'])

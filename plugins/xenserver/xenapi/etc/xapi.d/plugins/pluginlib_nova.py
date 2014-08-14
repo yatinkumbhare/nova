@@ -23,6 +23,7 @@ import gettext
 import logging
 import logging.handlers
 import time
+
 import XenAPI
 
 
@@ -30,7 +31,7 @@ translations = gettext.translation('nova', fallback=True)
 _ = translations.ugettext
 
 
-##### Logging setup
+# Logging setup
 
 def configure_logging(name):
     log = logging.getLogger()
@@ -42,7 +43,7 @@ def configure_logging(name):
     log.addHandler(sysh)
 
 
-##### Exceptions
+# Exceptions
 
 class PluginError(Exception):
     """Base Exception class for all plugin errors."""
@@ -58,7 +59,7 @@ class ArgumentError(PluginError):
         PluginError.__init__(self, *args)
 
 
-##### Argument validation
+# Argument validation
 
 def exists(args, key):
     """Validates that a freeform string argument to a RPC method call is given.

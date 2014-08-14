@@ -13,6 +13,7 @@
 #    under the License.
 
 
+from nova import db
 from nova.objects import base
 from nova.objects import fields
 from nova import quota
@@ -31,15 +32,26 @@ def ids_from_instance(context, instance):
     return project_id, user_id
 
 
+# TODO(lyj): This method needs to be cleaned up once the
+# ids_from_instance helper method is renamed or some common
+# method is added for objects.quotas.
+def ids_from_security_group(context, security_group):
+    return ids_from_instance(context, security_group)
+
+
 class Quotas(base.NovaObject):
+    # Version 1.0: initial version
+    # Version 1.1: Added create_limit() and update_limit()
+    VERSION = '1.1'
+
     fields = {
         'reservations': fields.ListOfStringsField(nullable=True),
         'project_id': fields.StringField(nullable=True),
         'user_id': fields.StringField(nullable=True),
     }
 
-    def __init__(self):
-        super(Quotas, self).__init__()
+    def __init__(self, *args, **kwargs):
+        super(Quotas, self).__init__(*args, **kwargs)
         # Set up defaults.
         self.reservations = []
         self.project_id = None
@@ -98,3 +110,29 @@ class Quotas(base.NovaObject):
                               user_id=self.user_id)
         self.reservations = None
         self.obj_reset_changes()
+
+    @base.remotable_classmethod
+    def create_limit(cls, context, project_id, resource, limit, user_id=None):
+        # NOTE(danms,comstud): Quotas likely needs an overhaul and currently
+        # doesn't map very well to objects. Since there is quite a bit of
+        # logic in the db api layer for this, just pass this through for now.
+        db.quota_create(context, project_id, resource, limit, user_id=user_id)
+
+    @base.remotable_classmethod
+    def update_limit(cls, context, project_id, resource, limit, user_id=None):
+        # NOTE(danms,comstud): Quotas likely needs an overhaul and currently
+        # doesn't map very well to objects. Since there is quite a bit of
+        # logic in the db api layer for this, just pass this through for now.
+        db.quota_update(context, project_id, resource, limit, user_id=user_id)
+
+
+class QuotasNoOp(Quotas):
+    def reserve(context, expire=None, project_id=None, user_id=None,
+                **deltas):
+        pass
+
+    def commit(self, context=None):
+        pass
+
+    def rollback(self, context=None):
+        pass

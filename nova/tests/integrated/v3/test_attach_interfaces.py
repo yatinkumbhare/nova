@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright 2012 Nebula, Inc.
 # Copyright 2013 IBM Corp.
 #
@@ -90,9 +89,9 @@ class AttachInterfacesSampleJsonTest(test_servers.ServersSampleBase):
                        fake_attach_interface)
         self.stubs.Set(compute_api.API, 'detach_interface',
                        fake_detach_interface)
-        self.flags(neutron_auth_strategy=None)
-        self.flags(neutron_url='http://anyhost/')
-        self.flags(neutron_url_timeout=30)
+        self.flags(auth_strategy=None, group='neutron')
+        self.flags(url='http://anyhost/', group='neutron')
+        self.flags(url_timeout=30, group='neutron')
 
     def generalize_subs(self, subs, vanilla_regexes):
         subs['subnet_id'] = vanilla_regexes['uuid']
@@ -165,7 +164,3 @@ class AttachInterfacesSampleJsonTest(test_servers.ServersSampleBase):
                                 (instance_uuid, port_id))
         self.assertEqual(response.status, 202)
         self.assertEqual(response.read(), '')
-
-
-class AttachInterfacesSampleXmlTest(AttachInterfacesSampleJsonTest):
-    ctype = 'xml'

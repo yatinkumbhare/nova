@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Rackspace
 # All Rights Reserved.
 #
@@ -27,13 +25,14 @@ from nova.network import manager as network_manager
 from nova.network import model as network_model
 from nova.network import nova_ipam_lib
 from nova.network import rpcapi as network_rpcapi
+from nova import objects
 from nova.objects import base as obj_base
-from nova.objects import instance_info_cache
-from nova.objects import pci_device
+from nova.objects import virtual_interface as vif_obj
 from nova.openstack.common import jsonutils
+from nova.pci import pci_device
+from nova.tests.objects import test_fixed_ip
 from nova.tests.objects import test_instance_info_cache
 from nova.tests.objects import test_pci_device
-from nova.virt.libvirt import config as libvirt_config
 
 
 HOST = "testhost"
@@ -41,48 +40,10 @@ CONF = cfg.CONF
 CONF.import_opt('use_ipv6', 'nova.netconf')
 
 
-class FakeIptablesFirewallDriver(object):
-    def __init__(self, **kwargs):
-        pass
-
-    def setattr(self, key, val):
-        self.__setattr__(key, val)
-
-    def apply_instance_filter(self, instance, network_info):
-        pass
-
-
-class FakeVIFDriver(object):
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def setattr(self, key, val):
-        self.__setattr__(key, val)
-
-    def get_config(self, instance, vif, image_meta, inst_type):
-        conf = libvirt_config.LibvirtConfigGuestInterface()
-
-        for attr, val in conf.__dict__.iteritems():
-            if val is None:
-                setattr(conf, attr, 'fake')
-
-        return conf
-
-    def plug(self, instance, vif):
-        pass
-
-    def unplug(self, instance, vif):
-        pass
-
-
 class FakeModel(dict):
     """Represent a model from the db."""
     def __init__(self, *args, **kwargs):
         self.update(kwargs)
-
-        def __getattr__(self, name):
-            return self[name]
 
 
 class FakeNetworkManager(network_manager.NetworkManager):
@@ -92,16 +53,31 @@ class FakeNetworkManager(network_manager.NetworkManager):
 
     class FakeDB:
         vifs = [{'id': 0,
+                 'created_at': None,
+                 'updated_at': None,
+                 'deleted_at': None,
+                 'deleted': 0,
                  'instance_uuid': '00000000-0000-0000-0000-000000000010',
                  'network_id': 1,
+                 'uuid': 'fake-uuid',
                  'address': 'DC:AD:BE:FF:EF:01'},
                 {'id': 1,
+                 'created_at': None,
+                 'updated_at': None,
+                 'deleted_at': None,
+                 'deleted': 0,
                  'instance_uuid': '00000000-0000-0000-0000-000000000020',
                  'network_id': 21,
+                 'uuid': 'fake-uuid2',
                  'address': 'DC:AD:BE:FF:EF:02'},
                 {'id': 2,
+                 'created_at': None,
+                 'updated_at': None,
+                 'deleted_at': None,
+                 'deleted': 0,
                  'instance_uuid': '00000000-0000-0000-0000-000000000030',
                  'network_id': 31,
+                 'uuid': 'fake-uuid3',
                  'address': 'DC:AD:BE:FF:EF:03'}]
 
         floating_ips = [dict(address='172.16.1.1',
@@ -111,13 +87,16 @@ class FakeNetworkManager(network_manager.NetworkManager):
                         dict(address='173.16.1.2',
                              fixed_ip_id=210)]
 
-        fixed_ips = [dict(id=100,
+        fixed_ips = [dict(test_fixed_ip.fake_fixed_ip,
+                          id=100,
                           address='172.16.0.1',
                           virtual_interface_id=0),
-                     dict(id=200,
+                     dict(test_fixed_ip.fake_fixed_ip,
+                          id=200,
                           address='172.16.0.2',
                           virtual_interface_id=1),
-                     dict(id=210,
+                     dict(test_fixed_ip.fake_fixed_ip,
+                          id=210,
                           address='173.16.0.2',
                           virtual_interface_id=2)]
 
@@ -158,19 +137,23 @@ class FakeNetworkManager(network_manager.NetworkManager):
         def fixed_ip_disassociate(self, context, address):
             return True
 
-    def __init__(self):
+    def __init__(self, stubs=None):
         self.db = self.FakeDB()
+        if stubs:
+            stubs.Set(vif_obj, 'db', self.db)
         self.deallocate_called = None
         self.deallocate_fixed_ip_calls = []
         self.network_rpcapi = network_rpcapi.NetworkAPI()
 
     # TODO(matelakat) method signature should align with the faked one's
-    def deallocate_fixed_ip(self, context, address=None, host=None):
+    def deallocate_fixed_ip(self, context, address=None, host=None,
+            instance=None):
         self.deallocate_fixed_ip_calls.append((context, address, host))
         # TODO(matelakat) use the deallocate_fixed_ip_calls instead
         self.deallocate_called = address
 
-    def _create_fixed_ips(self, context, network_id, fixed_cidr=None):
+    def _create_fixed_ips(self, context, network_id, fixed_cidr=None,
+                          extra_reserved=None):
         pass
 
     def get_instance_nw_info(context, instance_id, rxtx_factor,
@@ -202,7 +185,19 @@ def fake_network(network_id, ipv6=None):
              'host': None,
              'project_id': 'fake_project',
              'vpn_public_address': '192.168.%d.2' % network_id,
-             'rxtx_base': network_id * 10}
+             'vpn_public_port': None,
+             'vpn_private_address': None,
+             'dhcp_start': None,
+             'rxtx_base': network_id * 10,
+             'priority': None,
+             'deleted': False,
+             'created_at': None,
+             'updated_at': None,
+             'deleted_at': None,
+             'mtu': None,
+             'dhcp_server': '192.168.%d.1' % network_id,
+             'enable_dhcp': True,
+             'share_address': False}
     if ipv6:
         fake_network['cidr_v6'] = '2001:db8:0:%x::/64' % network_id
         fake_network['gateway_v6'] = '2001:db8:0:%x::1' % network_id
@@ -216,10 +211,14 @@ def fake_network(network_id, ipv6=None):
 def vifs(n):
     for x in xrange(1, n + 1):
         yield {'id': x,
+               'created_at': None,
+               'updated_at': None,
+               'deleted_at': None,
+               'deleted': 0,
                'address': 'DE:AD:BE:EF:00:%02x' % x,
                'uuid': '00000000-0000-0000-0000-00000000000000%02d' % x,
                'network_id': x,
-               'instance_id': 0}
+               'instance_uuid': 'fake-uuid'}
 
 
 def floating_ip_ids():
@@ -314,7 +313,7 @@ def fake_get_instance_nw_info(stubs, num_networks=1, ips_per_vif=2,
                'uuid': uuid,
                'network_id': 1,
                'network': None,
-               'instance_uuid': 0}
+               'instance_uuid': 'fake-uuid'}
 
     def network_get_fake(context, network_id, project_only='allow_none'):
         nets = [n for n in networks if n['id'] == network_id]
@@ -390,6 +389,11 @@ def stub_out_nw_api_get_instance_nw_info(stubs, func=None,
     if func is None:
         func = get_instance_nw_info
     stubs.Set(network_api.API, 'get_instance_nw_info', func)
+
+
+def stub_out_network_cleanup(stubs):
+    stubs.Set(network_api.API, 'deallocate_for_instance',
+              lambda *args, **kwargs: None)
 
 
 _real_functions = {}
@@ -475,29 +479,28 @@ def _get_instances_with_cached_ips(orig_func, *args, **kwargs):
     """
     instances = orig_func(*args, **kwargs)
     context = args[0]
-    fake_device = pci_device.PciDevice.get_by_dev_addr(context, 1, 'a')
+    fake_device = objects.PciDevice.get_by_dev_addr(context, 1, 'a')
 
     def _info_cache_for(instance):
         info_cache = dict(test_instance_info_cache.fake_info_cache,
                           network_info=_get_fake_cache(),
                           instance_uuid=instance['uuid'])
         if isinstance(instance, obj_base.NovaObject):
-            _info_cache = instance_info_cache.InstanceInfoCache()
-            instance_info_cache.InstanceInfoCache._from_db_object(context,
-                                                                  _info_cache,
-                                                                  info_cache)
+            _info_cache = objects.InstanceInfoCache(context)
+            objects.InstanceInfoCache._from_db_object(context, _info_cache,
+                                                      info_cache)
             info_cache = _info_cache
         instance['info_cache'] = info_cache
 
     if isinstance(instances, (list, obj_base.ObjectListBase)):
         for instance in instances:
             _info_cache_for(instance)
-            fake_device.claim(instance)
-            fake_device.allocate(instance)
+            pci_device.claim(fake_device, instance)
+            pci_device.allocate(fake_device, instance)
     else:
         _info_cache_for(instances)
-        fake_device.claim(instances)
-        fake_device.allocate(instances)
+        pci_device.claim(fake_device, instances)
+        pci_device.allocate(fake_device, instances)
     return instances
 
 

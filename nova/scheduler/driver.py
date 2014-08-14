@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -27,15 +25,14 @@ from oslo.config import cfg
 
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
-from nova.conductor import api as conductor_api
 from nova import db
 from nova import exception
+from nova.i18n import _
 from nova import notifications
-from nova import notifier
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
+from nova import rpc
 from nova import servicegroup
 
 LOG = logging.getLogger(__name__)
@@ -44,9 +41,6 @@ scheduler_driver_opts = [
     cfg.StrOpt('scheduler_host_manager',
                default='nova.scheduler.host_manager.HostManager',
                help='The scheduler host manager class to use'),
-    cfg.IntOpt('scheduler_max_attempts',
-               default=3,
-               help='Maximum number of attempts to schedule an instance'),
     ]
 
 CONF = cfg.CONF
@@ -70,7 +64,6 @@ def handle_schedule_error(context, ex, instance_uuid, request_spec):
     notifications.send_update(context, old_ref, new_ref,
             service="scheduler")
     compute_utils.add_instance_fault_from_exc(context,
-            conductor_api.LocalAPI(),
             new_ref, ex, sys.exc_info())
 
     properties = request_spec.get('instance_properties', {})
@@ -81,8 +74,8 @@ def handle_schedule_error(context, ex, instance_uuid, request_spec):
                    method='run_instance',
                    reason=ex)
 
-    notifier.get_notifier('scheduler').error(context,
-                                             'scheduler.run_instance', payload)
+    rpc.get_notifier('scheduler').error(context,
+                                        'scheduler.run_instance', payload)
 
 
 def instance_update_db(context, instance_uuid, extra_values=None):
@@ -106,10 +99,9 @@ class Scheduler(object):
                 CONF.scheduler_host_manager)
         self.servicegroup_api = servicegroup.API()
 
-    def update_service_capabilities(self, service_name, host, capabilities):
-        """Process a capability update from a service node."""
-        self.host_manager.update_service_capabilities(service_name,
-                host, capabilities)
+    def run_periodic_tasks(self, context):
+        """Manager calls this so drivers can perform periodic tasks."""
+        pass
 
     def hosts_up(self, context, topic):
         """Return the list of hosts that have a running service for topic."""
@@ -119,16 +111,8 @@ class Scheduler(object):
                 for service in services
                 if self.servicegroup_api.service_is_up(service)]
 
-    def group_hosts(self, context, group):
-        """Return the list of hosts that have VM's from the group."""
-
-        # The system_metadata 'group' will be filtered
-        members = db.instance_get_all_by_filters(context,
-                {'deleted': False, 'system_metadata': {'group': group}})
-        return [member['host']
-                for member in members
-                if member.get('host') is not None]
-
+    # NOTE(alaski): Remove this method when the scheduler rpc interface is
+    # bumped to 4.x as it is no longer used.
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,
                               requested_networks, is_first_time,
@@ -144,9 +128,4 @@ class Scheduler(object):
             that satisfies the request_spec and filter_properties.
         """
         msg = _("Driver must implement select_destinations")
-        raise NotImplementedError(msg)
-
-    def select_hosts(self, context, request_spec, filter_properties):
-        """Must override select_hosts method for scheduler to work."""
-        msg = _("Driver must implement select_hosts")
         raise NotImplementedError(msg)

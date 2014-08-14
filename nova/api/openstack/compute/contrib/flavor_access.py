@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -23,8 +21,8 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import exception
-from nova.objects import flavor as flavor_obj
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova import objects
 
 
 soft_authorize = extensions.soft_extension_authorizer('compute',
@@ -91,7 +89,7 @@ class FlavorAccessController(object):
         authorize(context)
 
         try:
-            flavor = flavor_obj.Flavor.get_by_flavor_id(context, flavor_id)
+            flavor = objects.Flavor.get_by_flavor_id(context, flavor_id)
         except exception.FlavorNotFound:
             explanation = _("Flavor not found.")
             raise webob.exc.HTTPNotFound(explanation=explanation)
@@ -115,7 +113,7 @@ class FlavorActionController(wsgi.Controller):
     def _get_flavor_refs(self, context):
         """Return a dictionary mapping flavorid to flavor_ref."""
 
-        flavors = flavor_obj.FlavorList.get_all(context)
+        flavors = objects.FlavorList.get_all(context)
         rval = {}
         for flavor in flavors:
             rval[flavor.flavorid] = flavor
@@ -167,9 +165,12 @@ class FlavorActionController(wsgi.Controller):
         self._check_body(body)
 
         vals = body['addTenantAccess']
-        tenant = vals['tenant']
+        tenant = vals.get('tenant')
+        if not tenant:
+            msg = _("Missing tenant parameter")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
 
-        flavor = flavor_obj.Flavor(context=context, flavorid=id)
+        flavor = objects.Flavor(context=context, flavorid=id)
         try:
             flavor.add_access(tenant)
         except exception.FlavorAccessExists as err:
@@ -188,9 +189,12 @@ class FlavorActionController(wsgi.Controller):
         self._check_body(body)
 
         vals = body['removeTenantAccess']
-        tenant = vals['tenant']
+        tenant = vals.get('tenant')
+        if not tenant:
+            msg = _("Missing tenant parameter")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
 
-        flavor = flavor_obj.Flavor(context=context, flavorid=id)
+        flavor = objects.Flavor(context=context, flavorid=id)
         try:
             flavor.remove_access(tenant)
         except (exception.FlavorNotFound,
@@ -207,7 +211,7 @@ class Flavor_access(extensions.ExtensionDescriptor):
     alias = "os-flavor-access"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "flavor_access/api/v2")
-    updated = "2012-08-01T00:00:00+00:00"
+    updated = "2012-08-01T00:00:00Z"
 
     def get_resources(self):
         resources = []

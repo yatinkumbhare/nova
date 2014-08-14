@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
 #
@@ -29,7 +27,6 @@ from nova.compute import flavors
 from nova import db
 from nova.network import manager
 from nova.openstack.common import jsonutils
-from nova.openstack.common import rpc
 from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests import fake_instance
@@ -135,10 +132,8 @@ class ServersControllerCreateTest(test.TestCase):
                        fake_method)
         self.stubs.Set(db, 'instance_get', instance_get)
         self.stubs.Set(db, 'instance_update', instance_update)
-        self.stubs.Set(rpc, 'cast', fake_method)
         self.stubs.Set(db, 'instance_update_and_get_original',
                        server_update)
-        self.stubs.Set(rpc, 'queue_get_for', queue_get_for)
         self.stubs.Set(manager.VlanManager, 'allocate_fixed_ip',
                        fake_method)
 
@@ -155,12 +150,11 @@ class ServersControllerCreateTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
         if override_controller:
-            server = override_controller.create(req, body).obj['server']
+            server = override_controller.create(req, body=body).obj['server']
         else:
-            server = self.controller.create(req, body).obj['server']
+            server = self.controller.create(req, body=body).obj['server']
 
     def test_create_instance_with_multiple_create_disabled(self):
-        ret_res_id = True
         min_count = 2
         max_count = 3
         params = {
@@ -178,6 +172,25 @@ class ServersControllerCreateTest(test.TestCase):
         self._test_create_extra(
             params,
             override_controller=self.no_mult_create_controller)
+
+    def test_multiple_create_with_string_type_min_and_max(self):
+        min_count = '2'
+        max_count = '3'
+        params = {
+            multiple_create.MIN_ATTRIBUTE_NAME: min_count,
+            multiple_create.MAX_ATTRIBUTE_NAME: max_count,
+        }
+        old_create = compute_api.API.create
+
+        def create(*args, **kwargs):
+            self.assertIsInstance(kwargs['min_count'], int)
+            self.assertIsInstance(kwargs['max_count'], int)
+            self.assertEqual(kwargs['min_count'], 2)
+            self.assertEqual(kwargs['max_count'], 3)
+            return old_create(*args, **kwargs)
+
+        self.stubs.Set(compute_api.API, 'create', create)
+        self._test_create_extra(params)
 
     def test_create_instance_with_multiple_create_enabled(self):
         min_count = 2
@@ -215,7 +228,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.create,
                           req,
-                          body)
+                          body=body)
 
     def test_create_instance_invalid_negative_max(self):
         image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
@@ -236,7 +249,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.create,
                           req,
-                          body)
+                          body=body)
 
     def test_create_instance_invalid_min_greater_than_max(self):
         image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
@@ -258,7 +271,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.create,
                           req,
-                          body)
+                          body=body)
 
     def test_create_instance_invalid_alpha_min(self):
         image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
@@ -279,7 +292,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.create,
                           req,
-                          body)
+                          body=body)
 
     def test_create_instance_invalid_alpha_max(self):
         image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
@@ -300,7 +313,7 @@ class ServersControllerCreateTest(test.TestCase):
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.create,
                           req,
-                          body)
+                          body=body)
 
     def test_create_multiple_instances(self):
         """Test creating multiple instances but not asking for
@@ -323,7 +336,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body).obj
+        res = self.controller.create(req, body=body).obj
 
         self.assertEqual(FAKE_UUID, res["server"]["id"])
         self._check_admin_password_len(res["server"])
@@ -350,7 +363,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body).obj
+        res = self.controller.create(req, body=body).obj
 
         self.assertEqual(FAKE_UUID, res["server"]["id"])
         self._check_admin_password_missing(res["server"])
@@ -364,7 +377,7 @@ class ServersControllerCreateTest(test.TestCase):
         """utility function - check server_dict for admin_password absence."""
         self.assertNotIn("admin_password", server_dict)
 
-    def test_create_multiple_instances_resv_id_return(self):
+    def _create_multiple_instances_resv_id_return(self, resv_id_return):
         """Test creating multiple instances with asking for
         reservation_id
         """
@@ -378,7 +391,7 @@ class ServersControllerCreateTest(test.TestCase):
                 'flavor_ref': flavor_ref,
                 'metadata': {'hello': 'world',
                              'open': 'stack'},
-                multiple_create.RRID_ATTRIBUTE_NAME: True
+                multiple_create.RRID_ATTRIBUTE_NAME: resv_id_return
             }
         }
 
@@ -386,15 +399,20 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body)
+        res = self.controller.create(req, body=body)
         reservation_id = res.obj['servers_reservation']['reservation_id']
         self.assertNotEqual(reservation_id, "")
         self.assertIsNotNone(reservation_id)
         self.assertTrue(len(reservation_id) > 1)
 
+    def test_create_multiple_instances_with_resv_id_return(self):
+        self._create_multiple_instances_resv_id_return(True)
+
+    def test_create_multiple_instances_with_string_resv_id_return(self):
+        self._create_multiple_instances_resv_id_return("True")
+
     def test_create_multiple_instances_with_multiple_volume_bdm(self):
-        """
-        Test that a BadRequest is raised if multiple instances
+        """Test that a BadRequest is raised if multiple instances
         are requested with a list of block device mappings for volumes.
         """
         min_count = 2
@@ -417,8 +435,7 @@ class ServersControllerCreateTest(test.TestCase):
                           self._test_create_extra, params, no_image=True)
 
     def test_create_multiple_instances_with_single_volume_bdm(self):
-        """
-        Test that a BadRequest is raised if multiple instances
+        """Test that a BadRequest is raised if multiple instances
         are requested to boot from a single volume.
         """
         min_count = 2
@@ -458,7 +475,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, req, body)
+                          self.controller.create, req, body=body)
 
     def test_create_multiple_instance_with_non_integer_min_count(self):
         image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
@@ -479,34 +496,4 @@ class ServersControllerCreateTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, req, body)
-
-
-class TestServerCreateRequestXMLDeserializer(test.TestCase):
-
-    def setUp(self):
-        super(TestServerCreateRequestXMLDeserializer, self).setUp()
-        ext_info = plugins.LoadedExtensionInfo()
-        controller = servers.ServersController(extension_info=ext_info)
-        self.deserializer = servers.CreateDeserializer(controller)
-
-    def test_request_with_multiple_create_args(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-    xmlns:%(alias)s="%(namespace)s"
-     name="new-server-test" image_ref="1" flavor_ref="1"
-     %(alias)s:min_count="1" %(alias)s:max_count="3"
-     %(alias)s:return_reservation_id="True">
-    </server>""" % {
-        'alias': multiple_create.ALIAS,
-        'namespace': multiple_create.MultipleCreate.namespace}
-        request = self.deserializer.deserialize(serial_request)
-        expected = {"server": {
-                "name": "new-server-test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                multiple_create.MIN_ATTRIBUTE_NAME: "1",
-                multiple_create.MAX_ATTRIBUTE_NAME: "3",
-                multiple_create.RRID_ATTRIBUTE_NAME: True,
-                }}
-        self.assertEqual(request['body'], expected)
+                          self.controller.create, req, body=body)

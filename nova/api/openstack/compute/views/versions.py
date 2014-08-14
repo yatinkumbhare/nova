@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -29,14 +27,12 @@ def get_view_builder(req):
 class ViewBuilder(common.ViewBuilder):
 
     def __init__(self, base_url):
-        """
-        :param base_url: url of the root wsgi application
-        """
+        """:param base_url: url of the root wsgi application."""
         self.base_url = base_url
 
     def build_choices(self, VERSIONS, req):
         version_objs = []
-        for version in VERSIONS:
+        for version in sorted(VERSIONS):
             version = VERSIONS[version]
             version_objs.append({
                 "id": version['id'],

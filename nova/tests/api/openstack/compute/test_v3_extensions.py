@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -35,7 +33,7 @@ class fake_bad_extension(object):
 
 class fake_stevedore_enabled_extensions(object):
     def __init__(self, namespace, check_func, invoke_on_load=False,
-                 invoke_args=(), invoke_kwds={}):
+                 invoke_args=(), invoke_kwds=None):
         self.extensions = []
 
     def map(self, func, *args, **kwds):

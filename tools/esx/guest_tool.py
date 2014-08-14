@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
 #
@@ -30,7 +28,7 @@ import subprocess
 import sys
 import time
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 PLATFORM_WIN = 'win32'

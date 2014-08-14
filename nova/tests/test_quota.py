@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -57,6 +55,8 @@ class QuotaIntegrationTestCase(test.TestCase):
 
         nova.tests.image.fake.stub_out_image_service(self.stubs)
 
+        self.compute_api = compute.API()
+
     def tearDown(self):
         super(QuotaIntegrationTestCase, self).tearDown()
         nova.tests.image.fake.FakeImageService_reset()
@@ -80,8 +80,9 @@ class QuotaIntegrationTestCase(test.TestCase):
         inst_type = flavors.get_flavor_by_name('m1.small')
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         try:
-            compute.API().create(self.context, min_count=1, max_count=1,
-                             instance_type=inst_type, image_href=image_uuid)
+            self.compute_api.create(self.context, min_count=1, max_count=1,
+                                    instance_type=inst_type,
+                                    image_href=image_uuid)
         except exception.QuotaError as e:
             expected_kwargs = {'code': 413, 'resource': 'cores', 'req': 1,
                           'used': 4, 'allowed': 4, 'overs': 'cores,instances'}
@@ -96,8 +97,9 @@ class QuotaIntegrationTestCase(test.TestCase):
         inst_type = flavors.get_flavor_by_name('m1.small')
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         try:
-            compute.API().create(self.context, min_count=1, max_count=1,
-                             instance_type=inst_type, image_href=image_uuid)
+            self.compute_api.create(self.context, min_count=1, max_count=1,
+                                    instance_type=inst_type,
+                                    image_href=image_uuid)
         except exception.QuotaError as e:
             expected_kwargs = {'code': 413, 'resource': 'cores', 'req': 1,
                           'used': 4, 'allowed': 4, 'overs': 'cores'}
@@ -110,8 +112,6 @@ class QuotaIntegrationTestCase(test.TestCase):
         # Setting cores quota to unlimited:
         self.flags(quota_cores=-1)
         instance = self._create_instance(cores=4)
-        inst_type = flavors.get_flavor_by_name('m1.small')
-        image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         db.instance_destroy(self.context, instance['uuid'])
 
     def test_too_many_addresses(self):
@@ -144,7 +144,7 @@ class QuotaIntegrationTestCase(test.TestCase):
             metadata['key%s' % i] = 'value%s' % i
         inst_type = flavors.get_flavor_by_name('m1.small')
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
-        self.assertRaises(exception.QuotaError, compute.API().create,
+        self.assertRaises(exception.QuotaError, self.compute_api.create,
                                             self.context,
                                             min_count=1,
                                             max_count=1,
@@ -153,7 +153,7 @@ class QuotaIntegrationTestCase(test.TestCase):
                                             metadata=metadata)
 
     def _create_with_injected_files(self, files):
-        api = compute.API()
+        api = self.compute_api
         inst_type = flavors.get_flavor_by_name('m1.small')
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         api.create(self.context, min_count=1, max_count=1,
@@ -161,7 +161,7 @@ class QuotaIntegrationTestCase(test.TestCase):
                 injected_files=files)
 
     def test_no_injected_files(self):
-        api = compute.API()
+        api = self.compute_api
         inst_type = flavors.get_flavor_by_name('m1.small')
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         api.create(self.context,
@@ -195,13 +195,13 @@ class QuotaIntegrationTestCase(test.TestCase):
                           self._create_with_injected_files, files)
 
     def test_max_injected_file_path_bytes(self):
-        max = CONF.quota_injected_file_path_bytes
+        max = CONF.quota_injected_file_path_length
         path = ''.join(['a' for i in xrange(max)])
         files = [(path, 'config = quotatest')]
         self._create_with_injected_files(files)  # no QuotaError
 
     def test_too_many_injected_file_path_bytes(self):
-        max = CONF.quota_injected_file_path_bytes
+        max = CONF.quota_injected_file_path_length
         path = ''.join(['a' for i in xrange(max + 1)])
         files = [(path, 'config = quotatest')]
         self.assertRaises(exception.QuotaError,
@@ -427,6 +427,47 @@ class BaseResourceTestCase(test.TestCase):
                                      quota_class='override_class')
 
         self.assertEqual(quota_value, 20)
+
+    def test_valid_method_call_check_invalid_input(self):
+        resources = {'dummy': 1}
+
+        self.assertRaises(exception.InvalidQuotaMethodUsage,
+                          quota._valid_method_call_check_resources,
+                          resources, 'limit')
+
+    def test_valid_method_call_check_invalid_method(self):
+        resources = {'key_pairs': 1}
+
+        self.assertRaises(exception.InvalidQuotaMethodUsage,
+                          quota._valid_method_call_check_resources,
+                          resources, 'dummy')
+
+    def test_valid_method_call_check_multiple(self):
+        resources = {'key_pairs': 1, 'dummy': 2}
+
+        self.assertRaises(exception.InvalidQuotaMethodUsage,
+                          quota._valid_method_call_check_resources,
+                          resources, 'check')
+
+        resources = {'key_pairs': 1, 'instances': 2, 'dummy': 3}
+
+        self.assertRaises(exception.InvalidQuotaMethodUsage,
+                          quota._valid_method_call_check_resources,
+                          resources, 'check')
+
+    def test_valid_method_call_check_wrong_method_reserve(self):
+        resources = {'key_pairs': 1}
+
+        self.assertRaises(exception.InvalidQuotaMethodUsage,
+                          quota._valid_method_call_check_resources,
+                          resources, 'reserve')
+
+    def test_valid_method_call_check_wrong_method_check(self):
+        resources = {'fixed_ips': 1}
+
+        self.assertRaises(exception.InvalidQuotaMethodUsage,
+                          quota._valid_method_call_check_resources,
+                          resources, 'check')
 
 
 class QuotaEngineTestCase(test.TestCase):
@@ -766,7 +807,7 @@ class DbQuotaDriverTestCase(test.TestCase):
                    quota_metadata_items=128,
                    quota_injected_files=5,
                    quota_injected_file_content_bytes=10 * 1024,
-                   quota_injected_file_path_bytes=255,
+                   quota_injected_file_path_length=255,
                    quota_security_groups=10,
                    quota_security_group_rules=20,
                    reservation_expire=86400,
@@ -1572,37 +1613,49 @@ class DbQuotaDriverTestCase(test.TestCase):
     def _stub_get_settable_quotas(self):
         def fake_get_project_quotas(context, resources, project_id,
                                     quota_class=None, defaults=True,
-                                    usages=True, remains=False):
+                                    usages=True, remains=False,
+                                    project_quotas=None):
             self.calls.append('get_project_quotas')
             result = {}
             for k, v in resources.items():
+                limit = v.default
+                reserved = 0
                 if k == 'instances':
                     remains = v.default - 5
                     in_use = 1
+                elif k == 'cores':
+                    remains = -1
+                    in_use = 5
+                    limit = -1
                 else:
                     remains = v.default
                     in_use = 0
-                result[k] = {'limit': v.default, 'in_use': in_use,
-                             'reserved': 0, 'remains': remains}
+                result[k] = {'limit': limit, 'in_use': in_use,
+                             'reserved': reserved, 'remains': remains}
             return result
 
         def fake_get_user_quotas(context, resources, project_id, user_id,
                                  quota_class=None, defaults=True,
-                                 usages=True):
+                                 usages=True, project_quotas=None,
+                                 user_quotas=None):
             self.calls.append('get_user_quotas')
             result = {}
             for k, v in resources.items():
+                reserved = 0
                 if k == 'instances':
                     in_use = 1
+                elif k == 'cores':
+                    in_use = 5
+                    reserved = 10
                 else:
                     in_use = 0
                 result[k] = {'limit': v.default,
-                             'in_use': in_use, 'reserved': 0}
+                             'in_use': in_use, 'reserved': reserved}
             return result
 
         def fake_qgabpau(context, project_id, user_id):
             self.calls.append('quota_get_all_by_project_and_user')
-            return {'instances': 2}
+            return {'instances': 2, 'cores': -1}
 
         self.stubs.Set(self.driver, 'get_project_quotas',
                        fake_get_project_quotas)
@@ -1619,8 +1672,8 @@ class DbQuotaDriverTestCase(test.TestCase):
 
         self.assertEqual(self.calls, [
                 'get_project_quotas',
-                'get_user_quotas',
                 'quota_get_all_by_project_and_user',
+                'get_user_quotas',
                 ])
         self.assertEqual(result, {
                 'instances': {
@@ -1628,8 +1681,8 @@ class DbQuotaDriverTestCase(test.TestCase):
                     'maximum': 7,
                     },
                 'cores': {
-                    'minimum': 0,
-                    'maximum': 20,
+                    'minimum': 15,
+                    'maximum': -1,
                     },
                 'ram': {
                     'minimum': 0,
@@ -1688,7 +1741,7 @@ class DbQuotaDriverTestCase(test.TestCase):
                     'maximum': -1,
                     },
                 'cores': {
-                    'minimum': 0,
+                    'minimum': 5,
                     'maximum': -1,
                     },
                 'ram': {
@@ -1733,10 +1786,73 @@ class DbQuotaDriverTestCase(test.TestCase):
                     },
                 })
 
+    def test_get_settable_quotas_by_user_with_unlimited_value(self):
+        self._stub_get_settable_quotas()
+        result = self.driver.get_settable_quotas(
+            FakeContext('test_project', 'test_class'),
+            quota.QUOTAS._resources, 'test_project', user_id='test_user')
+
+        self.assertEqual(self.calls, [
+                'get_project_quotas',
+                'quota_get_all_by_project_and_user',
+                'get_user_quotas',
+                ])
+        self.assertEqual(result, {
+                'instances': {
+                    'minimum': 1,
+                    'maximum': 7,
+                    },
+                'cores': {
+                    'minimum': 15,
+                    'maximum': -1,
+                    },
+                'ram': {
+                    'minimum': 0,
+                    'maximum': 50 * 1024,
+                    },
+                'floating_ips': {
+                    'minimum': 0,
+                    'maximum': 10,
+                    },
+                'fixed_ips': {
+                    'minimum': 0,
+                    'maximum': 10,
+                    },
+                'metadata_items': {
+                    'minimum': 0,
+                    'maximum': 128,
+                    },
+                'injected_files': {
+                    'minimum': 0,
+                    'maximum': 5,
+                    },
+                'injected_file_content_bytes': {
+                    'minimum': 0,
+                    'maximum': 10 * 1024,
+                    },
+                'injected_file_path_bytes': {
+                    'minimum': 0,
+                    'maximum': 255,
+                    },
+                'security_groups': {
+                    'minimum': 0,
+                    'maximum': 10,
+                    },
+                'security_group_rules': {
+                    'minimum': 0,
+                    'maximum': 20,
+                    },
+                'key_pairs': {
+                    'minimum': 0,
+                    'maximum': 100,
+                    },
+                })
+
     def _stub_get_project_quotas(self):
         def fake_get_project_quotas(context, resources, project_id,
                                     quota_class=None, defaults=True,
-                                    usages=True, remains=False):
+                                    usages=True, remains=False,
+                                    project_quotas=None):
             self.calls.append('get_project_quotas')
             return dict((k, dict(limit=v.default))
                         for k, v in resources.items())
@@ -1783,7 +1899,8 @@ class DbQuotaDriverTestCase(test.TestCase):
                                          quota.QUOTAS._resources,
                                          ['instances', 'cores', 'ram',
                                           'floating_ips', 'security_groups'],
-                                         True)
+                                         True,
+                                         project_id='test_project')
 
         self.assertEqual(self.calls, ['get_project_quotas'])
         self.assertEqual(result, dict(
@@ -1802,7 +1919,8 @@ class DbQuotaDriverTestCase(test.TestCase):
                                          ['metadata_items', 'injected_files',
                                           'injected_file_content_bytes',
                                           'injected_file_path_bytes',
-                                          'security_group_rules'], False)
+                                          'security_group_rules'], False,
+                                         project_id='test_project')
 
         self.assertEqual(self.calls, ['get_project_quotas'])
         self.assertEqual(result, dict(
@@ -2031,6 +2149,14 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
             return sync
         self.resources = {}
 
+        _existing_quota_sync_func_dict = dict(sqa_api.QUOTA_SYNC_FUNCTIONS)
+
+        def restore_sync_functions():
+            sqa_api.QUOTA_SYNC_FUNCTIONS.clear()
+            sqa_api.QUOTA_SYNC_FUNCTIONS.update(_existing_quota_sync_func_dict)
+
+        self.addCleanup(restore_sync_functions)
+
         for res_name in ('instances', 'cores', 'ram', 'fixed_ips'):
             method_name = '_sync_%s' % res_name
             sqa_api.QUOTA_SYNC_FUNCTIONS[method_name] = make_sync(res_name)
@@ -2071,11 +2197,9 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
         def fake_get_session():
             return FakeSession()
 
-        def fake_get_project_quota_usages(context, session, project_id):
-            return self.usages.copy()
-
-        def fake_get_user_quota_usages(context, session, project_id, user_id):
-            return self.usages.copy()
+        def fake_get_project_user_quota_usages(context, session, project_id,
+                                               user_id):
+            return self.usages.copy(), self.usages.copy()
 
         def fake_quota_usage_create(context, project_id, user_id, resource,
                                     in_use, reserved, until_refresh,
@@ -2100,10 +2224,8 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
             return reservation_ref
 
         self.stubs.Set(sqa_api, 'get_session', fake_get_session)
-        self.stubs.Set(sqa_api, '_get_project_quota_usages',
-                       fake_get_project_quota_usages)
-        self.stubs.Set(sqa_api, '_get_user_quota_usages',
-                       fake_get_user_quota_usages)
+        self.stubs.Set(sqa_api, '_get_project_user_quota_usages',
+                       fake_get_project_user_quota_usages)
         self.stubs.Set(sqa_api, '_quota_usage_create', fake_quota_usage_create)
         self.stubs.Set(sqa_api, '_reservation_create', fake_reservation_create)
 
@@ -2362,7 +2484,7 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
     def test_quota_reserve_cores_unlimited(self):
         # Requesting 8 cores, quota_cores set to unlimited:
         self.flags(quota_cores=-1)
-        context = self._init_usages(1, 8, 1 * 1024, 1)
+        self._init_usages(1, 8, 1 * 1024, 1)
         self.assertEqual(self.sync_called, set([]))
         self.usages_list[0]["in_use"] = 1
         self.usages_list[0]["reserved"] = 0
@@ -2379,7 +2501,7 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
     def test_quota_reserve_ram_unlimited(self):
         # Requesting 10*1024 ram, quota_ram set to unlimited:
         self.flags(quota_ram=-1)
-        context = self._init_usages(1, 1, 10 * 1024, 1)
+        self._init_usages(1, 1, 10 * 1024, 1)
         self.assertEqual(self.sync_called, set([]))
         self.usages_list[0]["in_use"] = 1
         self.usages_list[0]["reserved"] = 0
@@ -2429,7 +2551,7 @@ class NoopQuotaDriverTestCase(test.TestCase):
                    quota_metadata_items=128,
                    quota_injected_files=5,
                    quota_injected_file_content_bytes=10 * 1024,
-                   quota_injected_file_path_bytes=255,
+                   quota_injected_file_path_length=255,
                    quota_security_groups=10,
                    quota_security_group_rules=20,
                    reservation_expire=86400,

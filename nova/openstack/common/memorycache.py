@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -24,7 +22,6 @@ from nova.openstack.common import timeutils
 
 memcache_opts = [
     cfg.ListOpt('memcached_servers',
-                default=None,
                 help='Memcached servers or None for in process cache.'),
 ]
 
@@ -38,11 +35,8 @@ def get_client(memcached_servers=None):
     if not memcached_servers:
         memcached_servers = CONF.memcached_servers
     if memcached_servers:
-        try:
-            import memcache
-            client_cls = memcache.Client
-        except ImportError:
-            pass
+        import memcache
+        client_cls = memcache.Client
 
     return client_cls(memcached_servers, debug=0)
 
@@ -61,7 +55,7 @@ class Client(object):
         """
 
         now = timeutils.utcnow_ts()
-        for k in self.cache.keys():
+        for k in list(self.cache):
             (timeout, _value) = self.cache[k]
             if timeout and now >= timeout:
                 del self.cache[k]

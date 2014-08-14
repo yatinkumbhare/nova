@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 VMware, Inc.
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
@@ -21,11 +19,12 @@ Classes for making VMware VI SOAP calls.
 """
 
 import httplib
+import urllib2
 
 from oslo.config import cfg
 import suds
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import utils
 from nova.virt.vmwareapi import error_util
 
@@ -34,9 +33,6 @@ CONN_ABORT_ERROR = 'Software caused connection abort'
 ADDRESS_IN_USE_ERROR = 'Address already in use'
 
 vmwareapi_wsdl_loc_opt = cfg.StrOpt('wsdl_location',
-        #Deprecated in Icehouse
-        deprecated_name='vmwareapi_wsdl_loc',
-        deprecated_group='DEFAULT',
         help='Optional VIM Service WSDL Location '
              'e.g http://<server>/vimService.wsdl. '
              'Optional over-ride to default location for bug work-arounds')
@@ -102,36 +98,39 @@ class Vim:
 
     def __init__(self,
                  protocol="https",
-                 host="localhost"):
-        """
-        Creates the necessary Communication interfaces and gets the
+                 host="localhost",
+                 port=443):
+        """Creates the necessary Communication interfaces and gets the
         ServiceContent for initiating SOAP transactions.
 
         protocol: http or https
-        host    : ESX IPAddress[:port] or ESX Hostname[:port]
+        host    : ESX IPAddress or Hostname
+        port    : port for connection
         """
         if not suds:
             raise Exception(_("Unable to import suds."))
 
         self._protocol = protocol
         self._host_name = host
-        self.wsdl_url = Vim.get_wsdl_url(protocol, host)
-        self.url = Vim.get_soap_url(protocol, host)
+        self.wsdl_url = Vim.get_wsdl_url(protocol, host, port)
+        self.url = Vim.get_soap_url(protocol, host, port)
         self.client = suds.client.Client(self.wsdl_url, location=self.url,
                                          plugins=[VIMMessagePlugin()])
-        self._service_content = self.RetrieveServiceContent(
-                                        "ServiceInstance")
+        self._service_content = self.retrieve_service_content()
+
+    def retrieve_service_content(self):
+        return self.RetrieveServiceContent("ServiceInstance")
 
     @staticmethod
-    def get_wsdl_url(protocol, host_name):
-        """
-        allows override of the wsdl location, making this static
+    def get_wsdl_url(protocol, host_name, port):
+        """Allows override of the wsdl location, making this static
         means we can test the logic outside of the constructor
         without forcing the test environment to have multiple valid
         wsdl locations to test against.
 
         :param protocol: https or http
         :param host_name: localhost or other server name
+        :param port: port for connection
         :return: string to WSDL location for vSphere WS Management API
         """
         # optional WSDL location over-ride for work-arounds
@@ -139,22 +138,22 @@ class Vim:
             return CONF.vmware.wsdl_location
 
         # calculate default WSDL location if no override supplied
-        return Vim.get_soap_url(protocol, host_name) + "/vimService.wsdl"
+        return Vim.get_soap_url(protocol, host_name, port) + "/vimService.wsdl"
 
     @staticmethod
-    def get_soap_url(protocol, host_name):
-        """
-        Calculates the location of the SOAP services
+    def get_soap_url(protocol, host_name, port):
+        """Calculates the location of the SOAP services
         for a particular server. Created as a static
         method for testing.
 
         :param protocol: https or http
         :param host_name: localhost or other vSphere server name
+        :param port: port for connection
         :return: the url to the active vSphere WS Management API
         """
         if utils.is_valid_ipv6(host_name):
-            return '%s://[%s]/sdk' % (protocol, host_name)
-        return '%s://%s/sdk' % (protocol, host_name)
+            return '%s://[%s]:%d/sdk' % (protocol, host_name, port)
+        return '%s://%s:%d/sdk' % (protocol, host_name, port)
 
     def get_service_content(self):
         """Gets the service content object."""
@@ -163,8 +162,7 @@ class Vim:
     def __getattr__(self, attr_name):
         """Makes the API calls and gets the result."""
         def vim_request_handler(managed_object, **kwargs):
-            """
-            Builds the SOAP message and parses the response for fault
+            """Builds the SOAP message and parses the response for fault
             checking and other errors.
 
             managed_object    : Managed Object Reference or Managed
@@ -188,15 +186,24 @@ class Vim:
                 return response
             # Catch the VimFaultException that is raised by the fault
             # check of the SOAP response
-            except error_util.VimFaultException as excep:
+            except error_util.VimFaultException:
+                raise
+            except suds.MethodNotFound:
                 raise
             except suds.WebFault as excep:
                 doc = excep.document
+                fault_string = doc.childAtPath("/Envelope/Body/Fault/"
+                                               "faultstring").getText()
                 detail = doc.childAtPath("/Envelope/Body/Fault/detail")
                 fault_list = []
-                for child in detail.getChildren():
-                    fault_list.append(child.get("type"))
-                raise error_util.VimFaultException(fault_list, excep)
+                details = {}
+                if detail:
+                    for fault in detail.getChildren():
+                        fault_list.append(fault.get("type"))
+                        for child in fault.getChildren():
+                            details[child.name] = child.getText()
+                raise error_util.VimFaultException(fault_list, fault_string,
+                                                   details)
             except AttributeError as excep:
                 raise error_util.VimAttributeError(_("No such SOAP method "
                      "'%s' provided by VI SDK") % (attr_name), excep)
@@ -205,6 +212,10 @@ class Vim:
                     httplib.CannotSendHeader) as excep:
                 raise error_util.SessionOverLoadException(_("httplib "
                                 "error in %s: ") % (attr_name), excep)
+            except (urllib2.URLError,
+                    urllib2.HTTPError) as excep:
+                raise error_util.SessionConnectionException(_("urllib2 "
+                            "error in  %s: ") % (attr_name), excep)
             except Exception as excep:
                 # Socket errors which need special handling for they
                 # might be caused by ESX API call overload

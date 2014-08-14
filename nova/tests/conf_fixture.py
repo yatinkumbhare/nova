@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -29,12 +27,12 @@ CONF = cfg.CONF
 CONF.import_opt('use_ipv6', 'nova.netconf')
 CONF.import_opt('host', 'nova.netconf')
 CONF.import_opt('scheduler_driver', 'nova.scheduler.manager')
-CONF.import_opt('fake_network', 'nova.network.manager')
+CONF.import_opt('fake_network', 'nova.network.linux_net')
 CONF.import_opt('network_size', 'nova.network.manager')
 CONF.import_opt('num_networks', 'nova.network.manager')
 CONF.import_opt('floating_ip_dns_manager', 'nova.network.floating_ips')
 CONF.import_opt('instance_dns_manager', 'nova.network.floating_ips')
-CONF.import_opt('policy_file', 'nova.policy')
+CONF.import_opt('policy_file', 'nova.openstack.common.policy')
 CONF.import_opt('compute_driver', 'nova.virt.driver')
 CONF.import_opt('api_paste_config', 'nova.wsgi')
 
@@ -53,18 +51,13 @@ class ConfFixture(config_fixture.Config):
                               'nova.tests.utils.dns_manager')
         self.conf.set_default('instance_dns_manager',
                               'nova.tests.utils.dns_manager')
-        self.conf.set_default('lock_path', None)
         self.conf.set_default('network_size', 8)
         self.conf.set_default('num_networks', 2)
-        self.conf.set_default('rpc_backend',
-                              'nova.openstack.common.rpc.impl_fake')
-        self.conf.set_default('rpc_cast_timeout', 5)
-        self.conf.set_default('rpc_response_timeout', 5)
         self.conf.set_default('connection', "sqlite://", group='database')
-        self.conf.set_default('sqlite_synchronous', False)
+        self.conf.set_default('sqlite_synchronous', False, group='database')
         self.conf.set_default('use_ipv6', True)
-        self.conf.set_default('verbose', True)
         self.conf.set_default('vlan_interface', 'eth0')
+        self.conf.set_default('auth_strategy', 'noauth')
         config.parse_args([], default_config_files=[])
         self.addCleanup(utils.cleanup_dns_managers)
         self.addCleanup(ipv6.api.reset_backend)

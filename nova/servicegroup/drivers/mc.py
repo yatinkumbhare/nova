@@ -21,7 +21,7 @@ from oslo.config import cfg
 
 from nova import conductor
 from nova import context
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import memorycache
 from nova.openstack.common import timeutils
@@ -60,7 +60,7 @@ class MemcachedDriver(api.ServiceGroupDriver):
         report_interval = service.report_interval
         if report_interval:
             service.tg.add_timer(report_interval, self._report_state,
-                                 report_interval, service)
+                                 api.INITIAL_REPORTING_DELAY, service)
 
     def is_up(self, service_ref):
         """Moved from nova.utils
@@ -70,10 +70,9 @@ class MemcachedDriver(api.ServiceGroupDriver):
         return self.mc.get(str(key)) is not None
 
     def get_all(self, group_id):
+        """Returns ALL members of the given group
         """
-        Returns ALL members of the given group
-        """
-        LOG.debug(_('Memcached_Driver: get_all members of the %s group') %
+        LOG.debug('Memcached_Driver: get_all members of the %s group',
                   group_id)
         rs = []
         ctxt = context.get_admin_context()
@@ -85,7 +84,6 @@ class MemcachedDriver(api.ServiceGroupDriver):
 
     def _report_state(self, service):
         """Update the state of this service in the datastore."""
-        ctxt = context.get_admin_context()
         try:
             key = "%(topic)s:%(host)s" % service.service_ref
             # memcached has data expiration time capability.

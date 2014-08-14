@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Red Hat Inc.
 # All Rights Reserved.
 #
@@ -17,9 +15,8 @@
 #
 # iBoot Power Driver
 
-from nova import context as nova_context
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.virt.baremetal import baremetal_states
@@ -70,7 +67,6 @@ class IBootManager(base.PowerManager):
         self.password = str(node['pm_password'])
         instance = kwargs.pop('instance', {})
         self.node_name = instance.get('hostname', "")
-        context = nova_context.get_admin_context()
         self.state = None
         self.conn = None
 
@@ -126,6 +122,6 @@ class IBootManager(base.PowerManager):
         return self.state
 
     def is_power_on(self):
-        LOG.debug(_("Checking if %s is running"), self.node_name)
+        LOG.debug("Checking if %s is running", self.node_name)
         self._create_connection()
         return self._get_relay(self.relay_id)

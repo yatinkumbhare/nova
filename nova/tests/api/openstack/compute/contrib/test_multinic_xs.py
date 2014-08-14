@@ -13,9 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
 import webob
 
 from nova import compute
+from nova import exception
+from nova import objects
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
@@ -38,8 +41,14 @@ def compute_api_remove_fixed_ip(self, context, instance, address):
     last_remove_fixed_ip = (instance['uuid'], address)
 
 
-def compute_api_get(self, context, instance_id):
-    return {'id': 1, 'uuid': instance_id}
+def compute_api_get(self, context, instance_id, want_objects=False):
+    instance = objects.Instance()
+    instance.uuid = instance_id
+    instance.id = 1
+    instance.vm_state = 'fake'
+    instance.task_state = 'fake'
+    instance.obj_reset_changes()
+    return instance
 
 
 class FixedIpTest(test.NoDBTestCase):
@@ -83,8 +92,21 @@ class FixedIpTest(test.NoDBTestCase):
         req.headers['content-type'] = 'application/json'
 
         resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 422)
+        self.assertEqual(resp.status_int, 400)
         self.assertEqual(last_add_fixed_ip, (None, None))
+
+    @mock.patch.object(compute.api.API, 'add_fixed_ip')
+    def test_add_fixed_ip_no_more_ips_available(self, mock_add_fixed_ip):
+        mock_add_fixed_ip.side_effect = exception.NoMoreFixedIps
+
+        body = dict(addFixedIp=dict(networkId='test_net'))
+        req = webob.Request.blank('/v2/fake/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+
+        resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 400)
 
     def test_remove_fixed_ip(self):
         global last_remove_fixed_ip
@@ -111,5 +133,5 @@ class FixedIpTest(test.NoDBTestCase):
         req.headers['content-type'] = 'application/json'
 
         resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 422)
+        self.assertEqual(resp.status_int, 400)
         self.assertEqual(last_remove_fixed_ip, (None, None))

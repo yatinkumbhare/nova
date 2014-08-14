@@ -17,7 +17,7 @@
 """The security groups extension."""
 
 import contextlib
-import json
+
 import webob
 from webob import exc
 
@@ -28,13 +28,16 @@ from nova.api.openstack import xmlutil
 from nova import compute
 from nova.compute import api as compute_api
 from nova import exception
+from nova.i18n import _
 from nova.network.security_group import neutron_driver
 from nova.network.security_group import openstack_driver
-from nova.openstack.common.gettextutils import _
+from nova.openstack.common import jsonutils
+from nova.openstack.common import log as logging
 from nova.openstack.common import xmlutils
 from nova.virt import netutils
 
 
+LOG = logging.getLogger(__name__)
 authorize = extensions.extension_authorizer('compute', 'security_groups')
 softauth = extensions.soft_extension_authorizer('compute', 'security_groups')
 
@@ -111,9 +114,7 @@ class SecurityGroupsTemplate(xmlutil.TemplateBuilder):
 
 
 class SecurityGroupXMLDeserializer(wsgi.MetadataXMLDeserializer):
-    """
-    Deserializer to handle xml-formatted security group requests.
-    """
+    """Deserializer to handle xml-formatted security group requests."""
     def default(self, string):
         """Deserialize an xml-formatted security group create request."""
         dom = xmlutil.safe_minidom_parse_string(string)
@@ -131,9 +132,7 @@ class SecurityGroupXMLDeserializer(wsgi.MetadataXMLDeserializer):
 
 
 class SecurityGroupRulesXMLDeserializer(wsgi.MetadataXMLDeserializer):
-    """
-    Deserializer to handle xml-formatted security group requests.
-    """
+    """Deserializer to handle xml-formatted security group requests."""
 
     def default(self, string):
         """Deserialize an xml-formatted security group create request."""
@@ -210,7 +209,12 @@ class SecurityGroupControllerBase(object):
         self.compute_api = compute.API(
                                    security_group_api=self.security_group_api)
 
-    def _format_security_group_rule(self, context, rule):
+    def _format_security_group_rule(self, context, rule, group_rule_data=None):
+        """Return a secuity group rule in desired API response format.
+
+        If group_rule_data is passed in that is used rather than querying
+        for it.
+        """
         sg_rule = {}
         sg_rule['id'] = rule['id']
         sg_rule['parent_group_id'] = rule['parent_group_id']
@@ -221,10 +225,24 @@ class SecurityGroupControllerBase(object):
         sg_rule['ip_range'] = {}
         if rule['group_id']:
             with translate_exceptions():
-                source_group = self.security_group_api.get(context,
-                                                           id=rule['group_id'])
+                try:
+                    source_group = self.security_group_api.get(
+                        context, id=rule['group_id'])
+                except exception.SecurityGroupNotFound:
+                    # NOTE(arosen): There is a possible race condition that can
+                    # occur here if two api calls occur concurrently: one that
+                    # lists the security groups and another one that deletes a
+                    # security group rule that has a group_id before the
+                    # group_id is fetched. To handle this if
+                    # SecurityGroupNotFound is raised we return None instead
+                    # of the rule and the caller should ignore the rule.
+                    LOG.debug("Security Group ID %s does not exist",
+                              rule['group_id'])
+                    return
             sg_rule['group'] = {'name': source_group.get('name'),
-                             'tenant_id': source_group.get('project_id')}
+                                'tenant_id': source_group.get('project_id')}
+        elif group_rule_data:
+            sg_rule['group'] = group_rule_data
         else:
             sg_rule['ip_range'] = {'cidr': rule['cidr']}
         return sg_rule
@@ -237,8 +255,9 @@ class SecurityGroupControllerBase(object):
         security_group['tenant_id'] = group['project_id']
         security_group['rules'] = []
         for rule in group['rules']:
-            security_group['rules'] += [self._format_security_group_rule(
-                    context, rule)]
+            formatted_rule = self._format_security_group_rule(context, rule)
+            if formatted_rule:
+                security_group['rules'] += [formatted_rule]
         return security_group
 
     def _from_body(self, body, key):
@@ -383,14 +402,22 @@ class SecurityGroupRulesController(SecurityGroupControllerBase):
                 msg = _("Bad prefix for network in cidr %s") % new_rule['cidr']
                 raise exc.HTTPBadRequest(explanation=msg)
 
+        group_rule_data = None
         with translate_exceptions():
+            if sg_rule.get('group_id'):
+                source_group = self.security_group_api.get(
+                            context, id=sg_rule['group_id'])
+                group_rule_data = {'name': source_group.get('name'),
+                                   'tenant_id': source_group.get('project_id')}
+
             security_group_rule = (
                 self.security_group_api.create_security_group_rule(
                     context, security_group, new_rule))
 
-        return {"security_group_rule": self._format_security_group_rule(
-                                                        context,
-                                                        security_group_rule)}
+        formatted_rule = self._format_security_group_rule(context,
+                                                          security_group_rule,
+                                                          group_rule_data)
+        return {"security_group_rule": formatted_rule}
 
     def _rule_args_to_dict(self, context, to_port=None, from_port=None,
                            ip_protocol=None, cidr=None, group_id=None):
@@ -538,7 +565,7 @@ class SecurityGroupsOutputController(wsgi.Controller):
             else:
                 try:
                     # try converting to json
-                    req_obj = json.loads(req.body)
+                    req_obj = jsonutils.loads(req.body)
                     # Add security group to server, if no security group was in
                     # request add default since that is the group it is part of
                     servers[0][key] = req_obj['server'].get(
@@ -614,7 +641,7 @@ class Security_groups(extensions.ExtensionDescriptor):
     name = "SecurityGroups"
     alias = "os-security-groups"
     namespace = "http://docs.openstack.org/compute/ext/securitygroups/api/v1.1"
-    updated = "2013-05-28T00:00:00+00:00"
+    updated = "2013-05-28T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = SecurityGroupActionController()

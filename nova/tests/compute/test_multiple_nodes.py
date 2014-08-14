@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # All Rights Reserved.
 #
@@ -19,6 +17,8 @@
 from oslo.config import cfg
 
 from nova import context
+from nova import db
+from nova import objects
 from nova.openstack.common import importutils
 from nova import test
 from nova.virt import fake
@@ -105,16 +105,20 @@ class MultiNodeComputeTestCase(BaseTestCase):
                                    'disk_available_least': 265856,
                                    'deleted_at': None,
                                    'free_ram_mb': 130560,
-                                   'id': 2}]
-            return fake_compute_nodes
+                                   'metrics': '',
+                                   'stats': '',
+                                   'id': 2,
+                                   'host_ip': '127.0.0.1'}]
+            return [objects.ComputeNode._from_db_object(
+                        context, objects.ComputeNode(), cn)
+                    for cn in fake_compute_nodes]
 
-        def fake_compute_node_delete(context, compute_node):
-            self.assertEqual(compute_node.get('hypervisor_hostname'),
-                             'fake_phyp1')
+        def fake_compute_node_delete(context, compute_node_id):
+            self.assertEqual(2, compute_node_id)
 
         self.stubs.Set(self.compute, '_get_compute_nodes_in_db',
                 fake_get_compute_nodes_in_db)
-        self.stubs.Set(self.compute.conductor_api, 'compute_node_delete',
+        self.stubs.Set(db, 'compute_node_delete',
                 fake_compute_node_delete)
 
     def test_update_available_resource_add_remove_node(self):
@@ -138,24 +142,25 @@ class MultiNodeComputeTestCase(BaseTestCase):
         ctx = context.get_admin_context()
         fake.set_nodes(['A', 'B'])
 
-        fake_compute_nodes = [{'hypervisor_hostname': 'A',
-                                   'id': 2},
-                              {'hypervisor_hostname': 'B',
-                                   'id': 3}]
+        fake_compute_nodes = [
+            objects.ComputeNode(
+                context=ctx, hypervisor_hostname='A', id=2),
+            objects.ComputeNode(
+                context=ctx, hypervisor_hostname='B', id=3),
+            ]
 
         def fake_get_compute_nodes_in_db(context):
             return fake_compute_nodes
 
-        def fake_compute_node_delete(context, compute_node):
+        def fake_compute_node_delete(context, compute_node_id):
             for cn in fake_compute_nodes:
-                if (compute_node['hypervisor_hostname'] ==
-                                    cn['hypervisor_hostname']):
+                if compute_node_id == cn.id:
                     fake_compute_nodes.remove(cn)
                     return
 
         self.stubs.Set(self.compute, '_get_compute_nodes_in_db',
                 fake_get_compute_nodes_in_db)
-        self.stubs.Set(self.compute.conductor_api, 'compute_node_delete',
+        self.stubs.Set(db, 'compute_node_delete',
                 fake_compute_node_delete)
 
         self.compute.update_available_resource(ctx)

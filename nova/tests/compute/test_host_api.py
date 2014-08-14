@@ -1,5 +1,6 @@
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
+# Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,12 +14,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextlib
+
+import mock
+
 from nova.cells import utils as cells_utils
 from nova import compute
-from nova.compute import rpcapi as compute_rpcapi
 from nova import context
 from nova import exception
-from nova.openstack.common import rpc
+from nova import objects
 from nova import test
 from nova.tests import fake_notifier
 from nova.tests.objects import test_objects
@@ -41,12 +45,10 @@ class ComputeHostAPITestCase(test.TestCase):
         for index, obj in enumerate(obj_list):
             self._compare_obj(obj, db_obj_list[index])
 
-    def _mock_rpc_call(self, expected_message, result=None):
-        if result is None:
-            result = 'fake-result'
-        self.mox.StubOutWithMock(rpc, 'call')
-        rpc.call(self.ctxt, 'compute.fake_host',
-                 expected_message, None).AndReturn(result)
+    def _mock_rpc_call(self, method, **kwargs):
+        self.mox.StubOutWithMock(self.host_api.rpcapi, method)
+        getattr(self.host_api.rpcapi, method)(
+            self.ctxt, **kwargs).AndReturn('fake-result')
 
     def _mock_assert_host_exists(self):
         """Sets it so that the host API always thinks that 'fake_host'
@@ -59,12 +61,9 @@ class ComputeHostAPITestCase(test.TestCase):
 
     def test_set_host_enabled(self):
         self._mock_assert_host_exists()
-        self._mock_rpc_call(
-                {'method': 'set_host_enabled',
-                 'namespace': None,
-                 'args': {'enabled': 'fake_enabled'},
-                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION})
-
+        self._mock_rpc_call('set_host_enabled',
+                            host='fake_host',
+                            enabled='fake_enabled')
         self.mox.ReplayAll()
         fake_notifier.NOTIFICATIONS = []
         result = self.host_api.set_host_enabled(self.ctxt, 'fake_host',
@@ -86,12 +85,9 @@ class ComputeHostAPITestCase(test.TestCase):
 
     def test_host_name_from_assert_hosts_exists(self):
         self._mock_assert_host_exists()
-        self._mock_rpc_call(
-                {'method': 'set_host_enabled',
-                 'namespace': None,
-                 'args': {'enabled': 'fake_enabled'},
-                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION})
-
+        self._mock_rpc_call('set_host_enabled',
+                            host='fake_host',
+                            enabled='fake_enabled')
         self.mox.ReplayAll()
         result = self.host_api.set_host_enabled(self.ctxt, 'fake_hosT',
                                                 'fake_enabled')
@@ -99,11 +95,8 @@ class ComputeHostAPITestCase(test.TestCase):
 
     def test_get_host_uptime(self):
         self._mock_assert_host_exists()
-        self._mock_rpc_call(
-                {'method': 'get_host_uptime',
-                 'namespace': None,
-                 'args': {},
-                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION})
+        self._mock_rpc_call('get_host_uptime',
+                            host='fake_host')
         self.mox.ReplayAll()
         result = self.host_api.get_host_uptime(self.ctxt, 'fake_host')
         self.assertEqual('fake-result', result)
@@ -125,11 +118,9 @@ class ComputeHostAPITestCase(test.TestCase):
 
     def test_host_power_action(self):
         self._mock_assert_host_exists()
-        self._mock_rpc_call(
-                {'method': 'host_power_action',
-                 'namespace': None,
-                 'args': {'action': 'fake_action'},
-                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION})
+        self._mock_rpc_call('host_power_action',
+                            host='fake_host',
+                            action='fake_action')
         self.mox.ReplayAll()
         fake_notifier.NOTIFICATIONS = []
         result = self.host_api.host_power_action(self.ctxt, 'fake_host',
@@ -151,11 +142,10 @@ class ComputeHostAPITestCase(test.TestCase):
 
     def test_set_host_maintenance(self):
         self._mock_assert_host_exists()
-        self._mock_rpc_call(
-                {'method': 'host_maintenance_mode',
-                 'namespace': None,
-                 'args': {'host': 'fake_host', 'mode': 'fake_mode'},
-                 'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION})
+        self._mock_rpc_call('host_maintenance_mode',
+                            host='fake_host',
+                            host_param='fake_host',
+                            mode='fake_mode')
         self.mox.ReplayAll()
         fake_notifier.NOTIFICATIONS = []
         result = self.host_api.set_host_maintenance(self.ctxt, 'fake_host',
@@ -320,6 +310,18 @@ class ComputeHostAPITestCase(test.TestCase):
                 state='fake-state')
         self.assertEqual('fake-response', result)
 
+    def test_service_delete(self):
+        with contextlib.nested(
+            mock.patch.object(objects.Service, 'get_by_id',
+                              return_value=objects.Service()),
+            mock.patch.object(objects.Service, 'destroy')
+        ) as (
+            get_by_id, destroy
+        ):
+            self.host_api.service_delete(self.ctxt, 1)
+            get_by_id.assert_called_once_with(self.ctxt, 1)
+            destroy.assert_called_once_with()
+
 
 class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
     def setUp(self):
@@ -327,26 +329,30 @@ class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
         self.flags(cell_type='api', group='cells')
         super(ComputeHostAPICellsTestCase, self).setUp()
 
-    def _mock_rpc_call(self, expected_message, result=None):
-        if result is None:
-            result = 'fake-result'
-        # Wrapped with cells call
-        expected_message = {'method': 'proxy_rpc_to_manager',
-                            'namespace': None,
-                            'args': {'topic': 'compute.fake_host',
-                                     'rpc_message': expected_message,
-                                     'call': True,
-                                     'timeout': None},
-                            'version': '1.2'}
-        self.mox.StubOutWithMock(rpc, 'call')
-        rpc.call(self.ctxt, 'cells', expected_message,
-                 None).AndReturn(result)
+    def _mock_rpc_call(self, method, **kwargs):
+        if 'host_param' in kwargs:
+            kwargs.pop('host_param')
+        else:
+            kwargs.pop('host')
+        rpc_message = {
+            'method': method,
+            'namespace': None,
+            'args': kwargs,
+            'version': self.host_api.rpcapi.client.target.version,
+        }
+        cells_rpcapi = self.host_api.rpcapi.client.cells_rpcapi
+        self.mox.StubOutWithMock(cells_rpcapi, 'proxy_rpc_to_manager')
+        cells_rpcapi.proxy_rpc_to_manager(self.ctxt,
+                                          rpc_message,
+                                          'compute.fake_host',
+                                          call=True).AndReturn('fake-result')
 
     def test_service_get_all_no_zones(self):
         services = [dict(test_service.fake_service,
-                         id=1, topic='compute', host='host1'),
+                         id='cell1@1', topic='compute', host='host1'),
                     dict(test_service.fake_service,
-                         id=2, topic='compute', host='host2')]
+                         id='cell1@2', topic='compute', host='host2')]
+        exp_services = [s.copy() for s in services]
 
         fake_filters = {'host': 'host1'}
         self.mox.StubOutWithMock(self.host_api.cells_rpcapi,
@@ -356,22 +362,21 @@ class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
         self.mox.ReplayAll()
         result = self.host_api.service_get_all(self.ctxt,
                                                filters=fake_filters)
-        self._compare_objs(result, services)
+        self._compare_objs(result, exp_services)
 
-    def test_service_get_all(self):
+    def _test_service_get_all(self, fake_filters, **kwargs):
         services = [dict(test_service.fake_service,
-                         id=1, key1='val1', key2='val2', topic='compute',
-                         host='host1'),
+                         id='cell1@1', key1='val1', key2='val2',
+                         topic='compute', host='host1'),
                     dict(test_service.fake_service,
-                         id=2, key1='val2', key3='val3', topic='compute',
-                         host='host2')]
+                         id='cell1@2', key1='val2', key3='val3',
+                         topic='compute', host='host2')]
         exp_services = []
         for service in services:
             exp_service = {}
             exp_service.update(availability_zone='nova', **service)
             exp_services.append(exp_service)
 
-        fake_filters = {'key1': 'val1'}
         self.mox.StubOutWithMock(self.host_api.cells_rpcapi,
                                  'service_get_all')
         self.host_api.cells_rpcapi.service_get_all(self.ctxt,
@@ -379,22 +384,17 @@ class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
         self.mox.ReplayAll()
         result = self.host_api.service_get_all(self.ctxt,
                                                filters=fake_filters,
-                                               set_zones=True)
+                                               **kwargs)
         self.mox.VerifyAll()
         self._compare_objs(result, exp_services)
 
-        # Test w/ zone filter but no set_zones arg.
-        self.mox.ResetAll()
+    def test_service_get_all(self):
         fake_filters = {'availability_zone': 'nova'}
-        # Zone filter is done client-size, so should be stripped
-        # from this call.
-        self.host_api.cells_rpcapi.service_get_all(self.ctxt,
-                filters={}).AndReturn(services)
-        self.mox.ReplayAll()
-        result = self.host_api.service_get_all(self.ctxt,
-                                               filters=fake_filters)
-        self.mox.VerifyAll()
-        self._compare_objs(result, exp_services)
+        self._test_service_get_all(fake_filters)
+
+    def test_service_get_all_set_zones(self):
+        fake_filters = {'key1': 'val1'}
+        self._test_service_get_all(fake_filters, set_zones=True)
 
     def test_service_get_by_compute_host(self):
         self.mox.StubOutWithMock(self.host_api.cells_rpcapi,
@@ -424,6 +424,14 @@ class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
         result = self.host_api.service_update(
             self.ctxt, host_name, binary, params_to_update)
         self._compare_obj(result, expected_result)
+
+    def test_service_delete(self):
+        cell_service_id = cells_utils.cell_with_item('cell1', 1)
+        with mock.patch.object(self.host_api.cells_rpcapi,
+                               'service_delete') as service_delete:
+            self.host_api.service_delete(self.ctxt, cell_service_id)
+            service_delete.assert_called_once_with(
+                self.ctxt, cell_service_id)
 
     def test_instance_get_all_by_host(self):
         instances = [dict(id=1, cell_name='cell1', host='host1'),
@@ -456,7 +464,7 @@ class ComputeHostAPICellsTestCase(ComputeHostAPITestCase):
         self.assertEqual('fake-response', result)
 
     def test_get_host_uptime_service_down(self):
-        # The corresponing Compute test case depends on the
+        # The corresponding Compute test case depends on the
         # _assert_host_exists which is a no-op in the cells api
         pass
 

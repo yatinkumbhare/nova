@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
 #
@@ -20,7 +18,7 @@
 from oslo.config import cfg
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.virt.vmwareapi import error_util
 from nova.virt.vmwareapi import network_util
@@ -33,10 +31,10 @@ CONF = cfg.CONF
 vmwareapi_vif_opts = [
     cfg.StrOpt('vlan_interface',
                default='vmnic0',
-               #Deprecated in Icehouse
-               deprecated_name='vmwareapi_vlan_interface',
-               deprecated_group='DEFAULT',
                help='Physical ethernet adapter name for vlan networking'),
+    cfg.StrOpt('integration_bridge',
+               default='br-int',
+               help='Name of Integration Bridge'),
 ]
 
 CONF.register_opts(vmwareapi_vif_opts, 'vmware')
@@ -128,7 +126,7 @@ def get_neutron_network(session, network_name, cluster, vif):
         opaque = session._call_method(vim_util, "get_dynamic_property", host,
                                       "HostSystem",
                                       "config.network.opaqueNetwork")
-    except error_util.VimFaultException:
+    except error_util.InvalidPropertyException:
         opaque = None
     if opaque:
         bridge = vif['network']['id']
@@ -154,3 +152,35 @@ def get_network_ref(session, cluster, vif, is_neutron):
         network_ref = ensure_vlan_bridge(session, vif, cluster=cluster,
                                          create_vlan=create_vlan)
     return network_ref
+
+
+def get_vif_dict(session, cluster, vif_model, is_neutron, vif):
+    mac = vif['address']
+    name = vif['network']['bridge'] or CONF.vmware.integration_bridge
+    ref = get_network_ref(session, cluster, vif, is_neutron)
+    return {'network_name': name,
+            'mac_address': mac,
+            'network_ref': ref,
+            'iface_id': vif['id'],
+            'vif_model': vif_model}
+
+
+def get_vif_info(session, cluster, is_neutron, vif_model, network_info):
+    vif_infos = []
+    if network_info is None:
+        return vif_infos
+    for vif in network_info:
+        vif_infos.append(get_vif_dict(session, cluster, vif_model,
+                         is_neutron, vif))
+    return vif_infos
+
+
+def get_network_device(hardware_devices, mac_address):
+    """Return the network device with MAC 'mac_address'."""
+    if hardware_devices.__class__.__name__ == "ArrayOfVirtualDevice":
+        hardware_devices = hardware_devices.VirtualDevice
+    for device in hardware_devices:
+        if device.__class__.__name__ in vm_util.ALL_SUPPORTED_NETWORK_DEVICES:
+            if hasattr(device, 'macAddress'):
+                if device.macAddress == mac_address:
+                    return device

@@ -22,7 +22,7 @@ from nova.api.openstack import extensions as exts
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 auth_shelve = exts.extension_authorizer('compute', 'shelve')
@@ -41,7 +41,7 @@ class ShelveController(wsgi.Controller):
                                         want_objects=True)
         except exception.InstanceNotFound:
             msg = _("Server not found")
-            raise exc.HTTPNotFound(msg)
+            raise exc.HTTPNotFound(explanation=msg)
 
     @wsgi.action('shelve')
     def _shelve(self, req, id, body):
@@ -52,6 +52,8 @@ class ShelveController(wsgi.Controller):
         instance = self._get_instance(context, id)
         try:
             self.compute_api.shelve(context, instance)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                                                                   'shelve')
@@ -67,6 +69,8 @@ class ShelveController(wsgi.Controller):
         instance = self._get_instance(context, id)
         try:
             self.compute_api.shelve_offload(context, instance)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                                                               'shelveOffload')
@@ -81,6 +85,8 @@ class ShelveController(wsgi.Controller):
         instance = self._get_instance(context, id)
         try:
             self.compute_api.unshelve(context, instance)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                                                                   'unshelve')
@@ -93,7 +99,7 @@ class Shelve(exts.ExtensionDescriptor):
     name = "Shelve"
     alias = "os-shelve"
     namespace = "http://docs.openstack.org/compute/ext/shelve/api/v1.1"
-    updated = "2013-04-06T00:00:00+00:00"
+    updated = "2013-04-06T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = ShelveController()

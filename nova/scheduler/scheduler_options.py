@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -23,13 +21,13 @@ dynamic configuration.
 """
 
 import datetime
-import json
 import os
 
 from oslo.config import cfg
 
+from nova.i18n import _
 from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
+from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 
@@ -46,8 +44,7 @@ LOG = logging.getLogger(__name__)
 
 
 class SchedulerOptions(object):
-    """
-    SchedulerOptions monitors a local .json file for changes and loads it
+    """SchedulerOptions monitors a local .json file for changes and loads it
     if needed. This file is converted to a data structure and passed into
     the filtering and weighing functions which can use it for dynamic
     configuration.
@@ -76,7 +73,7 @@ class SchedulerOptions(object):
     def _load_file(self, handle):
         """Decode the JSON file. Broken out for testing."""
         try:
-            return json.load(handle)
+            return jsonutils.load(handle)
         except ValueError as e:
             LOG.exception(_("Could not decode scheduler options: '%s'"), e)
             return {}

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Eldar Nugaev
 # All Rights Reserved.
 #
@@ -15,15 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import webob
 
 from nova.api.openstack.compute.plugins.v3 import keypairs
-from nova.api.openstack import wsgi
 from nova import db
 from nova import exception
 from nova.openstack.common import jsonutils
-from nova.openstack.common import policy
+from nova.openstack.common import policy as common_policy
+from nova import policy
 from nova import quota
 from nova import test
 from nova.tests.api.openstack import fakes
@@ -101,6 +98,30 @@ class KeypairsTest(test.TestCase):
         self.assertTrue(len(res_dict['keypair']['fingerprint']) > 0)
         self.assertTrue(len(res_dict['keypair']['private_key']) > 0)
 
+    def test_keypair_create_without_keypair(self):
+        body = {'foo': None}
+        req = webob.Request.blank('/v3/keypairs')
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['Content-Type'] = 'application/json'
+        res = req.get_response(self.app)
+        self.assertEqual(res.status_int, 400)
+        jsonutils.loads(res.body)
+
+    def test_keypair_create_without_name(self):
+        body = {'keypair': {'public_key': 'public key'}}
+        req = webob.Request.blank('/v3/keypairs')
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['Content-Type'] = 'application/json'
+        res = req.get_response(self.app)
+        self.assertEqual(res.status_int, 400)
+        res_dict = jsonutils.loads(res.body)
+        self.assertEqual("Invalid input for field/attribute keypair. "
+                         "Value: {u'public_key': u'public key'}. "
+                         "'name' is a required property",
+                         res_dict['badRequest']['message'])
+
     def test_keypair_create_with_empty_name(self):
         body = {'keypair': {'name': ''}}
         req = webob.Request.blank('/v3/keypairs')
@@ -110,15 +131,15 @@ class KeypairsTest(test.TestCase):
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 400)
         res_dict = jsonutils.loads(res.body)
-        self.assertEqual(
-            'Keypair data is invalid: '
-            'Keypair name must be between 1 and 255 characters long',
-            res_dict['badRequest']['message'])
+        self.assertEqual("Invalid input for field/attribute name. "
+                         "Value: . u'' is too short",
+                         res_dict['badRequest']['message'])
 
     def test_keypair_create_with_name_too_long(self):
+        name = 'a' * 256
         body = {
             'keypair': {
-                'name': 'a' * 256
+                'name': name
             }
         }
         req = webob.Request.blank('/v3/keypairs')
@@ -128,10 +149,9 @@ class KeypairsTest(test.TestCase):
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 400)
         res_dict = jsonutils.loads(res.body)
-        self.assertEqual(
-            'Keypair data is invalid: '
-            'Keypair name must be between 1 and 255 characters long',
-            res_dict['badRequest']['message'])
+        expected_message = "Invalid input for field/attribute name. "\
+                           "Value: %s. u'%s' is too long" % (name, name)
+        self.assertEqual(expected_message, res_dict['badRequest']['message'])
 
     def test_keypair_create_with_non_alphanumeric_name(self):
         body = {
@@ -148,8 +168,8 @@ class KeypairsTest(test.TestCase):
         self.assertEqual(res.status_int, 400)
         res_dict = jsonutils.loads(res.body)
         self.assertEqual(
-            "Keypair data is invalid: "
-            "Keypair name contains unsafe characters",
+            "Invalid input for field/attribute name. Value: test/keypair. "
+            "u'test/keypair' does not match '^(?! )[a-zA-Z0-9. _-]+(?<! )$'",
             res_dict['badRequest']['message'])
 
     def test_keypair_import(self):
@@ -340,7 +360,7 @@ class KeypairsTest(test.TestCase):
         self.stubs.Set(db, 'instance_get_all_by_filters',
                         fakes.fake_instance_get_all_by_filters())
         self.stubs.Set(db, 'instance_get_by_uuid', fakes.fake_instance_get())
-        req = fakes.HTTPRequest.blank('/v3/servers/detail')
+        req = webob.Request.blank('/v3/servers/detail')
         res = req.get_response(self.app)
         server_dicts = jsonutils.loads(res.body)['servers']
         self.assertEqual(len(server_dicts), 5)
@@ -356,10 +376,8 @@ class KeypairsTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers['Content-Type'] = 'application/json'
         res = req.get_response(self.app)
-        res_dict = jsonutils.loads(res.body)
+        jsonutils.loads(res.body)
         self.assertEqual(res.status_int, 400)
-        self.assertEqual(res_dict['badRequest']['message'],
-                         "Invalid request body")
 
 
 class KeypairPolicyTest(test.TestCase):
@@ -382,131 +400,73 @@ class KeypairPolicyTest(test.TestCase):
                        db_key_pair_destroy)
 
     def test_keypair_list_fail_policy(self):
-        rules = policy.Rules({'compute_extension:v3:keypairs:index':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:v3:keypairs:index':
+                    common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs')
-        self.assertRaises(exception.NotAuthorized,
+        req = fakes.HTTPRequestV3.blank('/keypairs')
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.index,
                           req)
 
     def test_keypair_list_pass_policy(self):
-        rules = policy.Rules({'compute_extension:v3:keypairs:index':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:v3:keypairs:index':
+                     common_policy.parse_rule('')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs')
+        req = fakes.HTTPRequestV3.blank('/keypairs')
         res = self.KeyPairController.index(req)
         self.assertIn('keypairs', res)
 
     def test_keypair_show_fail_policy(self):
-        rules = policy.Rules({'compute_extension:v3:keypairs:show':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:v3:keypairs:show':
+                  common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs/FAKE')
-        self.assertRaises(exception.NotAuthorized,
+        req = fakes.HTTPRequestV3.blank('/keypairs/FAKE')
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.show,
                           req, 'FAKE')
 
     def test_keypair_show_pass_policy(self):
-        rules = policy.Rules({'compute_extension:v3:keypairs:show':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:v3:keypairs:show':
+                    common_policy.parse_rule('')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs/FAKE')
+        req = fakes.HTTPRequestV3.blank('/keypairs/FAKE')
         res = self.KeyPairController.show(req, 'FAKE')
         self.assertIn('keypair', res)
 
     def test_keypair_create_fail_policy(self):
-        rules = policy.Rules({'compute_extension:v3:keypairs:create':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:v3:keypairs:create':
+                     common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs')
+        req = fakes.HTTPRequestV3.blank('/keypairs')
         req.method = 'POST'
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.create,
-                          req, {})
+                          req, body={'keypair': {'name': 'create_test'}})
 
     def test_keypair_create_pass_policy(self):
         body = {'keypair': {'name': 'create_test'}}
-        rules = policy.Rules({'compute_extension:v3:keypairs:create':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:v3:keypairs:create':
+                     common_policy.parse_rule('')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs')
+        req = fakes.HTTPRequestV3.blank('/keypairs')
         req.method = 'POST'
-        res = self.KeyPairController.create(req, body)
+        res = self.KeyPairController.create(req, body=body)
         self.assertIn('keypair', res)
 
     def test_keypair_delete_fail_policy(self):
-        rules = policy.Rules({'compute_extension:v3:keypairs:delete':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:v3:keypairs:delete':
+                     common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs/FAKE')
+        req = fakes.HTTPRequestV3.blank('/keypairs/FAKE')
         req.method = 'DELETE'
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.delete,
                           req, 'FAKE')
 
     def test_keypair_delete_pass_policy(self):
-        rules = policy.Rules({'compute_extension:v3:keypairs:delete':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:v3:keypairs:delete':
+                     common_policy.parse_rule('')}
         policy.set_rules(rules)
-        req = fakes.HTTPRequest.blank('/v3/keypairs/FAKE')
+        req = fakes.HTTPRequestV3.blank('/keypairs/FAKE')
         req.method = 'DELETE'
         self.assertIsNone(self.KeyPairController.delete(req, 'FAKE'))
-
-
-class KeypairsXMLSerializerTest(test.TestCase):
-    def setUp(self):
-        super(KeypairsXMLSerializerTest, self).setUp()
-        self.deserializer = wsgi.XMLDeserializer()
-
-    def test_default_serializer(self):
-        exemplar = dict(keypair=dict(
-                public_key='fake_public_key',
-                private_key='fake_private_key',
-                fingerprint='fake_fingerprint',
-                user_id='fake_user_id',
-                name='fake_key_name'))
-        serializer = keypairs.KeypairTemplate()
-        text = serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('keypair', tree.tag)
-        for child in tree:
-            self.assertIn(child.tag, exemplar['keypair'])
-            self.assertEqual(child.text, exemplar['keypair'][child.tag])
-
-    def test_index_serializer(self):
-        exemplar = dict(keypairs=[
-                dict(keypair=dict(
-                        name='key1_name',
-                        public_key='key1_key',
-                        fingerprint='key1_fingerprint')),
-                dict(keypair=dict(
-                        name='key2_name',
-                        public_key='key2_key',
-                        fingerprint='key2_fingerprint'))])
-        serializer = keypairs.KeypairsTemplate()
-        text = serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('keypairs', tree.tag)
-        self.assertEqual(len(exemplar['keypairs']), len(tree))
-        for idx, keypair in enumerate(tree):
-            self.assertEqual('keypair', keypair.tag)
-            kp_data = exemplar['keypairs'][idx]['keypair']
-            for child in keypair:
-                self.assertIn(child.tag, kp_data)
-                self.assertEqual(child.text, kp_data[child.tag])
-
-    def test_deserializer(self):
-        exemplar = dict(keypair=dict(
-                name='key_name',
-                public_key='public_key'))
-        intext = ("<?xml version='1.0' encoding='UTF-8'?>\n"
-                  '<keypair><name>key_name</name>'
-                  '<public_key>public_key</public_key></keypair>')
-
-        result = self.deserializer.deserialize(intext)['body']
-        self.assertEqual(result, exemplar)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Metacloud Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,8 +20,8 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import exception
+from nova.i18n import _
 from nova.network.security_group import openstack_driver
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import xmlutils
 
@@ -151,11 +149,12 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase):
 
         id = self.security_group_api.validate_id(id)
 
-        LOG.debug(_("Showing security_group_default_rule with id %s") % id)
+        LOG.debug("Showing security_group_default_rule with id %s", id)
         try:
             rule = self.security_group_api.get_default_rule(context, id)
         except exception.SecurityGroupDefaultRuleNotFound:
-            raise exc.HTTPNotFound(_("security group default rule not found"))
+            msg = _("security group default rule not found")
+            raise exc.HTTPNotFound(explanation=msg)
 
         fmt_rule = self._format_security_group_default_rule(rule)
         return {"security_group_default_rule": fmt_rule}
@@ -202,7 +201,7 @@ class Security_group_default_rules(extensions.ExtensionDescriptor):
     alias = "os-security-group-default-rules"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "securitygroupdefaultrules/api/v1.1")
-    updated = "2013-02-05T00:00:00+00:00"
+    updated = "2013-02-05T00:00:00Z"
 
     def get_resources(self):
         resources = [

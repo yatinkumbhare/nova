@@ -12,10 +12,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
+
 from nova import db
 from nova import exception
 from nova.objects import aggregate
 from nova.openstack.common import timeutils
+from nova.tests import fake_notifier
 from nova.tests.objects import test_objects
 
 
@@ -53,6 +56,18 @@ class _TestAggregateObject(object):
         agg.create(self.context)
         self.compare_obj(agg, fake_aggregate, subs=SUBS)
 
+    def test_recreate_fails(self):
+        self.mox.StubOutWithMock(db, 'aggregate_create')
+        db.aggregate_create(self.context, {'name': 'foo'},
+                            metadata={'one': 'two'}).AndReturn(fake_aggregate)
+        self.mox.ReplayAll()
+        agg = aggregate.Aggregate()
+        agg.name = 'foo'
+        agg.metadata = {'one': 'two'}
+        agg.create(self.context)
+        self.assertRaises(exception.ObjectActionError, agg.create,
+                          self.context)
+
     def test_save(self):
         self.mox.StubOutWithMock(db, 'aggregate_update')
         db.aggregate_update(self.context, 123, {'name': 'baz'}).AndReturn(
@@ -79,12 +94,22 @@ class _TestAggregateObject(object):
         db.aggregate_metadata_delete(self.context, 123, 'todelete')
         db.aggregate_metadata_add(self.context, 123, {'toadd': 'myval'})
         self.mox.ReplayAll()
+        fake_notifier.NOTIFICATIONS = []
         agg = aggregate.Aggregate()
         agg._context = self.context
         agg.id = 123
         agg.metadata = {'foo': 'bar'}
         agg.obj_reset_changes()
         agg.update_metadata({'todelete': None, 'toadd': 'myval'})
+        self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
+        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual('aggregate.updatemetadata.start', msg.event_type)
+        self.assertEqual({'todelete': None, 'toadd': 'myval'},
+                         msg.payload['meta_data'])
+        msg = fake_notifier.NOTIFICATIONS[1]
+        self.assertEqual('aggregate.updatemetadata.end', msg.event_type)
+        self.assertEqual({'todelete': None, 'toadd': 'myval'},
+                         msg.payload['meta_data'])
         self.assertEqual({'foo': 'bar', 'toadd': 'myval'}, agg.metadata)
 
     def test_destroy(self):
@@ -137,6 +162,29 @@ class _TestAggregateObject(object):
                                  ).AndReturn([fake_aggregate])
         self.mox.ReplayAll()
         aggs = aggregate.AggregateList.get_by_host(self.context, 'fake-host')
+        self.assertEqual(1, len(aggs))
+        self.compare_obj(aggs[0], fake_aggregate, subs=SUBS)
+
+    @mock.patch('nova.db.aggregate_get_by_metadata_key')
+    def test_get_by_metadata_key(self, get_by_metadata_key):
+        get_by_metadata_key.return_value = [fake_aggregate]
+        aggs = aggregate.AggregateList.get_by_metadata_key(
+            self.context, 'this')
+        self.assertEqual(1, len(aggs))
+        self.compare_obj(aggs[0], fake_aggregate, subs=SUBS)
+
+    @mock.patch('nova.db.aggregate_get_by_metadata_key')
+    def test_get_by_metadata_key_and_hosts_no_match(self, get_by_metadata_key):
+        get_by_metadata_key.return_value = [fake_aggregate]
+        aggs = aggregate.AggregateList.get_by_metadata_key(
+            self.context, 'this', hosts=['baz'])
+        self.assertEqual(0, len(aggs))
+
+    @mock.patch('nova.db.aggregate_get_by_metadata_key')
+    def test_get_by_metadata_key_and_hosts_match(self, get_by_metadata_key):
+        get_by_metadata_key.return_value = [fake_aggregate]
+        aggs = aggregate.AggregateList.get_by_metadata_key(
+            self.context, 'this', hosts=['foo', 'bar'])
         self.assertEqual(1, len(aggs))
         self.compare_obj(aggs[0], fake_aggregate, subs=SUBS)
 

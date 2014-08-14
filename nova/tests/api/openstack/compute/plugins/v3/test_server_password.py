@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 from oslo.config import cfg
 import webob
 
@@ -22,6 +21,7 @@ from nova import compute
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 
 
 CONF = cfg.CONF
@@ -33,7 +33,13 @@ class ServerPasswordTest(test.TestCase):
     def setUp(self):
         super(ServerPasswordTest, self).setUp()
         fakes.stub_out_nw_api(self.stubs)
-        self.stubs.Set(compute.api.API, 'get', lambda *a, **kw: {'uuid': ''})
+        self.stubs.Set(
+            compute.api.API, 'get',
+            lambda self, ctxt, *a, **kw:
+                fake_instance.fake_instance_obj(
+                ctxt,
+                system_metadata={},
+                expected_attrs=['system_metadata']))
         self.password = 'fakepass'
 
         def fake_extract_password(instance):
@@ -72,11 +78,3 @@ class ServerPasswordTest(test.TestCase):
         res = self._make_request(url)
         self.assertEqual(res.status_int, 200)
         self.assertEqual(self._get_pass(res.body), '')
-
-
-class ServerPasswordXmlTest(ServerPasswordTest):
-    content_type = 'application/xml'
-
-    def _get_pass(self, body):
-        # NOTE(vish): first element is password
-        return etree.XML(body).text or ''

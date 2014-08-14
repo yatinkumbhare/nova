@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 Intel, Inc.
 # Copyright (c) 2011-2012 OpenStack Foundation
 # All Rights Reserved.
@@ -20,14 +18,14 @@
 Filter to add support for Trusted Computing Pools.
 
 Filter that only schedules tasks on a host if the integrity (trust)
-of that host matches the trust requested in the `extra_specs' for the
-flavor.  The `extra_specs' will contain a key/value pair where the
-key is `trust'.  The value of this pair (`trusted'/`untrusted') must
+of that host matches the trust requested in the ``extra_specs`` for the
+flavor.  The ``extra_specs`` will contain a key/value pair where the
+key is ``trust``.  The value of this pair (``trusted``/``untrusted``) must
 match the integrity of that host (obtained from the Attestation
 service) before the task can be scheduled on that host.
 
 Note that the parameters to control access to the Attestation Service
-are in the `nova.conf' file in a separate `trust' section.  For example,
+are in the ``nova.conf`` file in a separate ``trust`` section.  For example,
 the config file will look something like:
 
     [DEFAULT]
@@ -36,7 +34,8 @@ the config file will look something like:
     [trust]
     server=attester.mynetwork.com
 
-Details on the specific parameters can be found in the file `trust_attest.py'.
+Details on the specific parameters can be found in the file
+``trust_attest.py``.
 
 Details on setting up and using an Attestation Service can be found at
 the Open Attestation project at:
@@ -52,7 +51,6 @@ from oslo.config import cfg
 
 from nova import context
 from nova import db
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
@@ -62,17 +60,17 @@ LOG = logging.getLogger(__name__)
 
 trusted_opts = [
     cfg.StrOpt('attestation_server',
-               help='attestation server http'),
+               help='Attestation server HTTP'),
     cfg.StrOpt('attestation_server_ca_file',
-               help='attestation server Cert file for Identity verification'),
+               help='Attestation server Cert file for Identity verification'),
     cfg.StrOpt('attestation_port',
                default='8443',
-               help='attestation server port'),
+               help='Attestation server port'),
     cfg.StrOpt('attestation_api_url',
                default='/OpenAttestationWebServices/V1.0',
-               help='attestation web API URL'),
+               help='Attestation web API URL'),
     cfg.StrOpt('attestation_auth_blob',
-               help='attestation authorization blob - must change'),
+               help='Attestation authorization blob - must change'),
     cfg.IntOpt('attestation_auth_timeout',
                default=60,
                help='Attestation status cache valid period length'),
@@ -85,8 +83,7 @@ CONF.register_opts(trusted_opts, group=trust_group)
 
 
 class HTTPSClientAuthConnection(httplib.HTTPSConnection):
-    """
-    Class to make a HTTPS connection, with support for full client-based
+    """Class to make a HTTPS connection, with support for full client-based
     SSL Authentication
     """
 
@@ -102,8 +99,7 @@ class HTTPSClientAuthConnection(httplib.HTTPSConnection):
         self.timeout = timeout
 
     def connect(self):
-        """
-        Connect to a host on a given (SSL) port.
+        """Connect to a host on a given (SSL) port.
         If ca_file is pointing somewhere, use it to check Server Certificate.
 
         Redefined/copied and extended from httplib.py:1105 (Python 2.6.x).
@@ -180,7 +176,7 @@ class AttestationService(object):
         result = None
 
         status, data = self._request("POST", "PollHosts", hosts)
-        if data != None:
+        if data is not None:
             result = data.get('hosts')
 
         return result
@@ -207,11 +203,7 @@ class ComputeAttestationCache(object):
         # host in the first round that scheduler invokes us.
         computes = db.compute_node_get_all(admin)
         for compute in computes:
-            service = compute['service']
-            if not service:
-                LOG.warn(_("No service for compute ID %s") % compute['id'])
-                continue
-            host = service['host']
+            host = compute['hypervisor_hostname']
             self._init_cache_entry(host)
 
     def _cache_valid(self, host):
@@ -285,10 +277,10 @@ class TrustedFilter(filters.BaseHostFilter):
         self.compute_attestation = ComputeAttestation()
 
     def host_passes(self, host_state, filter_properties):
-        instance = filter_properties.get('instance_type', {})
-        extra = instance.get('extra_specs', {})
+        instance_type = filter_properties.get('instance_type', {})
+        extra = instance_type.get('extra_specs', {})
         trust = extra.get('trust:trusted_host')
-        host = host_state.host
+        host = host_state.nodename
         if trust:
             return self.compute_attestation.is_trusted(host, trust)
         return True

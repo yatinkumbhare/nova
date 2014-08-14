@@ -1,8 +1,8 @@
 {
     "servers": [
     {
-            "updated": "%(timestamp)s",
-            "created": "%(timestamp)s",
+            "updated": "%(isotime)s",
+            "created": "%(isotime)s",
             "addresses": {
                 "private": [
                     {
@@ -51,7 +51,7 @@
             "status": "ACTIVE",
             "tenant_id": "openstack",
             "user_id": "fake",
-            "security_groups": [{"name": "test"}],
+            "os-security-groups:security_groups": [{"name": "test"}],
             "key_name": null
     }]
 }

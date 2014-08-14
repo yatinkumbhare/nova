@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2011 Grid Dynamics
 # Copyright 2011 Eldar Nugaev, Kirill Shileev, Ilya Alekseyev
@@ -17,13 +15,14 @@
 #    under the License.
 
 import re
+
 import webob
 
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 authorize = extensions.extension_authorizer('compute', 'console_output')
@@ -41,9 +40,11 @@ class ConsoleOutputController(wsgi.Controller):
         authorize(context)
 
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id,
+                                            want_objects=True)
         except exception.NotFound:
-            raise webob.exc.HTTPNotFound(_('Instance not found'))
+            msg = _('Instance not found')
+            raise webob.exc.HTTPNotFound(explanation=msg)
 
         try:
             length = body['os-getConsoleOutput'].get('length')
@@ -67,9 +68,13 @@ class ConsoleOutputController(wsgi.Controller):
                                                          instance,
                                                          length)
         except exception.NotFound:
-            raise webob.exc.HTTPNotFound(_('Unable to get console'))
+            msg = _('Unable to get console')
+            raise webob.exc.HTTPNotFound(explanation=msg)
         except exception.InstanceNotReady as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
+        except NotImplementedError:
+            msg = _("Unable to get console log, functionality not implemented")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
 
         # XML output is not correctly escaped, so remove invalid characters
         remove_re = re.compile('[\x00-\x08\x0B-\x1F]')
@@ -85,7 +90,7 @@ class Console_output(extensions.ExtensionDescriptor):
     alias = "os-console-output"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "os-console-output/api/v2")
-    updated = "2011-12-08T00:00:00+00:00"
+    updated = "2011-12-08T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = ConsoleOutputController()

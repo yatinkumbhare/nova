@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
@@ -156,7 +154,7 @@ class _FakeImageService(object):
         self._imagedata = {}
         super(_FakeImageService, self).__init__()
 
-    #TODO(bcwaldon): implement optional kwargs such as limit, sort_dir
+    # TODO(bcwaldon): implement optional kwargs such as limit, sort_dir
     def detail(self, context, **kwargs):
         """Return list of detailed image information."""
         return copy.deepcopy(self.images.values())
@@ -169,7 +167,7 @@ class _FakeImageService(object):
             with open(dst_path, 'wb') as data:
                 data.write(self._imagedata.get(image_id, ''))
 
-    def show(self, context, image_id):
+    def show(self, context, image_id, include_locations=False):
         """Get data about specified image.
 
         Returns a dict containing image data for the given opaque image id.

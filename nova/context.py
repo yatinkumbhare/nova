@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -25,7 +23,7 @@ import uuid
 import six
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import local
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
@@ -51,16 +49,16 @@ class RequestContext(object):
                  request_id=None, auth_token=None, overwrite=True,
                  quota_class=None, user_name=None, project_name=None,
                  service_catalog=None, instance_lock_checked=False, **kwargs):
-        """
-        :param read_deleted: 'no' indicates deleted records are hidden, 'yes'
-            indicates deleted records are visible, 'only' indicates that
-            *only* deleted records are visible.
+        """:param read_deleted: 'no' indicates deleted records are hidden,
+                'yes' indicates deleted records are visible,
+                'only' indicates that *only* deleted records are visible.
 
-        :param overwrite: Set to False to ensure that the greenthread local
-            copy of the index is not overwritten.
 
-        :param kwargs: Extra arguments that might be present, but we ignore
-            because they possibly came in from older rpc messages.
+           :param overwrite: Set to False to ensure that the greenthread local
+                copy of the index is not overwritten.
+
+           :param kwargs: Extra arguments that might be present, but we ignore
+                because they possibly came in from older rpc messages.
         """
         if kwargs:
             LOG.warn(_('Arguments dropped when creating context: %s') %
@@ -84,7 +82,7 @@ class RequestContext(object):
         if service_catalog:
             # Only include required parts of service_catalog
             self.service_catalog = [s for s in service_catalog
-                if s.get('type') in ('volume',)]
+                if s.get('type') in ('volume', 'volumev2')]
         else:
             # if list is empty or none
             self.service_catalog = []
@@ -198,35 +196,35 @@ def require_admin_context(ctxt):
 
 
 def require_context(ctxt):
-    """Raise exception.NotAuthorized() if context is not a user or an
+    """Raise exception.Forbidden() if context is not a user or an
     admin context.
     """
     if not ctxt.is_admin and not is_user_context(ctxt):
-        raise exception.NotAuthorized()
+        raise exception.Forbidden()
 
 
 def authorize_project_context(context, project_id):
     """Ensures a request has permission to access the given project."""
     if is_user_context(context):
         if not context.project_id:
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
         elif context.project_id != project_id:
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
 
 
 def authorize_user_context(context, user_id):
     """Ensures a request has permission to access the given user."""
     if is_user_context(context):
         if not context.user_id:
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
         elif context.user_id != user_id:
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
 
 
 def authorize_quota_class_context(context, class_name):
     """Ensures a request has permission to access the given quota class."""
     if is_user_context(context):
         if not context.quota_class:
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
         elif context.quota_class != class_name:
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()

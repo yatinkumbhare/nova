@@ -14,6 +14,8 @@
 
 import contextlib
 import cPickle as pickle
+import errno
+import socket
 import time
 import xmlrpclib
 
@@ -23,11 +25,12 @@ from oslo.config import cfg
 
 from nova import context
 from nova import exception
-from nova.objects import aggregate as aggregate_obj
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova import objects
 from nova.openstack.common import log as logging
 from nova.openstack.common import versionutils
 from nova import utils
+from nova.virt.xenapi.client import objects as cli_objects
 from nova.virt.xenapi import pool
 from nova.virt.xenapi import pool_states
 
@@ -36,13 +39,9 @@ LOG = logging.getLogger(__name__)
 xenapi_session_opts = [
     cfg.IntOpt('login_timeout',
                default=10,
-               deprecated_name='xenapi_login_timeout',
-               deprecated_group='DEFAULT',
                help='Timeout in seconds for XenAPI login.'),
     cfg.IntOpt('connection_concurrent',
                default=5,
-               deprecated_name='xenapi_connection_concurrent',
-               deprecated_group='DEFAULT',
                help='Maximum number of concurrent XenAPI connections. '
                     'Used only if compute_driver=xenapi.XenAPIDriver'),
     ]
@@ -52,6 +51,19 @@ CONF.register_opts(xenapi_session_opts, 'xenserver')
 CONF.import_opt('host', 'nova.netconf')
 
 
+def apply_session_helpers(session):
+    session.VM = cli_objects.VM(session)
+    session.SR = cli_objects.SR(session)
+    session.VDI = cli_objects.VDI(session)
+    session.VBD = cli_objects.VBD(session)
+    session.PBD = cli_objects.PBD(session)
+    session.PIF = cli_objects.PIF(session)
+    session.VLAN = cli_objects.VLAN(session)
+    session.host = cli_objects.Host(session)
+    session.network = cli_objects.Network(session)
+    session.pool = cli_objects.Pool(session)
+
+
 class XenAPISession(object):
     """The session to invoke XenAPI SDK calls."""
 
@@ -59,7 +71,7 @@ class XenAPISession(object):
     # changed in development environments.
     # MAJOR VERSION: Incompatible changes with the plugins
     # MINOR VERSION: Compatible changes, new plguins, etc
-    PLUGIN_REQUIRED_VERSION = '1.0'
+    PLUGIN_REQUIRED_VERSION = '1.2'
 
     def __init__(self, url, user, pw):
         import XenAPI
@@ -71,10 +83,13 @@ class XenAPISession(object):
         url = self._create_first_session(url, user, pw, exception)
         self._populate_session_pool(url, user, pw, exception)
         self.host_uuid = self._get_host_uuid()
+        self.host_ref = self._get_host_ref()
         self.product_version, self.product_brand = \
             self._get_product_version_and_brand()
 
         self._verify_plugin_version()
+
+        apply_session_helpers(self)
 
     def _verify_plugin_version(self):
         requested_version = self.PLUGIN_REQUIRED_VERSION
@@ -113,7 +128,7 @@ class XenAPISession(object):
 
     def _get_host_uuid(self):
         if self.is_slave:
-            aggr = aggregate_obj.AggregateList.get_by_host(
+            aggr = objects.AggregateList.get_by_host(
                 context.get_admin_context(),
                 CONF.host, key=pool_states.POOL_FLAG)[0]
             if not aggr:
@@ -145,8 +160,7 @@ class XenAPISession(object):
         return product_version, product_brand
 
     def _get_software_version(self):
-        host = self.get_xenapi_host()
-        return self.call_xenapi('host.get_software_version', host)
+        return self.call_xenapi('host.get_software_version', self.host_ref)
 
     def get_session_id(self):
         """Return a string session_id.  Used for vnc consoles."""
@@ -162,7 +176,7 @@ class XenAPISession(object):
         finally:
             self._sessions.put(session)
 
-    def get_xenapi_host(self):
+    def _get_host_ref(self):
         """Return the xenapi host on which nova-compute runs on."""
         with self._get_session() as session:
             return session.xenapi.host.get_by_uuid(self.host_uuid)
@@ -174,12 +188,6 @@ class XenAPISession(object):
 
     def call_plugin(self, plugin, fn, args):
         """Call host.call_plugin on a background thread."""
-        # NOTE(johannes): Fetch host before we acquire a session. Since
-        # get_xenapi_host() acquires a session too, it can result in a
-        # deadlock if multiple greenthreads race with each other. See
-        # bug 924918
-        host = self.get_xenapi_host()
-
         # NOTE(armando): pass the host uuid along with the args so that
         # the plugin gets executed on the right host when using XS pools
         args['host_uuid'] = self.host_uuid
@@ -187,7 +195,7 @@ class XenAPISession(object):
         with self._get_session() as session:
             return self._unwrap_plugin_exceptions(
                                  session.xenapi.host.call_plugin,
-                                 host, plugin, fn, args)
+                                 self.host_ref, plugin, fn, args)
 
     def call_plugin_serialized(self, plugin, fn, *args, **kwargs):
         params = {'params': pickle.dumps(dict(args=args, kwargs=kwargs))}
@@ -200,35 +208,46 @@ class XenAPISession(object):
         attempts = num_retries + 1
         sleep_time = 0.5
         for attempt in xrange(1, attempts + 1):
-            LOG.info(_('%(plugin)s.%(fn)s attempt %(attempt)d/%(attempts)d'),
-                     {'plugin': plugin, 'fn': fn, 'attempt': attempt,
-                      'attempts': attempts})
             try:
                 if attempt > 1:
                     time.sleep(sleep_time)
                     sleep_time = min(2 * sleep_time, 15)
 
+                callback_result = None
                 if callback:
-                    callback(kwargs)
+                    callback_result = callback(kwargs)
 
+                msg = ('%(plugin)s.%(fn)s attempt %(attempt)d/%(attempts)d, '
+                       'callback_result: %(callback_result)s')
+                LOG.debug(msg,
+                          {'plugin': plugin, 'fn': fn, 'attempt': attempt,
+                           'attempts': attempts,
+                           'callback_result': callback_result})
                 return self.call_plugin_serialized(plugin, fn, *args, **kwargs)
             except self.XenAPI.Failure as exc:
-                if self._is_retryable_exception(exc):
+                if self._is_retryable_exception(exc, fn):
                     LOG.warn(_('%(plugin)s.%(fn)s failed. Retrying call.')
                              % {'plugin': plugin, 'fn': fn})
+                else:
+                    raise
+            except socket.error as exc:
+                if exc.errno == errno.ECONNRESET:
+                    LOG.warn(_('Lost connection to XenAPI during call to '
+                               '%(plugin)s.%(fn)s.  Retrying call.') %
+                               {'plugin': plugin, 'fn': fn})
                 else:
                     raise
 
         raise exception.PluginRetriesExceeded(num_retries=num_retries)
 
-    def _is_retryable_exception(self, exc):
+    def _is_retryable_exception(self, exc, fn):
         _type, method, error = exc.details[:3]
         if error == 'RetryableError':
-            LOG.debug(_("RetryableError, so retrying upload_vhd"),
+            LOG.debug("RetryableError, so retrying %(fn)s", {'fn': fn},
                       exc_info=True)
             return True
         elif "signal" in method:
-            LOG.debug(_("Error due to a signal, retrying upload_vhd"),
+            LOG.debug("Error due to a signal, retrying %(fn)s", {'fn': fn},
                       exc_info=True)
             return True
         else:
@@ -246,7 +265,7 @@ class XenAPISession(object):
         try:
             return func(*args, **kwargs)
         except self.XenAPI.Failure as exc:
-            LOG.debug(_("Got exception: %s"), exc)
+            LOG.debug("Got exception: %s", exc)
             if (len(exc.details) == 4 and
                 exc.details[0] == 'XENAPI_PLUGIN_EXCEPTION' and
                     exc.details[2] == 'Failure'):
@@ -260,7 +279,7 @@ class XenAPISession(object):
             else:
                 raise
         except xmlrpclib.ProtocolError as exc:
-            LOG.debug(_("Got exception: %s"), exc)
+            LOG.debug("Got exception: %s", exc)
             raise
 
     def get_rec(self, record_type, ref):
@@ -279,9 +298,4 @@ class XenAPISession(object):
         the `get_all` call and the `get_record` call.
         """
 
-        for ref in self.call_xenapi('%s.get_all' % record_type):
-            rec = self.get_rec(record_type, ref)
-            # Check to make sure the record still exists. It may have
-            # been deleted between the get_all call and get_record call
-            if rec:
-                yield ref, rec
+        return self.call_xenapi('%s.get_all_records' % record_type).items()

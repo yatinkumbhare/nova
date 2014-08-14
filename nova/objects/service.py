@@ -15,10 +15,9 @@
 from nova import availability_zones
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import base
-from nova.objects import compute_node
 from nova.objects import fields
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 
 
@@ -32,7 +31,7 @@ class Service(base.NovaPersistentObject, base.NovaObject):
     VERSION = '1.2'
 
     fields = {
-        'id': fields.IntegerField(),
+        'id': fields.IntegerField(read_only=True),
         'host': fields.StringField(nullable=True),
         'binary': fields.StringField(nullable=True),
         'topic': fields.StringField(nullable=True),
@@ -52,8 +51,8 @@ class Service(base.NovaPersistentObject, base.NovaObject):
             db_compute = db_service['compute_node'][0]
         except Exception:
             return
-        service.compute_node = compute_node.ComputeNode._from_db_object(
-            context, compute_node.ComputeNode(), db_compute)
+        service.compute_node = objects.ComputeNode._from_db_object(
+            context, objects.ComputeNode(), db_compute)
 
     @staticmethod
     def _from_db_object(context, service, db_service):
@@ -73,7 +72,7 @@ class Service(base.NovaPersistentObject, base.NovaObject):
         if not self._context:
             raise exception.OrphanedObjectError(method='obj_load_attr',
                                                 objtype=self.obj_name())
-        LOG.debug(_("Lazy-loading `%(attr)s' on %(name)s id %(id)s"),
+        LOG.debug("Lazy-loading `%(attr)s' on %(name)s id %(id)s",
                   {'attr': attrname,
                    'name': self.obj_name(),
                    'id': self.id,
@@ -82,7 +81,7 @@ class Service(base.NovaPersistentObject, base.NovaObject):
             raise exception.ObjectActionError(
                 action='obj_load_attr',
                 reason='attribute %s not lazy-loadable' % attrname)
-        self.compute_node = compute_node.ComputeNode.get_by_service_id(
+        self.compute_node = objects.ComputeNode.get_by_service_id(
             self._context, self.id)
 
     @base.remotable_classmethod
@@ -107,6 +106,9 @@ class Service(base.NovaPersistentObject, base.NovaObject):
 
     @base.remotable
     def create(self, context):
+        if self.obj_attr_is_set('id'):
+            raise exception.ObjectActionError(action='create',
+                                              reason='already created')
         updates = self.obj_get_changes()
         db_service = db.service_create(context, updates)
         self._from_db_object(context, self, db_service)
@@ -124,19 +126,29 @@ class Service(base.NovaPersistentObject, base.NovaObject):
 
 
 class ServiceList(base.ObjectListBase, base.NovaObject):
+    # Version 1.0: Initial version
+    #              Service <= version 1.2
+    VERSION = '1.0'
+
     fields = {
         'objects': fields.ListOfObjectsField('Service'),
+        }
+    child_versions = {
+        '1.0': '1.2',
+        # NOTE(danms): Service was at 1.2 before we added this
         }
 
     @base.remotable_classmethod
     def get_by_topic(cls, context, topic):
         db_services = db.service_get_all_by_topic(context, topic)
-        return base.obj_make_list(context, ServiceList(), Service, db_services)
+        return base.obj_make_list(context, cls(context), objects.Service,
+                                  db_services)
 
     @base.remotable_classmethod
     def get_by_host(cls, context, host):
         db_services = db.service_get_all_by_host(context, host)
-        return base.obj_make_list(context, ServiceList(), Service, db_services)
+        return base.obj_make_list(context, cls(context), objects.Service,
+                                  db_services)
 
     @base.remotable_classmethod
     def get_all(cls, context, disabled=None, set_zones=False):
@@ -144,4 +156,5 @@ class ServiceList(base.ObjectListBase, base.NovaObject):
         if set_zones:
             db_services = availability_zones.set_availability_zones(
                 context, db_services)
-        return base.obj_make_list(context, ServiceList(), Service, db_services)
+        return base.obj_make_list(context, cls(context), objects.Service,
+                                  db_services)

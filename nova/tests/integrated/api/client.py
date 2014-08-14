@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright (c) 2011 Justin Santa Barbara
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,9 +14,10 @@
 
 import httplib
 import urllib
-import urlparse
 
-from nova.openstack.common.gettextutils import _
+import six.moves.urllib.parse as urlparse
+
+from nova.i18n import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.tests.image import fake
@@ -127,7 +126,7 @@ class TestOpenStackClient(object):
                                 headers=headers)
 
         http_status = response.status
-        LOG.debug(_("%(auth_uri)s => code %(http_status)s") %
+        LOG.debug("%(auth_uri)s => code %(http_status)s",
                   {'auth_uri': auth_uri, 'http_status': http_status})
 
         if http_status == 401:
@@ -158,7 +157,7 @@ class TestOpenStackClient(object):
         response = self.request(full_uri, **kwargs)
 
         http_status = response.status
-        LOG.debug(_("%(relative_uri)s => code %(http_status)s") %
+        LOG.debug("%(relative_uri)s => code %(http_status)s",
                   {'relative_uri': relative_uri, 'http_status': http_status})
 
         if check_response_status:
@@ -176,7 +175,7 @@ class TestOpenStackClient(object):
 
     def _decode_json(self, response):
         body = response.read()
-        LOG.debug(_("Decoding JSON: %s") % (body))
+        LOG.debug("Decoding JSON: %s", body)
         if body:
             return jsonutils.loads(body)
         else:

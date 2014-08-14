@@ -34,7 +34,7 @@ extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.pngmath',
               'sphinx.ext.ifconfig',
               'sphinx.ext.graphviz',
-              'oslo.sphinx',
+              'oslosphinx',
               ]
 
 todo_include_todos = True
@@ -152,8 +152,6 @@ man_pages = [
      [u'OpenStack'], 1),
     ('man/nova-rootwrap', 'nova-rootwrap', u'Cloud controller fabric',
      [u'OpenStack'], 1),
-    ('man/nova-rpc-zmq-receiver', 'nova-rpc-zmq-receiver', u'Cloud controller fabric',
-     [u'OpenStack'], 1),
     ('man/nova-scheduler', 'nova-scheduler', u'Cloud controller fabric',
      [u'OpenStack'], 1),
     ('man/nova-xvpvncproxy', 'nova-xvpvncproxy', u'Cloud controller fabric',
@@ -196,7 +194,7 @@ man_pages = [
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['_static']
+#html_static_path = ['_static']
 
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.

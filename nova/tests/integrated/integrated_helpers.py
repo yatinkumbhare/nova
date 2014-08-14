@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
 #
@@ -37,7 +35,6 @@ from nova.tests.integrated.api import client
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
-CONF = cfg.CONF
 CONF.import_opt('manager', 'nova.cells.opts', group='cells')
 
 
@@ -72,7 +69,6 @@ class _IntegratedTestBase(test.TestCase):
         f = self._get_flags()
         self.flags(**f)
         self.flags(verbose=True)
-        self.flags(periodic_enable=False)
 
         self.useFixture(test.ReplaceModule('crypto', fake_crypto))
         nova.tests.image.fake.stub_out_image_service(self.stubs)

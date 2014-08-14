@@ -22,7 +22,7 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.virt.baremetal import db
 
 authorize = extensions.extension_authorizer('compute', 'baremetal_nodes')
@@ -57,7 +57,7 @@ def _make_interface_elem(elem):
 
 
 def is_valid_mac(address):
-    """Verify the format of a MAC addres."""
+    """Verify the format of a MAC address."""
 
     class mac_dialect(netaddr.mac_eui48):
         word_fmt = '%.02x'
@@ -242,7 +242,7 @@ class Baremetal_nodes(extensions.ExtensionDescriptor):
     name = "BareMetalNodes"
     alias = "os-baremetal-nodes"
     namespace = "http://docs.openstack.org/compute/ext/baremetal_nodes/api/v2"
-    updated = "2013-01-04T00:00:00+00:00"
+    updated = "2013-01-04T00:00:00Z"
 
     def get_resources(self):
         resources = []

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (C) 2012-2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -79,11 +77,12 @@ from oslo.config import cfg
 from nova import block_device
 from nova.compute import flavors
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova.objects import base as obj_base
 from nova.virt import block_device as driver_block_device
 from nova.virt import configdrive
 from nova.virt import driver
-
+from nova.virt.libvirt import utils as libvirt_utils
 
 CONF = cfg.CONF
 
@@ -219,6 +218,7 @@ def get_disk_bus_for_device_type(virt_type,
        type, return the optimal disk_bus to use for a given
        device type. For example, for a disk on KVM it will
        return 'virtio', while for a CDROM it will return 'ide'
+       on x86_64 and 'scsi' on ppc64.
 
        Returns the disk_bus, or returns None if the device
        type is not supported for this virtualization
@@ -247,7 +247,11 @@ def get_disk_bus_for_device_type(virt_type,
             return "xen"
     elif virt_type in ("qemu", "kvm"):
         if device_type == "cdrom":
-            return "ide"
+            arch = libvirt_utils.get_arch(image_meta)
+            if arch in ("ppc", "ppc64"):
+                return "scsi"
+            else:
+                return "ide"
         elif device_type == "disk":
             return "virtio"
         elif device_type == "floppy":
@@ -341,9 +345,10 @@ def get_config_drive_type():
     return config_drive_type
 
 
-def get_info_from_bdm(virt_type, bdm, mapping={}, disk_bus=None,
+def get_info_from_bdm(virt_type, bdm, mapping=None, disk_bus=None,
                       dev_type=None, allowed_types=None,
                       assigned_devices=None):
+    mapping = mapping or {}
     allowed_types = allowed_types or SUPPORTED_DEVICE_TYPES
     device_name = block_device.strip_dev(get_device_name(bdm))
 
@@ -386,7 +391,10 @@ def get_info_from_bdm(virt_type, bdm, mapping={}, disk_bus=None,
 
 def get_device_name(bdm):
     """Get the device name if present regardless of the bdm format."""
-    return bdm.get('device_name') or bdm.get('mount_device')
+    if isinstance(bdm, obj_base.NovaObject):
+        return bdm.device_name
+    else:
+        return bdm.get('device_name') or bdm.get('mount_device')
 
 
 def get_root_info(virt_type, image_meta, root_bdm, disk_bus, cdrom_bus,
@@ -419,11 +427,11 @@ def get_root_info(virt_type, image_meta, root_bdm, disk_bus, cdrom_bus,
         if not get_device_name(root_bdm) and root_device_name:
             root_bdm = root_bdm.copy()
             root_bdm['device_name'] = root_device_name
-        return get_info_from_bdm(virt_type, root_bdm, {})
+        return get_info_from_bdm(virt_type, root_bdm, {}, disk_bus)
 
 
-def default_device_names(virt_type, instance, root_device_name,
-                         update_func, ephemerals, swap, block_device_mapping):
+def default_device_names(virt_type, context, instance, root_device_name,
+                         ephemerals, swap, block_device_mapping):
 
     block_device_info = {
         'root_device_name': root_device_name,
@@ -434,11 +442,10 @@ def default_device_names(virt_type, instance, root_device_name,
             driver_block_device.convert_volumes(
                 block_device_mapping) +
             driver_block_device.convert_snapshots(
+                block_device_mapping) +
+            driver_block_device.convert_blanks(
                 block_device_mapping))
     }
-
-    devices = dict((bdm.get('id'), bdm) for bdm in
-        itertools.chain(ephemerals, swap, block_device_mapping))
 
     get_disk_info(virt_type, instance, block_device_info)
 
@@ -446,16 +453,7 @@ def default_device_names(virt_type, instance, root_device_name,
                                [block_device_info['swap']] if
                                block_device_info['swap'] else [],
                                block_device_info['block_device_mapping']):
-        if driver_bdm.id in devices:
-            bdm = devices[driver_bdm.id]
-            # NOTE (ndipanov): We may have chosen different values
-            # for bus and type so update those along with device name
-            bdm['device_name'] = get_device_name(driver_bdm)
-            bdm['disk_bus'] = driver_bdm['disk_bus']
-            # Swap does not have device type in driver format
-            bdm['device_type'] = driver_bdm.get('device_type', 'disk')
-            if update_func:
-                update_func(bdm)
+        driver_bdm.save(context)
 
 
 def has_default_ephemeral(instance, disk_bus, block_device_info, mapping):
@@ -505,23 +503,6 @@ def get_disk_mapping(virt_type, instance,
         driver.block_device_info_get_mapping(block_device_info))
      if get_device_name(bdm)]
 
-    if virt_type == "lxc":
-        # NOTE(zul): This information is not used by the libvirt driver
-        # however we need to populate mapping so the image can be
-        # created when the instance is started. This can
-        # be removed when we convert LXC to use block devices.
-        root_disk_bus = disk_bus
-        root_device_type = 'disk'
-
-        root_info = get_next_disk_info(mapping,
-                                       root_disk_bus,
-                                       root_device_type,
-                                       boot_index=1)
-        mapping['root'] = root_info
-        mapping['disk'] = root_info
-
-        return mapping
-
     if rescue:
         rescue_info = get_next_disk_info(mapping,
                                          disk_bus, boot_index=1)
@@ -549,7 +530,7 @@ def get_disk_mapping(virt_type, instance,
     # NOTE (ndipanov): This implicitly relies on image->local BDMs not
     #                  being considered in the driver layer - so missing
     #                  bdm with boot_index 0 means - use image, unless it was
-    #                  overriden. This can happen when using legacy syntax and
+    #                  overridden. This can happen when using legacy syntax and
     #                  no root_device_name is set on the instance.
     if not root_bdm and not block_device.volume_in_mapping(root_info['dev'],
                                                            block_device_info):

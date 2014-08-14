@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -23,7 +21,7 @@ import webob.exc
 
 from nova.api.openstack import extensions
 from nova import compute
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import utils
 
 CONF = cfg.CONF
@@ -130,7 +128,7 @@ class Instance_usage_audit_log(extensions.ExtensionDescriptor):
     name = "OSInstanceUsageAuditLog"
     alias = "os-instance_usage_audit_log"
     namespace = "http://docs.openstack.org/ext/services/api/v1.1"
-    updated = "2012-07-06T01:00:00+00:00"
+    updated = "2012-07-06T01:00:00Z"
 
     def get_resources(self):
         ext = extensions.ResourceExtension('os-instance_usage_audit_log',

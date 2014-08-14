@@ -19,8 +19,8 @@ import tempfile
 from oslo.config import cfg
 
 from nova import exception
+from nova.i18n import _
 from nova.network import dns_driver
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 
 CONF = cfg.CONF
@@ -28,8 +28,7 @@ LOG = logging.getLogger(__name__)
 
 
 class MiniDNS(dns_driver.DNSDriver):
-    """
-    Trivial DNS driver. This will read/write to a local, flat file
+    """Trivial DNS driver. This will read/write to a local, flat file
     and have no effect on your actual DNS system. This class is
     strictly for testing purposes, and should keep you out of dependency
     hell.
@@ -46,7 +45,7 @@ class MiniDNS(dns_driver.DNSDriver):
         else:
             self.tempdir = tempfile.mkdtemp()
             self.filename = os.path.join(self.tempdir, "dnstest.txt")
-        LOG.debug(_('minidns file is |%s|'), self.filename)
+        LOG.debug('minidns file is |%s|', self.filename)
 
         if not os.path.exists(self.filename):
             f = open(self.filename, "w+")

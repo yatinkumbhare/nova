@@ -25,9 +25,9 @@ from nova import compute
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova import exception
+from nova.i18n import _
 from nova import network
 from nova.openstack.common import fileutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import timeutils
 from nova import utils
 
@@ -176,7 +176,7 @@ class Cloudpipe(extensions.ExtensionDescriptor):
     name = "Cloudpipe"
     alias = "os-cloudpipe"
     namespace = "http://docs.openstack.org/compute/ext/cloudpipe/api/v1.1"
-    updated = "2011-12-16T00:00:00+00:00"
+    updated = "2011-12-16T00:00:00Z"
 
     def get_resources(self):
         resources = []

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -29,9 +27,12 @@ import webob.exc
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import exception
+from nova.i18n import _
+from nova.i18n import _LC
+from nova.i18n import _LI
+from nova.i18n import _LW
+from nova.i18n import translate
 from nova import notifications
-from nova.openstack.common import gettextutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import utils
 from nova import wsgi as base_wsgi
@@ -61,11 +62,17 @@ CONF.register_opts(api_opts, api_opts_group)
 # List of v3 API extensions which are considered to form
 # the core API and so must be present
 # TODO(cyeoh): Expand this list as the core APIs are ported to V3
-API_V3_CORE_EXTENSIONS = set(['consoles', 'extensions', 'flavors', 'ips',
-                              'limits', 'servers', 'server-metadata',
-                              'keypairs', 'console-output', 'versions',
-                              'flavor-manage', 'flavor-access',
-                              'flavor-extra-specs'])
+API_V3_CORE_EXTENSIONS = set(['consoles',
+                              'extensions',
+                              'flavor-access',
+                              'flavor-extra-specs',
+                              'flavor-manage',
+                              'flavors',
+                              'ips',
+                              'keypairs',
+                              'server-metadata',
+                              'servers',
+                              'versions'])
 
 
 class FaultWrapper(base_wsgi.Middleware):
@@ -91,7 +98,7 @@ class FaultWrapper(base_wsgi.Middleware):
             status = 500
 
         msg_dict = dict(url=req.url, status=status)
-        LOG.info(_("%(url)s returned with HTTP %(status)d") % msg_dict)
+        LOG.info(_LI("%(url)s returned with HTTP %(status)d"), msg_dict)
         outer = self.status_to_type(status)
         if headers:
             outer.headers = headers
@@ -103,12 +110,8 @@ class FaultWrapper(base_wsgi.Middleware):
         # inconsistent with the EC2 API to hide every exception,
         # including those that are safe to expose, see bug 1021373
         if safe:
-            if isinstance(inner.msg_fmt, gettextutils.Message):
-                user_locale = req.best_match_language()
-                inner_msg = gettextutils.get_localized_message(
-                        inner.msg_fmt, user_locale)
-            else:
-                inner_msg = unicode(inner)
+            user_locale = req.best_match_language()
+            inner_msg = translate(inner.message, user_locale)
             outer.explanation = '%s: %s' % (inner.__class__.__name__,
                                             inner_msg)
 
@@ -168,8 +171,7 @@ class PlainMapper(APIMapper):
 
 
 class APIRouter(base_wsgi.Router):
-    """
-    Routes requests on the OpenStack API to the appropriate controller
+    """Routes requests on the OpenStack API to the appropriate controller
     and method.
     """
     ExtensionManager = None  # override in subclasses
@@ -195,7 +197,7 @@ class APIRouter(base_wsgi.Router):
 
     def _setup_ext_routes(self, mapper, ext_mgr, init_only):
         for resource in ext_mgr.get_resources():
-            LOG.debug(_('Extended resource: %s'),
+            LOG.debug('Extending resource: %s',
                       resource.collection)
 
             if init_only is not None and resource.collection not in init_only:
@@ -230,13 +232,13 @@ class APIRouter(base_wsgi.Router):
             msg_format_dict = {'collection': collection,
                                'ext_name': extension.extension.name}
             if collection not in self.resources:
-                LOG.warning(_('Extension %(ext_name)s: Cannot extend '
-                              'resource %(collection)s: No such resource'),
-                            msg_format_dict)
+                LOG.warn(_LW('Extension %(ext_name)s: Cannot extend '
+                             'resource %(collection)s: No such resource'),
+                         msg_format_dict)
                 continue
 
-            LOG.debug(_('Extension %(ext_name)s extending resource: '
-                        '%(collection)s'),
+            LOG.debug('Extension %(ext_name)s extended resource: '
+                      '%(collection)s',
                       msg_format_dict)
 
             resource = self.resources[collection]
@@ -248,8 +250,7 @@ class APIRouter(base_wsgi.Router):
 
 
 class APIRouterV3(base_wsgi.Router):
-    """
-    Routes requests on the OpenStack v3 API to the appropriate controller
+    """Routes requests on the OpenStack v3 API to the appropriate controller
     and method.
     """
 
@@ -278,33 +279,33 @@ class APIRouterV3(base_wsgi.Router):
                     if ext.obj.alias not in CONF.osapi_v3.extensions_blacklist:
                         return self._register_extension(ext)
                     else:
-                        LOG.warning(_("Not loading %s because it is "
-                                      "in the blacklist"), ext.obj.alias)
+                        LOG.warn(_LW("Not loading %s because it is "
+                                     "in the blacklist"), ext.obj.alias)
                         return False
                 else:
-                    LOG.warning(
-                        _("Not loading %s because it is not in the whitelist"),
-                        ext.obj.alias)
+                    LOG.warn(
+                        _LW("Not loading %s because it is not in the "
+                            "whitelist"), ext.obj.alias)
                     return False
             else:
                 return False
 
         if not CONF.osapi_v3.enabled:
-            LOG.info("V3 API has been disabled by configuration")
+            LOG.info(_LI("V3 API has been disabled by configuration"))
             return
 
         self.init_only = init_only
-        LOG.debug(_("v3 API Extension Blacklist: %s"),
+        LOG.debug("v3 API Extension Blacklist: %s",
                   CONF.osapi_v3.extensions_blacklist)
-        LOG.debug(_("v3 API Extension Whitelist: %s"),
+        LOG.debug("v3 API Extension Whitelist: %s",
                   CONF.osapi_v3.extensions_whitelist)
 
         in_blacklist_and_whitelist = set(
             CONF.osapi_v3.extensions_whitelist).intersection(
                 CONF.osapi_v3.extensions_blacklist)
         if len(in_blacklist_and_whitelist) != 0:
-            LOG.warning(_("Extensions in both blacklist and whitelist: %s"),
-                        list(in_blacklist_and_whitelist))
+            LOG.warn(_LW("Extensions in both blacklist and whitelist: %s"),
+                     list(in_blacklist_and_whitelist))
 
         self.api_extension_manager = stevedore.enabled.EnabledExtensionManager(
             namespace=self.API_EXTENSION_NAMESPACE,
@@ -327,7 +328,7 @@ class APIRouterV3(base_wsgi.Router):
         missing_core_extensions = self.get_missing_core_extensions(
             self.loaded_extension_info.get_extensions().keys())
         if not self.init_only and missing_core_extensions:
-            LOG.critical(_("Missing core API extensions: %s"),
+            LOG.critical(_LC("Missing core API extensions: %s"),
                          missing_core_extensions)
             raise exception.CoreAPIMissing(
                 missing_apis=missing_core_extensions)
@@ -355,10 +356,10 @@ class APIRouterV3(base_wsgi.Router):
         """
 
         handler = ext.obj
-        LOG.debug(_("Running _register_resources on %s"), ext.obj)
+        LOG.debug("Running _register_resources on %s", ext.obj)
 
         for resource in handler.get_resources():
-            LOG.debug(_('Extended resource: %s'), resource.collection)
+            LOG.debug('Extended resource: %s', resource.collection)
 
             inherits = None
             if resource.inherits:
@@ -397,7 +398,7 @@ class APIRouterV3(base_wsgi.Router):
         """
 
         handler = ext.obj
-        LOG.debug(_("Running _register_controllers on %s"), ext.obj)
+        LOG.debug("Running _register_controllers on %s", ext.obj)
 
         for extension in handler.get_controller_extensions():
             ext_name = extension.extension.name
@@ -405,13 +406,13 @@ class APIRouterV3(base_wsgi.Router):
             controller = extension.controller
 
             if collection not in self.resources:
-                LOG.warning(_('Extension %(ext_name)s: Cannot extend '
-                              'resource %(collection)s: No such resource'),
-                              {'ext_name': ext_name, 'collection': collection})
+                LOG.warn(_LW('Extension %(ext_name)s: Cannot extend '
+                             'resource %(collection)s: No such resource'),
+                         {'ext_name': ext_name, 'collection': collection})
                 continue
 
-            LOG.debug(_('Extension %(ext_name)s extending resource: '
-                      '%(collection)s'),
+            LOG.debug('Extension %(ext_name)s extending resource: '
+                      '%(collection)s',
                       {'ext_name': ext_name, 'collection': collection})
 
             resource = self.resources[collection]

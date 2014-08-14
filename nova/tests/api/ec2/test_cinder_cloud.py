@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -32,9 +30,11 @@ from nova.compute import utils as compute_utils
 from nova import context
 from nova import db
 from nova import exception
+from nova import objects
 from nova import test
 from nova.tests import cast_as_call
 from nova.tests import fake_network
+from nova.tests import fake_notifier
 from nova.tests import fake_utils
 from nova.tests.image import fake
 from nova.tests import matchers
@@ -89,12 +89,12 @@ class CinderCloudTestCase(test.TestCase):
     def setUp(self):
         super(CinderCloudTestCase, self).setUp()
         ec2utils.reset_cache()
-        vol_tmpdir = self.useFixture(fixtures.TempDir()).path
+        self.useFixture(fixtures.TempDir()).path
         fake_utils.stub_out_utils_spawn_n(self.stubs)
         self.flags(compute_driver='nova.virt.fake.FakeDriver',
                    volume_api_class='nova.tests.fake_volume.API')
 
-        def fake_show(meh, context, id):
+        def fake_show(meh, context, id, **kwargs):
             return {'id': id,
                     'name': 'fake_name',
                     'container_format': 'ami',
@@ -126,6 +126,12 @@ class CinderCloudTestCase(test.TestCase):
 
         # Short-circuit the conductor service
         self.flags(use_local=True, group='conductor')
+
+        # Stub out the notification service so we use the no-op serializer
+        # and avoid lazy-load traces with the wrap_exception decorator in
+        # the compute service.
+        fake_notifier.stub_notifier(self.stubs)
+        self.addCleanup(fake_notifier.reset)
 
         # set up services
         self.conductor = self.start_service('conductor',
@@ -264,6 +270,48 @@ class CinderCloudTestCase(test.TestCase):
         self.cloud.delete_volume(self.context, volume2_id)
         self.cloud.delete_snapshot(self.context, snap['snapshotId'])
         self.cloud.delete_volume(self.context, volume1_id)
+
+    def test_volume_status_of_attaching_volume(self):
+        """Test the volume's status in response when attaching a volume."""
+        vol1 = self.cloud.create_volume(self.context,
+                                        size=1,
+                                        name='test-ls',
+                                        description='test volume ls')
+        self.assertEqual('available', vol1['status'])
+
+        kwargs = {'image_id': 'ami-1',
+                  'instance_type': CONF.default_flavor,
+                  'max_count': 1}
+        ec2_instance_id = self._run_instance(**kwargs)
+        resp = self.cloud.attach_volume(self.context,
+                                        vol1['volumeId'],
+                                        ec2_instance_id,
+                                        '/dev/sde')
+        # Here,the status should be 'attaching',but it can be 'attached' in
+        # unittest scenario if the attach action is very fast.
+        self.assertIn(resp['status'], ('attaching', 'attached'))
+
+    def test_volume_status_of_detaching_volume(self):
+        """Test the volume's status in response when detaching a volume."""
+        vol1 = self.cloud.create_volume(self.context,
+                                        size=1,
+                                        name='test-ls',
+                                        description='test volume ls')
+        self.assertEqual('available', vol1['status'])
+        vol1_uuid = ec2utils.ec2_vol_id_to_uuid(vol1['volumeId'])
+        kwargs = {'image_id': 'ami-1',
+                  'instance_type': CONF.default_flavor,
+                  'max_count': 1,
+                  'block_device_mapping': [{'device_name': '/dev/sdb',
+                                            'volume_id': vol1_uuid,
+                                            'delete_on_termination': True}]}
+        self._run_instance(**kwargs)
+        resp = self.cloud.detach_volume(self.context,
+                                        vol1['volumeId'])
+
+        # Here,the status should be 'detaching',but it can be 'detached' in
+        # unittest scenario if the detach action is very fast.
+        self.assertIn(resp['status'], ('detaching', 'detached'))
 
     def test_describe_snapshots(self):
         # Makes sure describe_snapshots works and filters results.
@@ -474,9 +522,9 @@ class CinderCloudTestCase(test.TestCase):
     def _tearDownBlockDeviceMapping(self, inst1, inst2, volumes):
         for vol in volumes:
             self.volume_api.delete(self.context, vol['id'])
-        for uuid in (inst1['uuid'], inst2['uuid']):
+        for instance_uuid in (inst1['uuid'], inst2['uuid']):
             for bdm in db.block_device_mapping_get_all_by_instance(
-                    self.context, uuid):
+                    self.context, instance_uuid):
                 db.block_device_mapping_destroy(self.context, bdm['id'])
         db.instance_destroy(self.context, inst2['uuid'])
         db.instance_destroy(self.context, inst1['uuid'])
@@ -516,7 +564,7 @@ class CinderCloudTestCase(test.TestCase):
          'ebs': {'status': 'attached',
                  'deleteOnTermination': False,
                  'volumeId': 'vol-0000000b', }}]
-        # NOTE(yamahata): swap/ephemeral device case isn't supported yet.
+    # NOTE(yamahata): swap/ephemeral device case isn't supported yet.
 
     _expected_instance_bdm2 = {
         'instanceId': 'i-00000002',
@@ -638,7 +686,7 @@ class CinderCloudTestCase(test.TestCase):
                 'mappings': mappings2,
                 'block_device_mapping': block_device_mapping2}}
 
-        def fake_show(meh, context, image_id):
+        def fake_show(meh, context, image_id, **kwargs):
             _images = [copy.deepcopy(image1), copy.deepcopy(image2)]
             for i in _images:
                 if str(i['id']) == str(image_id):
@@ -692,7 +740,6 @@ class CinderCloudTestCase(test.TestCase):
         {'deviceName': '/dev/sdb2', 'ebs': {'snapshotId':
                                             'vol-00053977'}},
         {'deviceName': '/dev/sdb3', 'virtualName': 'ephemeral5'},
-        # {'deviceName': '/dev/sdb4', 'noDevice': True},
 
         {'deviceName': '/dev/sdc0', 'virtualName': 'swap'},
         {'deviceName': '/dev/sdc1', 'ebs': {'snapshotId':
@@ -700,7 +747,6 @@ class CinderCloudTestCase(test.TestCase):
         {'deviceName': '/dev/sdc2', 'ebs': {'snapshotId':
                                             'vol-00bc614e'}},
         {'deviceName': '/dev/sdc3', 'virtualName': 'ephemeral6'},
-        # {'deviceName': '/dev/sdc4', 'noDevice': True}
         ]
 
     _expected_root_device_name2 = '/dev/sdb1'
@@ -776,8 +822,7 @@ class CinderCloudTestCase(test.TestCase):
 
         self.assertEqual(len(vols), 2)
         for vol in vols:
-            self.assertTrue(str(vol['id']) == str(vol1_uuid) or
-                str(vol['id']) == str(vol2_uuid))
+            self.assertIn(str(vol['id']), [str(vol1_uuid), str(vol2_uuid)])
             if str(vol['id']) == str(vol1_uuid):
                 self.volume_api.attach(self.context, vol['id'],
                                        instance_uuid, '/dev/sdb')
@@ -808,15 +853,13 @@ class CinderCloudTestCase(test.TestCase):
         vols = [v for v in vols if v['instance_uuid'] == instance_uuid]
         self.assertEqual(len(vols), 2)
         for vol in vols:
-            self.assertTrue(str(vol['id']) == str(vol1_uuid) or
-                            str(vol['id']) == str(vol2_uuid))
-            self.assertTrue(vol['mountpoint'] == '/dev/sdb' or
-                            vol['mountpoint'] == '/dev/sdc')
+            self.assertIn(str(vol['id']), [str(vol1_uuid), str(vol2_uuid)])
+            self.assertIn(vol['mountpoint'], ['/dev/sdb', '/dev/sdc'])
             self.assertEqual(vol['instance_uuid'], instance_uuid)
             self.assertEqual(vol['status'], "in-use")
             self.assertEqual(vol['attach_status'], "attached")
 
-        #Here we puke...
+        # Here we puke...
         self.cloud.terminate_instances(self.context, [ec2_instance_id])
 
         admin_ctxt = context.get_admin_context(read_deleted="no")
@@ -859,9 +902,9 @@ class CinderCloudTestCase(test.TestCase):
         vol = self.volume_api.get(self.context, vol2_uuid)
         self._assert_volume_detached(vol)
 
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
+        inst_obj = objects.Instance.get_by_uuid(self.context, instance_uuid)
         self.cloud.compute_api.attach_volume(self.context,
-                                             instance,
+                                             inst_obj,
                                              volume_id=vol2_uuid,
                                              device='/dev/sdc')
 
@@ -872,7 +915,7 @@ class CinderCloudTestCase(test.TestCase):
         self._assert_volume_attached(vol2, instance_uuid, '/dev/sdc')
 
         self.cloud.compute_api.detach_volume(self.context,
-                                             instance, vol1)
+                                             inst_obj, vol1)
 
         vol1 = self.volume_api.get(self.context, vol1_uuid)
         self._assert_volume_detached(vol1)
@@ -954,7 +997,7 @@ class CinderCloudTestCase(test.TestCase):
 
             self._assert_volume_attached(vol, instance_uuid, mountpoint)
 
-        #Just make sure we found them
+        # Just make sure we found them
         self.assertTrue(vol1_id)
         self.assertTrue(vol2_id)
 
@@ -964,14 +1007,6 @@ class CinderCloudTestCase(test.TestCase):
         vol = self.volume_api.get(admin_ctxt, vol1_id)
         self._assert_volume_detached(vol)
         self.assertFalse(vol['deleted'])
-        #db.volume_destroy(self.context, vol1_id)
-
-        ##admin_ctxt = context.get_admin_context(read_deleted="only")
-        ##vol = db.volume_get(admin_ctxt, vol2_id)
-        ##self.assertTrue(vol['deleted'])
-
-        #for snapshot_id in (ec2_snapshot1_id, ec2_snapshot2_id):
-        #    self.cloud.delete_snapshot(self.context, snapshot_id)
 
     def test_create_image(self):
         # Make sure that CreateImage works.

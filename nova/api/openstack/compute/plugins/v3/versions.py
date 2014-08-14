@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
 #
@@ -15,22 +13,24 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import webob.exc
+
 from nova.api.openstack.compute import versions
 from nova.api.openstack.compute.views import versions as views_versions
 from nova.api.openstack import extensions
-from nova.api.openstack import wsgi
 
 
 ALIAS = "versions"
 
 
 class VersionsController(object):
-    @extensions.expected_errors(())
-    @wsgi.serializers(xml=versions.VersionTemplate,
-                      atom=versions.VersionAtomSerializer)
-    def show(self, req):
+    @extensions.expected_errors(404)
+    def show(self, req, id='v3.0'):
         builder = views_versions.get_view_builder(req)
-        return builder.build_version(versions.VERSIONS['v3.0'])
+        if id not in versions.VERSIONS:
+            raise webob.exc.HTTPNotFound()
+
+        return builder.build_version(versions.VERSIONS[id])
 
 
 class Versions(extensions.V3APIExtensionBase):
@@ -38,7 +38,6 @@ class Versions(extensions.V3APIExtensionBase):
 
     name = "Versions"
     alias = ALIAS
-    namespace = "http://docs.openstack.org/compute/core/versions/v3"
     version = 1
 
     def get_resources(self):

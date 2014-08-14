@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 Citrix Systems, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -46,7 +44,7 @@ def stubout_instance_snapshot(stubs):
     stubs.Set(vm_utils, '_fetch_image', fake_fetch_image)
 
     def fake_wait_for_vhd_coalesce(*args):
-        #TODO(sirp): Should we actually fake out the data here
+        # TODO(sirp): Should we actually fake out the data here
         return "fakeparent", "fakebase"
 
     stubs.Set(vm_utils, '_wait_for_vhd_coalesce', fake_wait_for_vhd_coalesce)

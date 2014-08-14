@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 # Copyright 2013 Red Hat, Inc.
@@ -27,15 +25,16 @@ from oslo.config import cfg
 from nova.compute import flavors
 import nova.context
 from nova import db
+from nova.i18n import _
 from nova.image import glance
 from nova import network
 from nova.network import model as network_model
-from nova import notifier as notify
+from nova.objects import base as obj_base
 from nova.openstack.common import context as common_context
 from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log
 from nova.openstack.common import timeutils
+from nova import rpc
 from nova import utils
 
 LOG = log.getLogger(__name__)
@@ -50,15 +49,16 @@ notify_opts = [
     cfg.BoolOpt('notify_api_faults', default=False,
         help='If set, send api.fault notifications on caught exceptions '
              'in the API service.'),
+    cfg.StrOpt('default_notification_level',
+               default='INFO',
+               help='Default notification level for outgoing notifications'),
+    cfg.StrOpt('default_publisher_id',
+               help='Default publisher_id for outgoing notifications'),
 ]
 
 
 CONF = cfg.CONF
 CONF.register_opts(notify_opts)
-CONF.import_opt('default_notification_level',
-                'nova.openstack.common.notifier.api')
-CONF.import_opt('default_publisher_id',
-                'nova.openstack.common.notifier.api')
 
 
 def notify_decorator(name, fn):
@@ -81,8 +81,8 @@ def notify_decorator(name, fn):
         ctxt = common_context.get_context_from_function_and_args(
             fn, args, kwarg)
 
-        notifier = notify.get_notifier(publisher_id=(CONF.default_publisher_id
-                                                     or CONF.host))
+        notifier = rpc.get_notifier(publisher_id=(CONF.default_publisher_id
+                                                  or CONF.host))
         method = notifier.getattr(CONF.default_notification_level.lower(),
                                   'info')
         method(ctxt, name, body)
@@ -99,7 +99,7 @@ def send_api_fault(url, status, exception):
 
     payload = {'url': url, 'exception': str(exception), 'status': status}
 
-    notify.get_notifier('api').error(None, 'api.fault', payload)
+    rpc.get_notifier('api').error(None, 'api.fault', payload)
 
 
 def send_update(context, old_instance, new_instance, service=None, host=None):
@@ -123,11 +123,10 @@ def send_update(context, old_instance, new_instance, service=None, host=None):
     if old_vm_state != new_vm_state:
         # yes, the vm state is changing:
         update_with_state_change = True
-    elif CONF.notify_on_state_change:
-        if (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
-                old_task_state != new_task_state):
-            # yes, the task state is changing:
-            update_with_state_change = True
+    elif (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
+          old_task_state != new_task_state):
+        # yes, the task state is changing:
+        update_with_state_change = True
 
     if update_with_state_change:
         # send a notification with state changes
@@ -171,11 +170,10 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
         if old_vm_state != new_vm_state:
             # yes, the vm state is changing:
             fire_update = True
-        elif CONF.notify_on_state_change:
-            if (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
-                    old_task_state != new_task_state):
-                # yes, the task state is changing:
-                fire_update = True
+        elif (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
+              old_task_state != new_task_state):
+            # yes, the task state is changing:
+            fire_update = True
 
     if fire_update:
         # send either a state change or a regular notification
@@ -225,8 +223,8 @@ def _send_instance_update_notification(context, instance, old_vm_state=None,
     if old_display_name:
         payload["old_display_name"] = old_display_name
 
-    notify.get_notifier(service, host).info(context,
-                                            'compute.instance.update', payload)
+    rpc.get_notifier(service, host).info(context,
+                                         'compute.instance.update', payload)
 
 
 def audit_period_bounds(current_period=False):
@@ -276,10 +274,8 @@ def bandwidth_usage(instance_ref, audit_start,
                     return
                 raise
 
-    # FIXME(comstud): Temporary as we transition to objects.  This import
-    # is here to avoid circular imports.
-    from nova.objects import instance as instance_obj
-    if isinstance(instance_ref, instance_obj.Instance):
+    # FIXME(comstud): Temporary as we transition to objects.
+    if isinstance(instance_ref, obj_base.NovaObject):
         nw_info = instance_ref.info_cache.network_info
         if nw_info is None:
             nw_info = network_model.NetworkInfo()
@@ -323,10 +319,15 @@ def info_from_instance(context, instance_ref, network_info,
     """Get detailed instance information for an instance which is common to all
     notifications.
 
-    :param network_info: network_info provided if not None
-    :param system_metadata: system_metadata DB entries for the instance,
-    if not None.  *NOTE*: Currently unused here in trunk, but needed for
-    potential custom modifications.
+    :param:network_info: network_info provided if not None
+    :param:system_metadata: system_metadata DB entries for the instance,
+    if not None
+
+    .. note::
+
+        Currently unused here in trunk, but needed for potential custom
+        modifications.
+
     """
 
     def null_safe_str(s):
@@ -408,6 +409,7 @@ def info_from_instance(context, instance_ref, network_info,
         for vif in network_info:
             for ip in vif.fixed_ips():
                 ip["label"] = vif["network"]["label"]
+                ip["vif_mac"] = vif["address"]
                 fixed_ips.append(ip)
         instance_info['fixed_ips'] = fixed_ips
 
@@ -416,7 +418,7 @@ def info_from_instance(context, instance_ref, network_info,
     instance_info["image_meta"] = image_meta_props
 
     # add instance metadata
-    instance_info['metadata'] = instance_ref['metadata']
+    instance_info['metadata'] = utils.instance_meta(instance_ref)
 
     instance_info.update(kw)
     return instance_info

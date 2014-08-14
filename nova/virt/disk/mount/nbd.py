@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Red Hat, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,7 +20,7 @@ import time
 
 from oslo.config import cfg
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.disk.mount import api
@@ -32,7 +30,8 @@ LOG = logging.getLogger(__name__)
 nbd_opts = [
     cfg.IntOpt('timeout_nbd',
                default=10,
-               help='time to wait for a NBD device coming up'),
+               help='Amount of time, in seconds, to wait for NBD '
+               'device start up.'),
     ]
 
 CONF = cfg.CONF
@@ -52,7 +51,11 @@ class NbdMount(api.Mount):
     def _find_unused(self, devices):
         for device in devices:
             if not os.path.exists(os.path.join('/sys/block/', device, 'pid')):
-                return device
+                if not os.path.exists('/var/lock/qemu-nbd-%s' % device):
+                    return device
+                else:
+                    LOG.error(_('NBD error - previous umount did not cleanup '
+                              '/var/lock/qemu-nbd-%s.'), device)
         LOG.warn(_('No free nbd devices'))
         return None
 
@@ -71,12 +74,6 @@ class NbdMount(api.Mount):
             return None
         return os.path.join('/dev', device)
 
-    def _read_pid_file(self, pidfile):
-        # This is for unit test convenience
-        with open(pidfile) as f:
-            pid = int(f.readline())
-        return pid
-
     @utils.synchronized('nbd-allocation-lock')
     def _inner_get_dev(self):
         device = self._allocate_nbd()
@@ -85,7 +82,7 @@ class NbdMount(api.Mount):
 
         # NOTE(mikal): qemu-nbd will return an error if the device file is
         # already in use.
-        LOG.debug(_('Get nbd device %(dev)s for %(imgfile)s'),
+        LOG.debug('Get nbd device %(dev)s for %(imgfile)s',
                   {'dev': device, 'imgfile': self.image})
         _out, err = utils.trycmd('qemu-nbd', '-c', device, self.image,
                                  run_as_root=True)
@@ -125,7 +122,16 @@ class NbdMount(api.Mount):
     def unget_dev(self):
         if not self.linked:
             return
-        LOG.debug(_('Release nbd device %s'), self.device)
+        LOG.debug('Release nbd device %s', self.device)
         utils.execute('qemu-nbd', '-d', self.device, run_as_root=True)
         self.linked = False
         self.device = None
+
+    def flush_dev(self):
+        """flush NBD block device buffer."""
+        # Perform an explicit BLKFLSBUF to support older qemu-nbd(s).
+        # Without this flush, when a nbd device gets re-used the
+        # qemu-nbd intermittently hangs.
+        if self.device:
+            utils.execute('blockdev', '--flushbufs',
+                          self.device, run_as_root=True)

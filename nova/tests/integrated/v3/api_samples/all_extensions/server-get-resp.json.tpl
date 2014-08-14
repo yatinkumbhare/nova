@@ -12,7 +12,7 @@
                 }
             ]
         },
-        "created": "%(timestamp)s",
+        "created": "%(isotime)s",
         "flavor": {
             "id": "1",
             "links": [
@@ -49,7 +49,6 @@
         },
         "name": "new-server-test",
         "os-config-drive:config_drive": "",
-        "os-disk-config:disk_config": "AUTO",
         "os-extended-availability-zone:availability_zone": "nova",
         "os-extended-server-attributes:host": "%(compute_host)s",
         "os-extended-server-attributes:hypervisor_hostname": "%(hypervisor_hostname)s",
@@ -60,17 +59,17 @@
         "os-extended-status:vm_state": "active",
         "os-extended-volumes:volumes_attached": [],
         "os-pci:pci_devices": [{"id": 1}],
-        "os-server-usage:launched_at": "%(timestamp)s",
+        "os-server-usage:launched_at": "%(strtime)s",
         "os-server-usage:terminated_at": null,
         "progress": 0,
-        "security_groups": [
+        "os-security-groups:security_groups": [
             {
                 "name": "default"
             }
         ],
         "status": "ACTIVE",
         "tenant_id": "openstack",
-        "updated": "%(timestamp)s",
+        "updated": "%(isotime)s",
         "user_id": "fake"
     }
 }

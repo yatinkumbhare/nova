@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
 #
@@ -26,7 +24,7 @@ import sys
 
 from oslo.config import cfg
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova import utils
@@ -35,9 +33,9 @@ from nova.virt import event as virtevent
 driver_opts = [
     cfg.StrOpt('compute_driver',
                help='Driver to use for controlling virtualization. Options '
-                   'include: libvirt.LibvirtDriver, xenapi.XenAPIDriver, '
-                   'fake.FakeDriver, baremetal.BareMetalDriver, '
-                   'vmwareapi.VMwareESXDriver, vmwareapi.VMwareVCDriver'),
+                    'include: libvirt.LibvirtDriver, xenapi.XenAPIDriver, '
+                    'fake.FakeDriver, baremetal.BareMetalDriver, '
+                    'vmwareapi.VMwareVCDriver, hyperv.HyperVDriver'),
     cfg.StrOpt('default_ephemeral_format',
                help='The default format an ephemeral_volume will be '
                     'formatted with on creation.'),
@@ -49,6 +47,16 @@ driver_opts = [
     cfg.BoolOpt('use_cow_images',
                 default=True,
                 help='Whether to use cow images'),
+    cfg.BoolOpt('vif_plugging_is_fatal',
+                default=True,
+                help="Fail instance boot if vif plugging fails"),
+    cfg.IntOpt('vif_plugging_timeout',
+               default=300,
+               help='Number of seconds to wait for neutron vif plugging '
+                    'events to arrive before continuing or failing (see '
+                    'vif_plugging_is_fatal). If this is set to zero and '
+                    'vif_plugging_is_fatal is False, events should not '
+                    'be expected to arrive at all.'),
 ]
 
 CONF = cfg.CONF
@@ -141,8 +149,16 @@ class ComputeDriver(object):
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
+    def cleanup_host(self, host):
+        """Clean up anything that is necessary for the driver gracefully stop,
+        including ending remote sessions. This is optional.
+        """
+        pass
+
     def get_info(self, instance):
         """Get the current status of an instance, by name (not ID!)
+
+        :param instance: nova.objects.instance.Instance object
 
         Returns a dict containing:
 
@@ -170,10 +186,10 @@ class ComputeDriver(object):
         """
         return len(self.list_instances())
 
-    def instance_exists(self, instance_id):
+    def instance_exists(self, instance):
         """Checks existence of an instance on the host.
 
-        :param instance_id: The ID / name of the instance to lookup
+        :param instance: The instance to lookup
 
         Returns True if an instance with the supplied ID exists on
         the host, False otherwise.
@@ -185,7 +201,10 @@ class ComputeDriver(object):
             encouraged to override this method with something more
             efficient.
         """
-        return instance_id in self.list_instances()
+        try:
+            return instance.uuid in self.list_instance_uuids()
+        except NotImplementedError:
+            return instance.name in self.list_instances()
 
     def estimate_instance_overhead(self, instance_info):
         """Estimate the virtualization overhead required to build an instance
@@ -200,24 +219,63 @@ class ComputeDriver(object):
         return {'memory_mb': 0}
 
     def list_instances(self):
-        """
-        Return the names of all the instances known to the virtualization
+        """Return the names of all the instances known to the virtualization
         layer, as a list.
         """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def list_instance_uuids(self):
-        """
-        Return the UUIDS of all the instances known to the virtualization
+        """Return the UUIDS of all the instances known to the virtualization
         layer, as a list.
+        """
+        raise NotImplementedError()
+
+    def rebuild(self, context, instance, image_meta, injected_files,
+                admin_password, bdms, detach_block_devices,
+                attach_block_devices, network_info=None,
+                recreate=False, block_device_info=None,
+                preserve_ephemeral=False):
+        """Destroy and re-make this instance.
+
+        A 'rebuild' effectively purges all existing data from the system and
+        remakes the VM with given 'metadata' and 'personalities'.
+
+        This base class method shuts down the VM, detaches all block devices,
+        then spins up the new VM afterwards. It may be overridden by
+        hypervisors that need to - e.g. for optimisations, or when the 'VM'
+        is actually proxied and needs to be held across the shutdown + spin
+        up steps.
+
+        :param context: security context
+        :param instance: nova.objects.instance.Instance
+                         This function should use the data there to guide
+                         the creation of the new instance.
+        :param image_meta: image object returned by nova.image.glance that
+                           defines the image from which to boot this instance
+        :param injected_files: User files to inject into instance.
+        :param admin_password: Administrator password to set in instance.
+        :param bdms: block-device-mappings to use for rebuild
+        :param detach_block_devices: function to detach block devices. See
+            nova.compute.manager.ComputeManager:_rebuild_default_impl for
+            usage.
+        :param attach_block_devices: function to attach block devices. See
+            nova.compute.manager.ComputeManager:_rebuild_default_impl for
+            usage.
+        :param network_info:
+           :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
+        :param recreate: True if the instance is being recreated on a new
+            hypervisor - all the cleanup of old state is skipped.
+        :param block_device_info: Information about block devices to be
+                                  attached to the instance.
+        :param preserve_ephemeral: True if the default ephemeral storage
+                                   partition must be preserved on rebuild
         """
         raise NotImplementedError()
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None):
-        """
-        Create a new instance/VM/domain on the virtualization platform.
+        """Create a new instance/VM/domain on the virtualization platform.
 
         Once this successfully completes, the instance should be
         running (power_state.RUNNING).
@@ -227,7 +285,7 @@ class ComputeDriver(object):
         that it was before this call began.
 
         :param context: security context
-        :param instance: Instance object as returned by DB layer.
+        :param instance: nova.objects.instance.Instance
                          This function should use the data there to guide
                          the creation of the new instance.
         :param image_meta: image object returned by nova.image.glance that
@@ -242,8 +300,8 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True):
-        """Destroy (shutdown and delete) the specified instance.
+                destroy_disks=True, migrate_data=None):
+        """Destroy the specified instance from the Hypervisor.
 
         If the instance is not found (for example if networking failed), this
         function should still succeed.  It's probably a good idea to log a
@@ -256,6 +314,25 @@ class ComputeDriver(object):
         :param block_device_info: Information about block devices that should
                                   be detached from the instance.
         :param destroy_disks: Indicates if disks should be destroyed
+        :param migrate_data: implementation specific params
+        """
+        raise NotImplementedError()
+
+    def cleanup(self, context, instance, network_info, block_device_info=None,
+                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+        """Cleanup the instance resources .
+
+        Instance should have been destroyed from the Hypervisor before calling
+        this method.
+
+        :param context: security context
+        :param instance: Instance object as returned by DB layer.
+        :param network_info:
+           :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
+        :param block_device_info: Information about block devices that should
+                                  be detached from the instance.
+        :param destroy_disks: Indicates if disks should be destroyed
+        :param migrate_data: implementation specific params
         """
         raise NotImplementedError()
 
@@ -269,7 +346,7 @@ class ComputeDriver(object):
         successfully even in cases in which the underlying domain/vm
         is paused or halted/stopped.
 
-        :param instance: Instance object as returned by DB layer.
+        :param instance: nova.objects.instance.Instance
         :param network_info:
            :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
         :param reboot_type: Either a HARD or SOFT reboot
@@ -283,12 +360,20 @@ class ComputeDriver(object):
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
-    def get_console_output(self, instance):
-        # TODO(Vek): Need to pass context in for access to auth_token
+    def get_console_output(self, context, instance):
+        """Get console output for an instance
+
+        :param context: security context
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
-    def get_vnc_console(self, instance):
-        # TODO(Vek): Need to pass context in for access to auth_token
+    def get_vnc_console(self, context, instance):
+        """Get connection info for a vnc console.
+
+        :param context: security context
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def get_spice_console(self, context, instance):
@@ -299,14 +384,34 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
+    def get_rdp_console(self, context, instance):
+        """Get connection info for a rdp console.
+
+        :param context: security context
+        :param instance: nova.objects.instance.Instance
+        """
+        raise NotImplementedError()
+
     def get_diagnostics(self, instance):
-        """Return data about VM diagnostics."""
+        """Return data about VM diagnostics.
+
+        :param instance: nova.objects.instance.Instance
+        """
         # TODO(Vek): Need to pass context in for access to auth_token
+        raise NotImplementedError()
+
+    def get_instance_diagnostics(self, instance):
+        """Return data about VM diagnostics.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def get_all_bw_counters(self, instances):
         """Return bandwidth usage counters for each interface on each
            running VM.
+
+        :param instances: nova.objects.instance.InstanceList
         """
         raise NotImplementedError()
 
@@ -317,14 +422,13 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def get_host_ip_addr(self):
-        """
-        Retrieves the IP address of the dom0
+        """Retrieves the IP address of the dom0
         """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def attach_volume(self, context, connection_info, instance, mountpoint,
-                      encryption=None):
+                      disk_bus=None, device_type=None, encryption=None):
         """Attach the disk to the instance at mountpoint using info."""
         raise NotImplementedError()
 
@@ -334,33 +438,45 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def swap_volume(self, old_connection_info, new_connection_info,
-                    instance, mountpoint):
-        """Replace the disk attached to the instance."""
+                    instance, mountpoint, resize_to):
+        """Replace the disk attached to the instance.
+
+        :param instance: nova.objects.instance.Instance
+        :param resize_to: This parameter is used to indicate the new volume
+                          size when the new volume lager than old volume.
+                          And the units is Gigabyte.
+        """
         raise NotImplementedError()
 
     def attach_interface(self, instance, image_meta, vif):
-        """Attach an interface to the instance."""
+        """Attach an interface to the instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def detach_interface(self, instance, vif):
-        """Detach an interface from the instance."""
+        """Detach an interface from the instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def migrate_disk_and_power_off(self, context, instance, dest,
                                    flavor, network_info,
                                    block_device_info=None):
-        """
-        Transfers the disk of a running instance in multiple phases, turning
+        """Transfers the disk of a running instance in multiple phases, turning
         off the instance before the end.
+
+        :param instance: nova.objects.instance.Instance
         """
         raise NotImplementedError()
 
     def snapshot(self, context, instance, image_id, update_task_state):
-        """
-        Snapshots the specified instance.
+        """Snapshots the specified instance.
 
         :param context: security context
-        :param instance: Instance object as returned by DB layer.
+        :param instance: nova.objects.instance.Instance
         :param image_id: Reference to a pre-created image that will
                          hold the snapshot.
         """
@@ -373,7 +489,7 @@ class ComputeDriver(object):
 
         :param context: the context for the migration/resize
         :param migration: the migrate/resize information
-        :param instance: the instance being migrated/resized
+        :param instance: nova.objects.instance.Instance being migrated/resized
         :param disk_info: the newly transferred disk information
         :param network_info:
            :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
@@ -389,17 +505,19 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def confirm_migration(self, migration, instance, network_info):
-        """Confirms a resize, destroying the source VM."""
+        """Confirms a resize, destroying the source VM.
+
+        :param instance: nova.objects.instance.Instance
+        """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def finish_revert_migration(self, context, instance, network_info,
                                 block_device_info=None, power_on=True):
-        """
-        Finish reverting a resize.
+        """Finish reverting a resize.
 
         :param context: the context for the finish_revert_migration
-        :param instance: the instance being migrated/resized
+        :param instance: nova.objects.instance.Instance being migrated/resized
         :param network_info:
            :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
         :param block_device_info: instance volume block device info
@@ -409,26 +527,34 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def pause(self, instance):
-        """Pause the specified instance."""
+        """Pause the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def unpause(self, instance):
-        """Unpause paused VM instance."""
+        """Unpause paused VM instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def suspend(self, instance):
-        """suspend the specified instance."""
+        """suspend the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def resume(self, context, instance, network_info, block_device_info=None):
-        """
-        resume the specified instance.
+        """resume the specified instance.
 
         :param context: the context for the resume
-        :param instance: the instance being resumed
+        :param instance: nova.objects.instance.Instance being resumed
         :param network_info:
            :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
         :param block_device_info: instance volume block device info
@@ -437,38 +563,62 @@ class ComputeDriver(object):
 
     def resume_state_on_host_boot(self, context, instance, network_info,
                                   block_device_info=None):
-        """resume guest state when a host is booted."""
+        """resume guest state when a host is booted.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def rescue(self, context, instance, network_info, image_meta,
                rescue_password):
-        """Rescue the specified instance."""
+        """Rescue the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def set_bootable(self, instance, is_bootable):
-        """Set the ability to power on/off an instance."""
+        """Set the ability to power on/off an instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def unrescue(self, instance, network_info):
-        """Unrescue the specified instance."""
+        """Unrescue the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def power_off(self, instance):
-        """Power off the specified instance."""
+        """Power off the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def power_on(self, context, instance, network_info,
                  block_device_info=None):
-        """Power on the specified instance."""
+        """Power on the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def soft_delete(self, instance):
-        """Soft delete the specified instance."""
+        """Soft delete the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def restore(self, instance):
-        """Restore the specified instance."""
+        """Restore the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def get_available_resource(self, nodename):
@@ -484,12 +634,12 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def pre_live_migration(self, ctxt, instance_ref, block_device_info,
+    def pre_live_migration(self, context, instance, block_device_info,
                            network_info, disk_info, migrate_data=None):
         """Prepare an instance for live migration
 
-        :param ctxt: security context
-        :param instance_ref: instance object that will be migrated
+        :param context: security context
+        :param instance: nova.objects.instance.Instance object
         :param block_device_info: instance block device information
         :param network_info: instance network information
         :param disk_info: instance disk information
@@ -497,64 +647,92 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def live_migration(self, ctxt, instance_ref, dest,
+    def live_migration(self, context, instance, dest,
                        post_method, recover_method, block_migration=False,
                        migrate_data=None):
         """Live migration of an instance to another host.
 
-        :params ctxt: security context
-        :params instance_ref:
+        :param context: security context
+        :param instance:
             nova.db.sqlalchemy.models.Instance object
             instance object that is migrated.
-        :params dest: destination host
-        :params post_method:
+        :param dest: destination host
+        :param post_method:
             post operation method.
-            expected nova.compute.manager.post_live_migration.
-        :params recover_method:
+            expected nova.compute.manager._post_live_migration.
+        :param recover_method:
             recovery method when any exception occurs.
-            expected nova.compute.manager.recover_live_migration.
-        :params block_migration: if true, migrate VM disk.
-        :params migrate_data: implementation specific params.
+            expected nova.compute.manager._rollback_live_migration.
+        :param block_migration: if true, migrate VM disk.
+        :param migrate_data: implementation specific params.
 
         """
         raise NotImplementedError()
 
-    def post_live_migration(self, ctxt, instance_ref, block_device_info,
+    def rollback_live_migration_at_destination(self, context, instance,
+                                               network_info,
+                                               block_device_info,
+                                               destroy_disks=True,
+                                               migrate_data=None):
+        """Clean up destination node after a failed live migration.
+
+        :param context: security context
+        :param instance: instance object that was being migrated
+        :param network_info: instance network information
+        :param block_device_info: instance block device information
+        :param destroy_disks:
+            if true, destroy disks at destination during cleanup
+        :param migrate_data: implementation specific params
+
+        """
+        raise NotImplementedError()
+
+    def post_live_migration(self, context, instance, block_device_info,
                             migrate_data=None):
         """Post operation of live migration at source host.
 
-        :param ctxt: security context
-        :instance_ref: instance object that was migrated
+        :param context: security context
+        :instance: instance object that was migrated
         :block_device_info: instance block device information
         :param migrate_data: if not None, it is a dict which has data
         """
         pass
 
-    def post_live_migration_at_destination(self, ctxt, instance_ref,
+    def post_live_migration_at_source(self, context, instance, network_info):
+        """Unplug VIFs from networks at source.
+
+        :param context: security context
+        :param instance: instance object reference
+        :param network_info: instance network information
+        """
+        raise NotImplementedError(_("Hypervisor driver does not support "
+                                    "post_live_migration_at_source method"))
+
+    def post_live_migration_at_destination(self, context, instance,
                                            network_info,
                                            block_migration=False,
                                            block_device_info=None):
         """Post operation of live migration at destination host.
 
-        :param ctxt: security context
-        :param instance_ref: instance object that is migrated
+        :param context: security context
+        :param instance: instance object that is migrated
         :param network_info: instance network information
         :param block_migration: if true, post operation of block_migration.
         """
         raise NotImplementedError()
 
-    def check_instance_shared_storage_local(self, ctxt, instance):
+    def check_instance_shared_storage_local(self, context, instance):
         """Check if instance files located on shared storage.
 
         This runs check on the destination host, and then calls
         back to the source host to check the results.
 
-        :param ctxt: security context
+        :param context: security context
         :param instance: nova.db.sqlalchemy.models.Instance
         """
         raise NotImplementedError()
 
-    def check_instance_shared_storage_remote(self, ctxt, data):
+    def check_instance_shared_storage_remote(self, context, data):
         """Check if instance files located on shared storage.
 
         :param context: security context
@@ -562,15 +740,15 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def check_instance_shared_storage_cleanup(self, ctxt, data):
+    def check_instance_shared_storage_cleanup(self, context, data):
         """Do cleanup on host after check_instance_shared_storage calls
 
-        :param ctxt: security context
+        :param context: security context
         :param data: result of check_instance_shared_storage_local
         """
         pass
 
-    def check_can_live_migrate_destination(self, ctxt, instance_ref,
+    def check_can_live_migrate_destination(self, context, instance,
                                            src_compute_info, dst_compute_info,
                                            block_migration=False,
                                            disk_over_commit=False):
@@ -579,8 +757,8 @@ class ComputeDriver(object):
         This runs checks on the destination host, and then calls
         back to the source host to check the results.
 
-        :param ctxt: security context
-        :param instance_ref: nova.db.sqlalchemy.models.Instance
+        :param context: security context
+        :param instance: nova.db.sqlalchemy.models.Instance
         :param src_compute_info: Info about the sending machine
         :param dst_compute_info: Info about the receiving machine
         :param block_migration: if true, prepare for block migration
@@ -589,16 +767,16 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def check_can_live_migrate_destination_cleanup(self, ctxt,
+    def check_can_live_migrate_destination_cleanup(self, context,
                                                    dest_check_data):
         """Do required cleanup on dest host after check_can_live_migrate calls
 
-        :param ctxt: security context
+        :param context: security context
         :param dest_check_data: result of check_can_live_migrate_destination
         """
         raise NotImplementedError()
 
-    def check_can_live_migrate_source(self, ctxt, instance_ref,
+    def check_can_live_migrate_source(self, context, instance,
                                       dest_check_data):
         """Check if it is possible to execute live migration.
 
@@ -606,9 +784,31 @@ class ComputeDriver(object):
         results from check_can_live_migrate_destination.
 
         :param context: security context
-        :param instance_ref: nova.db.sqlalchemy.models.Instance
+        :param instance: nova.db.sqlalchemy.models.Instance
         :param dest_check_data: result of check_can_live_migrate_destination
         :returns: a dict containing migration info (hypervisor-dependent)
+        """
+        raise NotImplementedError()
+
+    def get_instance_disk_info(self, instance_name,
+                               block_device_info=None):
+        """Retrieve information about actual disk sizes of an instance.
+
+        :param instance_name:
+            name of a nova instance as returned by list_instances()
+        :param block_device_info:
+            Optional; Can be used to filter out devices which are
+            actually volumes.
+        :return:
+            json strings with below format::
+
+                "[{'path':'disk',
+                   'type':'raw',
+                   'virt_disk_size':'10737418240',
+                   'backing_file':'backing_file',
+                   'disk_size':'83886080'
+                   'over_committed_disk_size':'10737418240'},
+                   ...]"
         """
         raise NotImplementedError()
 
@@ -679,12 +879,21 @@ class ComputeDriver(object):
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
+    def refresh_instance_security_rules(self, instance):
+        """Refresh security group rules
+
+        Gets called when an instance gets added to or removed from
+        the security group the instance is a member of or if the
+        group gains or loses a rule.
+        """
+        raise NotImplementedError()
+
     def reset_network(self, instance):
         """reset networking for specified instance."""
         # TODO(Vek): Need to pass context in for access to auth_token
         pass
 
-    def ensure_filtering_rules_for_instance(self, instance_ref, network_info):
+    def ensure_filtering_rules_for_instance(self, instance, network_info):
         """Setting up filtering rules and waiting for its completion.
 
         To migrate an instance, filtering rules to hypervisors
@@ -704,7 +913,7 @@ class ComputeDriver(object):
         not be started when setting-up filtering rules operations
         are not completed.
 
-        :params instance_ref: nova.db.sqlalchemy.models.Instance object
+        :param instance: nova.objects.instance.Instance object
 
         """
         # TODO(Vek): Need to pass context in for access to auth_token
@@ -723,37 +932,39 @@ class ComputeDriver(object):
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
-    def set_admin_password(self, context, instance_id, new_pass=None):
-        """
-        Set the root password on the specified instance.
+    def set_admin_password(self, instance, new_pass):
+        """Set the root password on the specified instance.
 
-        The first parameter is an instance of nova.compute.service.Instance,
-        and so the instance is being specified as instance.name. The second
-        parameter is the value of the new password.
+        :param instance: nova.objects.instance.Instance
+        :param new_password: the new password
         """
         raise NotImplementedError()
 
     def inject_file(self, instance, b64_path, b64_contents):
-        """
-        Writes a file on the specified instance.
+        """Writes a file on the specified instance.
 
         The first parameter is an instance of nova.compute.service.Instance,
         and so the instance is being specified as instance.name. The second
         parameter is the base64-encoded path to which the file is to be
         written on the instance; the third is the contents of the file, also
         base64-encoded.
+
+        NOTE(russellb) This method is deprecated and will be removed once it
+        can be removed from nova.compute.manager.
         """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def change_instance_metadata(self, context, instance, diff):
-        """
-        Applies a diff to the instance metadata.
+        """Applies a diff to the instance metadata.
 
         This is an optional driver method which is used to publish
         changes to the instance's metadata to the hypervisor.  If the
         hypervisor has no means of publishing the instance metadata to
         the instance, then this method should not be implemented.
+
+        :param context: security context
+        :param instance: nova.objects.instance.Instance
         """
         pass
 
@@ -794,12 +1005,18 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def plug_vifs(self, instance, network_info):
-        """Plug VIFs into networks."""
+        """Plug VIFs into networks.
+
+        :param instance: nova.objects.instance.Instance
+        """
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def unplug_vifs(self, instance, network_info):
-        """Unplug VIFs from networks."""
+        """Unplug VIFs from networks.
+
+        :param instance: nova.objects.instance.Instance
+        """
         raise NotImplementedError()
 
     def get_host_stats(self, refresh=False):
@@ -821,11 +1038,13 @@ class ComputeDriver(object):
         """Get the currently known host CPU stats.
 
         :returns: a dict containing the CPU stat info, eg:
-                  {'kernel': kern,
-                   'idle': idle,
-                   'user': user,
-                   'iowait': wait,
-                   'frequency': freq},
+
+            | {'kernel': kern,
+            |  'idle': idle,
+            |  'user': user,
+            |  'iowait': wait,
+            |   'frequency': freq},
+
                   where kern and user indicate the cumulative CPU time
                   (nanoseconds) spent by kernel and user processes
                   respectively, idle indicates the cumulative idle CPU time
@@ -833,12 +1052,12 @@ class ComputeDriver(object):
                   time (nanoseconds), since the host is booting up; freq
                   indicates the current CPU frequency (MHz). All values are
                   long integers.
+
         """
         raise NotImplementedError()
 
     def block_stats(self, instance_name, disk_id):
-        """
-        Return performance counters associated with the given disk_id on the
+        """Return performance counters associated with the given disk_id on the
         given instance_name.  These are returned as [rd_req, rd_bytes, wr_req,
         wr_bytes, errs], where rd indicates read, wr indicates write, req is
         the total number of I/O requests made, bytes is the total number of
@@ -857,9 +1076,8 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def interface_stats(self, instance_name, iface_id):
-        """
-        Return performance counters associated with the given iface_id on the
-        given instance_id.  These are returned as [rx_bytes, rx_packets,
+        """Return performance counters associated with the given iface_id
+        on the given instance_id.  These are returned as [rx_bytes, rx_packets,
         rx_errs, rx_drop, tx_bytes, tx_packets, tx_errs, tx_drop], where rx
         indicates receive, tx indicates transmit, bytes and packets indicate
         the total number of bytes or packets transferred, and errs and dropped
@@ -875,6 +1093,10 @@ class ComputeDriver(object):
         Note that this function takes an instance ID.
         """
         raise NotImplementedError()
+
+    def deallocate_networks_on_reschedule(self, instance):
+        """Does the driver want networks deallocated on reschedule?"""
+        return False
 
     def macs_for_instance(self, instance):
         """What MAC addresses must this instance have?
@@ -919,30 +1141,33 @@ class ComputeDriver(object):
         client API.
 
         :return: None, or a set of DHCP options, eg:
-                 [{'opt_name': 'bootfile-name',
-                   'opt_value': '/tftpboot/path/to/config'},
-                  {'opt_name': 'server-ip-address',
-                   'opt_value': '1.2.3.4'},
-                  {'opt_name': 'tftp-server',
-                   'opt_value': '1.2.3.4'}
-                 ]
+
+             |    [{'opt_name': 'bootfile-name',
+             |      'opt_value': '/tftpboot/path/to/config'},
+             |     {'opt_name': 'server-ip-address',
+             |      'opt_value': '1.2.3.4'},
+             |     {'opt_name': 'tftp-server',
+             |      'opt_value': '1.2.3.4'}
+             |    ]
+
         """
         pass
 
     def manage_image_cache(self, context, all_instances):
-        """
-        Manage the driver's local image cache.
+        """Manage the driver's local image cache.
 
         Some drivers chose to cache images for instances on disk. This method
         is an opportunity to do management of that cache which isn't directly
         related to other calls into the driver. The prime example is to clean
         the cache and remove images which are no longer of interest.
+
+        :param instances: nova.objects.instance.InstanceList
         """
         pass
 
     def add_to_aggregate(self, context, aggregate, host, **kwargs):
         """Add a compute host to an aggregate."""
-        #NOTE(jogo) Currently only used for XenAPI-Pool
+        # NOTE(jogo) Currently only used for XenAPI-Pool
         raise NotImplementedError()
 
     def remove_from_aggregate(self, context, aggregate, host, **kwargs):
@@ -966,6 +1191,7 @@ class ComputeDriver(object):
                 'initiator': initiator,
                 'host': hostname
             }
+
         """
         raise NotImplementedError()
 
@@ -999,7 +1225,7 @@ class ComputeDriver(object):
     def instance_on_disk(self, instance):
         """Checks access of instance files on the host.
 
-        :param instance: instance to lookup
+        :param instance: nova.objects.instance.Instance to lookup
 
         Returns True if files of an instance with the supplied ID accessible on
         the host, False otherwise.
@@ -1030,7 +1256,7 @@ class ComputeDriver(object):
         """
 
         if not self._compute_event_callback:
-            LOG.debug(_("Discarding event %s") % str(event))
+            LOG.debug("Discarding event %s", str(event))
             return
 
         if not isinstance(event, virtevent.Event):
@@ -1038,7 +1264,7 @@ class ComputeDriver(object):
                 _("Event must be an instance of nova.virt.event.Event"))
 
         try:
-            LOG.debug(_("Emitting event %s") % str(event))
+            LOG.debug("Emitting event %s", str(event))
             self._compute_event_callback(event)
         except Exception as ex:
             LOG.error(_("Exception dispatching event %(event)s: %(ex)s"),
@@ -1047,6 +1273,7 @@ class ComputeDriver(object):
     def delete_instance_files(self, instance):
         """Delete any lingering instance files for an instance.
 
+        :param instance: nova.objects.instance.Instance
         :returns: True if the instance was deleted from disk, False otherwise.
         """
         return True
@@ -1055,18 +1282,18 @@ class ComputeDriver(object):
     def need_legacy_block_device_info(self):
         """Tell the caller if the driver requires legacy block device info.
 
-        Tell the caller weather we expect the legacy format of block
+        Tell the caller whether we expect the legacy format of block
         device info to be passed in to methods that expect it.
         """
         return True
 
     def volume_snapshot_create(self, context, instance, volume_id,
                                create_info):
-        """
-        Snapshots volumes attached to a specified instance.
+        """Snapshots volumes attached to a specified instance.
 
         :param context: request context
-        :param instance: Instance object that has the volume attached
+        :param instance: nova.objects.instance.Instance that has the volume
+               attached
         :param volume_id: Volume to be snapshotted
         :param create_info: The data needed for nova to be able to attach
                to the volume.  This is the same data format returned by
@@ -1080,11 +1307,11 @@ class ComputeDriver(object):
 
     def volume_snapshot_delete(self, context, instance, volume_id,
                                snapshot_id, delete_info):
-        """
-        Snapshots volumes attached to a specified instance.
+        """Snapshots volumes attached to a specified instance.
 
         :param context: request context
-        :param instance: Instance object that has the volume attached
+        :param instance: nova.objects.instance.Instance that has the volume
+               attached
         :param volume_id: Attached volume associated with the snapshot
         :param snapshot_id: The snapshot to delete.
         :param delete_info: Volume backend technology specific data needed to
@@ -1102,6 +1329,18 @@ class ComputeDriver(object):
                                           *block_device_lists):
         """Default the missing device names in the block device mapping."""
         raise NotImplementedError()
+
+    def is_supported_fs_format(self, fs_type):
+        """Check whether the file format is supported by this driver
+
+        :param fs_type: the file system type to be checked,
+                        the validate values are defined at disk API module.
+        """
+        # NOTE(jichenjc): Return False here so that every hypervisor
+        #                 need to define their supported file system
+        #                 type and implement this function at their
+        #                 virt layer.
+        return False
 
 
 def load_compute_driver(virtapi, compute_driver=None):

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -20,7 +18,6 @@ import inspect
 
 from nova import context
 from nova import exception
-from nova.openstack.common import gettextutils
 from nova import test
 
 
@@ -86,9 +83,9 @@ class NovaExceptionTestCase(test.NoDBTestCase):
 
     def test_error_msg_exception_with_kwargs(self):
         class FakeNovaException(exception.NovaException):
-            msg_fmt = "default message: %(mispelled_code)s"
+            msg_fmt = "default message: %(misspelled_code)s"
 
-        exc = FakeNovaException(code=500, mispelled_code='blah')
+        exc = FakeNovaException(code=500, misspelled_code='blah')
         self.assertEqual(unicode(exc), 'default message: blah')
         self.assertEqual(exc.message, 'default message: blah')
 
@@ -141,15 +138,6 @@ class NovaExceptionTestCase(test.NoDBTestCase):
         self.flags(fatal_exception_format_errors=False)
         exc = FakeNovaException_Remote(lame_arg='lame')
         self.assertEqual(exc.format_message(), "some message %(somearg)s")
-
-    def test_format_message_gettext_msg_returned(self):
-        class FakeNovaException(exception.NovaException):
-            msg_fmt = gettextutils.Message("Some message %(param)s", 'nova')
-
-        exc = FakeNovaException(param='blah')
-        msg = exc.format_message()
-        self.assertIsInstance(msg, gettextutils.Message)
-        self.assertEqual(msg, "Some message blah")
 
 
 class ExceptionTestCase(test.NoDBTestCase):

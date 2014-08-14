@@ -15,12 +15,10 @@
 
 import datetime
 
-from lxml import etree
-
-from nova.api.openstack.compute.plugins.v3 import server_usage
 from nova import compute
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
@@ -52,7 +50,7 @@ def fake_compute_get_all(*args, **kwargs):
     ]
     fields = instance_obj.INSTANCE_DEFAULT_FIELDS
     return instance_obj._make_instance_list(args[1],
-                                            instance_obj.InstanceList(),
+                                            objects.InstanceList(),
                                             db_list, fields)
 
 
@@ -69,7 +67,7 @@ class ServerUsageTest(test.TestCase):
         self.stubs.Set(db, 'instance_get_by_uuid', return_server)
 
     def _make_request(self, url):
-        req = fakes.HTTPRequest.blank(url)
+        req = fakes.HTTPRequestV3.blank(url)
         req.accept = self.content_type
         res = req.get_response(fakes.wsgi_app_v3(init_only=(
             'servers', 'os-server-usage')))
@@ -125,14 +123,3 @@ class ServerUsageTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 404)
-
-
-class ServerUsageXmlTest(ServerUsageTest):
-    content_type = 'application/xml'
-    prefix = '{%s}' % server_usage.ServerUsage.namespace
-
-    def _get_server(self, body):
-        return etree.XML(body)
-
-    def _get_servers(self, body):
-        return etree.XML(body).getchildren()

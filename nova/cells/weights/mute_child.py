@@ -21,7 +21,7 @@ downgrade its likelihood of being chosen for scheduling requests.
 from oslo.config import cfg
 
 from nova.cells import weights
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 
@@ -30,11 +30,11 @@ LOG = logging.getLogger(__name__)
 mute_weigher_opts = [
         cfg.FloatOpt('mute_weight_multiplier',
                 default=-10.0,
-                help='Multiplier used to weigh mute children.  (The value '
+                help='Multiplier used to weigh mute children. (The value '
                      'should be negative.)'),
         cfg.FloatOpt('mute_weight_value',
                 default=1000.0,
-                help='Weight value assigned to mute children.  (The value '
+                help='Weight value assigned to mute children. (The value '
                      'should be positive.)'),
 ]
 
@@ -48,7 +48,7 @@ class MuteChildWeigher(weights.BaseCellWeigher):
     weight.
     """
 
-    def _weight_multiplier(self):
+    def weight_multiplier(self):
         # negative multiplier => lower weight
         return CONF.cells.mute_weight_multiplier
 

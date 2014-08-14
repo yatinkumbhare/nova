@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Hewlett-Packard Development Company, L.P.
 # All Rights Reserved.
 #
@@ -21,7 +19,7 @@ from oslo.config import cfg
 
 from nova import context as nova_context
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
@@ -33,21 +31,21 @@ from nova.virt.baremetal import db
 opts = [
     cfg.StrOpt('virtual_power_ssh_host',
                default='',
-               help='ip or name to virtual power host'),
+               help='IP or name to virtual power host'),
     cfg.IntOpt('virtual_power_ssh_port',
                default=22,
                help='Port to use for ssh to virtual power host'),
     cfg.StrOpt('virtual_power_type',
                default='virsh',
-               help='base command to use for virtual power(vbox,virsh)'),
+               help='Base command to use for virtual power(vbox, virsh)'),
     cfg.StrOpt('virtual_power_host_user',
                default='',
-               help='user to execute virtual power commands as'),
+               help='User to execute virtual power commands as'),
     cfg.StrOpt('virtual_power_host_pass',
                default='',
-               help='password for virtual power host_user'),
+               help='Password for virtual power host_user'),
     cfg.StrOpt('virtual_power_host_key',
-               help='ssh key for virtual power host_user'),
+               help='The ssh key for virtual power host_user'),
 
 ]
 
@@ -86,7 +84,7 @@ class VirtualPowerManager(base.PowerManager):
         global _cmds
 
         if _cmds is None:
-            LOG.debug(_("Setting up %s commands."),
+            LOG.debug("Setting up %s commands.",
                       CONF.baremetal.virtual_power_type)
             _vpc = 'nova.virt.baremetal.virtual_power_driver_settings.%s' % \
                     CONF.baremetal.virtual_power_type
@@ -134,13 +132,13 @@ class VirtualPowerManager(base.PowerManager):
             self._connection = connection.ssh_connect(self.connection_data)
 
     def _get_full_node_list(self):
-        LOG.debug(_("Getting full node list."))
+        LOG.debug("Getting full node list.")
         cmd = self._vp_cmd.list_cmd
         full_list = self._run_command(cmd)
         return full_list
 
     def _check_for_node(self):
-        LOG.debug(_("Looking up Name for Mac address %s."),
+        LOG.debug("Looking up Name for Mac address %s.",
                   self._mac_addresses)
         self._matched_name = ''
         full_node_list = self._get_full_node_list()
@@ -192,13 +190,13 @@ class VirtualPowerManager(base.PowerManager):
         return self.state
 
     def is_power_on(self):
-        LOG.debug(_("Checking if %s is running"), self._node_name)
+        LOG.debug("Checking if %s is running", self._node_name)
 
         if not self._check_for_node():
             err_msg = _('Node "%(name)s" with MAC address %(mac)s not found.')
             LOG.error(err_msg, {'name': self._node_name,
                                 'mac': self._mac_addresses})
-            # in our case the _node_name is the the node_id
+            # in our case the _node_name is the node_id
             raise exception.NodeNotFound(node_id=self._node_name)
 
         cmd = self._vp_cmd.list_running_cmd
@@ -229,7 +227,7 @@ class VirtualPowerManager(base.PowerManager):
             stdout, stderr = processutils.ssh_execute(
                 self._connection, cmd, check_exit_code=check_exit_code)
             result = stdout.strip().splitlines()
-            LOG.debug(_('Result for run_command: %s'), result)
+            LOG.debug('Result for run_command: %s', result)
         except processutils.ProcessExecutionError:
             result = []
             LOG.exception(_("Error running command: %s"), cmd)

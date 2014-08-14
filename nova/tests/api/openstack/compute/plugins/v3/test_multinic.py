@@ -13,9 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
 import webob
 
 from nova import compute
+from nova import exception
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
@@ -38,7 +40,8 @@ def compute_api_remove_fixed_ip(self, context, instance, address):
     last_remove_fixed_ip = (instance['uuid'], address)
 
 
-def compute_api_get(self, context, instance_id):
+def compute_api_get(self, context, instance_id, expected_attrs=None,
+                    want_objects=False):
     return {'id': 1, 'uuid': instance_id}
 
 
@@ -68,6 +71,24 @@ class FixedIpTest(test.NoDBTestCase):
         self.assertEqual(resp.status_int, 202)
         self.assertEqual(last_add_fixed_ip, (UUID, 'test_net'))
 
+    def test_add_fixed_ip_empty_network_id(self):
+        body = {'add_fixed_ip': {'network_id': ''}}
+        req = webob.Request.blank('/v3/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+        resp = req.get_response(self.app)
+        self.assertEqual(400, resp.status_int)
+
+    def test_add_fixed_ip_network_id_bigger_than_36(self):
+        body = {'add_fixed_ip': {'network_id': 'a' * 37}}
+        req = webob.Request.blank('/v3/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+        resp = req.get_response(self.app)
+        self.assertEqual(400, resp.status_int)
+
     def test_add_fixed_ip_no_network(self):
         global last_add_fixed_ip
         last_add_fixed_ip = (None, None)
@@ -82,6 +103,19 @@ class FixedIpTest(test.NoDBTestCase):
         self.assertEqual(resp.status_int, 400)
         self.assertEqual(last_add_fixed_ip, (None, None))
 
+    @mock.patch.object(compute.api.API, 'add_fixed_ip')
+    def test_add_fixed_ip_no_more_ips_available(self, mock_add_fixed_ip):
+        mock_add_fixed_ip.side_effect = exception.NoMoreFixedIps
+
+        body = dict(add_fixed_ip=dict())
+        req = webob.Request.blank('/v3/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+
+        resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 400)
+
     def test_remove_fixed_ip(self):
         global last_remove_fixed_ip
         last_remove_fixed_ip = (None, None)
@@ -95,6 +129,15 @@ class FixedIpTest(test.NoDBTestCase):
         resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
         self.assertEqual(last_remove_fixed_ip, (UUID, '10.10.10.1'))
+
+    def test_remove_fixed_ip_invalid_address(self):
+        body = {'remove_fixed_ip': {'address': ''}}
+        req = webob.Request.blank('/v3/servers/%s/action' % UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps(body)
+        req.headers['content-type'] = 'application/json'
+        resp = req.get_response(self.app)
+        self.assertEqual(400, resp.status_int)
 
     def test_remove_fixed_ip_no_address(self):
         global last_remove_fixed_ip

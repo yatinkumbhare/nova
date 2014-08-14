@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -60,8 +58,9 @@ from oslo.config import cfg
 import six
 
 from nova import config
+from nova.i18n import _
+from nova import objects
 from nova.openstack.common import cliutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import version
 from nova.virt.baremetal.db import migration as bmdb_migration
@@ -165,6 +164,8 @@ def main():
 
         print(_('Please re-run nova-manage as root.'))
         return(2)
+
+    objects.register_all()
 
     if CONF.category.name == "version":
         print(version.version_string_with_package())

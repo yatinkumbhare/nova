@@ -21,8 +21,9 @@ from nova.api.openstack import xmlutil
 import nova.context
 from nova import db
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import quota
+from nova import utils
 
 
 QUOTAS = quota.QUOTAS
@@ -64,7 +65,7 @@ class QuotaClassSetsController(wsgi.Controller):
             nova.context.authorize_quota_class_context(context, id)
             return self._format_quota_set(id,
                                           QUOTAS.get_class_quotas(context, id))
-        except exception.NotAuthorized:
+        except exception.Forbidden:
             raise webob.exc.HTTPForbidden()
 
     @wsgi.serializers(xml=QuotaClassTemplate)
@@ -80,12 +81,13 @@ class QuotaClassSetsController(wsgi.Controller):
         for key in quota_class_set.keys():
             if key in QUOTAS:
                 try:
-                    value = int(quota_class_set[key])
+                    value = utils.validate_integer(
+                        body['quota_class_set'][key], key)
+                except exception.InvalidInput as e:
+                    raise webob.exc.HTTPBadRequest(
+                        explanation=e.format_message())
+                try:
                     db.quota_class_update(context, quota_class, key, value)
-                except (ValueError, TypeError):
-                    msg = _("Quota class '%(value)s' for %(key)s should be "
-                            "integer.") % {'value': value, 'key': key}
-                    raise webob.exc.HTTPBadRequest(explanation=msg)
                 except exception.QuotaClassNotFound:
                     db.quota_class_create(context, quota_class, key, value)
                 except exception.AdminRequired:
@@ -101,7 +103,7 @@ class Quota_classes(extensions.ExtensionDescriptor):
     alias = "os-quota-class-sets"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "quota-classes-sets/api/v1.1")
-    updated = "2012-03-12T00:00:00+00:00"
+    updated = "2012-03-12T00:00:00Z"
 
     def get_resources(self):
         resources = []

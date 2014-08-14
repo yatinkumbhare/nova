@@ -19,7 +19,6 @@ import netaddr
 import six
 
 from nova.compute import api as compute
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.scheduler import filters
 
@@ -55,7 +54,7 @@ class DifferentHostFilter(AffinityFilter):
 
 class SameHostFilter(AffinityFilter):
     '''Schedule the instance on the same host as another instance in a set of
-    of instances.
+    instances.
     '''
 
     # The hosts the instances are running on doesn't change within a request
@@ -99,34 +98,74 @@ class SimpleCIDRAffinityFilter(AffinityFilter):
         return True
 
 
-class GroupAntiAffinityFilter(AffinityFilter):
+class _GroupAntiAffinityFilter(AffinityFilter):
     """Schedule the instance on a different host from a set of group
     hosts.
     """
 
+    def __init__(self):
+        super(_GroupAntiAffinityFilter, self).__init__()
+
     def host_passes(self, host_state, filter_properties):
+        # Only invoke the filter is 'anti-affinity' is configured
+        policies = filter_properties.get('group_policies', [])
+        if self.policy_name not in policies:
+            return True
+
         group_hosts = filter_properties.get('group_hosts') or []
-        LOG.debug(_("Group anti affinity: check if %(host)s not "
-                    "in %(configured)s"), {'host': host_state.host,
+        LOG.debug("Group anti affinity: check if %(host)s not "
+                    "in %(configured)s", {'host': host_state.host,
                                            'configured': group_hosts})
         if group_hosts:
-            return not host_state.host in group_hosts
+            return host_state.host not in group_hosts
 
         # No groups configured
         return True
 
 
-class GroupAffinityFilter(AffinityFilter):
+class GroupAntiAffinityFilter(_GroupAntiAffinityFilter):
+    def __init__(self):
+        self.policy_name = 'legacy'
+        super(GroupAntiAffinityFilter, self).__init__()
+
+
+class ServerGroupAntiAffinityFilter(_GroupAntiAffinityFilter):
+    def __init__(self):
+        self.policy_name = 'anti-affinity'
+        super(ServerGroupAntiAffinityFilter, self).__init__()
+
+
+class _GroupAffinityFilter(AffinityFilter):
     """Schedule the instance on to host from a set of group hosts.
     """
 
+    def __init__(self):
+        super(_GroupAffinityFilter, self).__init__()
+
     def host_passes(self, host_state, filter_properties):
+        # Only invoke the filter is 'affinity' is configured
+        policies = filter_properties.get('group_policies', [])
+        if self.policy_name not in policies:
+            return True
+
         group_hosts = filter_properties.get('group_hosts', [])
-        LOG.debug(_("Group affinity: check if %(host)s in "
-                    "%(configured)s"), {'host': host_state.host,
+        LOG.debug("Group affinity: check if %(host)s in "
+                    "%(configured)s", {'host': host_state.host,
                                         'configured': group_hosts})
         if group_hosts:
             return host_state.host in group_hosts
 
         # No groups configured
         return True
+
+
+class GroupAffinityFilter(_GroupAffinityFilter):
+    def __init__(self):
+        self.policy_name = 'legacy'
+        super(GroupAffinityFilter, self).__init__()
+
+
+class ServerGroupAffinityFilter(_GroupAffinityFilter):
+    def __init__(self):
+        self.policy_name = 'affinity'
+        super(ServerGroupAffinityFilter, self).__init__()

@@ -1,4 +1,6 @@
-# Copyright (c) 2012 Rackspace Hosting # All Rights Reserved.
+# Copyright (c) 2012 Rackspace Hosting
+# All Rights Reserved.
+# Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -15,7 +17,12 @@
 Tests For Cells Messaging module
 """
 
+import contextlib
+
+import mock
+import mox
 from oslo.config import cfg
+from oslo import messaging as oslo_messaging
 
 from nova.cells import messaging
 from nova.cells import utils as cells_utils
@@ -25,21 +32,19 @@ from nova import context
 from nova import db
 from nova import exception
 from nova.network import model as network_model
+from nova import objects
 from nova.objects import base as objects_base
 from nova.objects import fields as objects_fields
-from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
-from nova.openstack.common import rpc
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
+from nova import rpc
 from nova import test
 from nova.tests.cells import fakes
-from nova.tests import fake_instance_actions
+from nova.tests import fake_server_actions
 
 CONF = cfg.CONF
 CONF.import_opt('name', 'nova.cells.opts', group='cells')
-CONF.import_opt('allowed_rpc_exception_modules',
-                'nova.openstack.common.rpc')
 
 
 class CellsMessageClassesTestCase(test.TestCase):
@@ -48,10 +53,6 @@ class CellsMessageClassesTestCase(test.TestCase):
         super(CellsMessageClassesTestCase, self).setUp()
         fakes.init(self)
         self.ctxt = context.RequestContext('fake', 'fake')
-        # Need to be able to deserialize test.TestingException.
-        allowed_modules = CONF.allowed_rpc_exception_modules
-        allowed_modules.append('nova.test')
-        self.flags(allowed_rpc_exception_modules=allowed_modules)
         self.our_name = 'api-cell'
         self.msg_runner = fakes.get_message_runner(self.our_name)
         self.state_manager = self.msg_runner.state_manager
@@ -648,17 +649,6 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         self.tgt_db_inst = methods_cls.db
         self.tgt_c_rpcapi = methods_cls.compute_rpcapi
 
-    def test_schedule_run_instance(self):
-        host_sched_kwargs = {'filter_properties': {},
-                             'key1': 'value1',
-                             'key2': 'value2'}
-        self.mox.StubOutWithMock(self.tgt_scheduler, 'run_instance')
-        self.tgt_scheduler.run_instance(self.ctxt, host_sched_kwargs)
-        self.mox.ReplayAll()
-        self.src_msg_runner.schedule_run_instance(self.ctxt,
-                                                  self.tgt_cell_name,
-                                                  host_sched_kwargs)
-
     def test_build_instances(self):
         build_inst_kwargs = {'filter_properties': {},
                              'key1': 'value1',
@@ -692,12 +682,14 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         result = response.value_or_raise()
         self.assertEqual('fake_result', result)
 
-    def test_run_compute_api_method_expects_obj(self):
+    def _run_compute_api_method_expects_object(self, tgt_compute_api_function,
+                                               method_name,
+                                               expected_attrs=None):
+        # runs compute api methods which expects instance to be an object
         instance_uuid = 'fake_instance_uuid'
-        method_info = {'method': 'start',
+        method_info = {'method': method_name,
                        'method_args': (instance_uuid, 2, 3),
                        'method_kwargs': {'arg1': 'val1', 'arg2': 'val2'}}
-        self.mox.StubOutWithMock(self.tgt_compute_api, 'start')
         self.mox.StubOutWithMock(self.tgt_db_inst, 'instance_get_by_uuid')
 
         self.tgt_db_inst.instance_get_by_uuid(self.ctxt,
@@ -707,12 +699,12 @@ class CellsTargetedMethodsTestCase(test.TestCase):
             # NOTE(comstud): This block of code simulates the following
             # mox code:
             #
-            # self.mox.StubOutWithMock(instance_obj, 'Instance',
+            # self.mox.StubOutWithMock(objects, 'Instance',
             #                          use_mock_anything=True)
-            # self.mox.StubOutWithMock(instance_obj.Instance,
+            # self.mox.StubOutWithMock(objects.Instance,
             #                          '_from_db_object')
-            # instance_mock = self.mox.CreateMock(instance_obj.Instance)
-            # instance_obj.Instance().AndReturn(instance_mock)
+            # instance_mock = self.mox.CreateMock(objects.Instance)
+            # objects.Instance().AndReturn(instance_mock)
             #
             # Unfortunately, the above code fails on py27 do to some
             # issue with the Mock object do to similar issue as this:
@@ -720,7 +712,7 @@ class CellsTargetedMethodsTestCase(test.TestCase):
             #
             class FakeInstance(object):
                 @classmethod
-                def _from_db_object(cls, ctxt, obj, db_obj):
+                def _from_db_object(cls, ctxt, obj, db_obj, **kwargs):
                     pass
 
             instance_mock = FakeInstance()
@@ -728,14 +720,17 @@ class CellsTargetedMethodsTestCase(test.TestCase):
             def fake_instance():
                 return instance_mock
 
-            self.stubs.Set(instance_obj, 'Instance', fake_instance)
+            self.stubs.Set(objects, 'Instance', fake_instance)
             self.mox.StubOutWithMock(instance_mock, '_from_db_object')
             return instance_mock
 
         instance = get_instance_mock()
-        instance._from_db_object(
-                self.ctxt, instance, 'fake_instance').AndReturn(instance)
-        self.tgt_compute_api.start(self.ctxt, instance, 2, 3,
+        instance._from_db_object(self.ctxt,
+                                 instance,
+                                 'fake_instance',
+                                 expected_attrs=expected_attrs
+                                ).AndReturn(instance)
+        tgt_compute_api_function(self.ctxt, instance, 2, 3,
                 arg1='val1', arg2='val2').AndReturn('fake_result')
         self.mox.ReplayAll()
 
@@ -746,6 +741,20 @@ class CellsTargetedMethodsTestCase(test.TestCase):
                 True)
         result = response.value_or_raise()
         self.assertEqual('fake_result', result)
+
+    def test_run_compute_api_method_expects_obj(self):
+        # Run compute_api start method
+        self.mox.StubOutWithMock(self.tgt_compute_api, 'start')
+        self._run_compute_api_method_expects_object(self.tgt_compute_api.start,
+                                                    'start')
+
+    def test_run_compute_api_method_expects_obj_with_info_cache(self):
+        # Run compute_api shelve method as it requires info_cache and
+        # metadata to be present in instance object
+        self.mox.StubOutWithMock(self.tgt_compute_api, 'shelve')
+        self._run_compute_api_method_expects_object(
+            self.tgt_compute_api.shelve, 'shelve',
+            expected_attrs=['metadata', 'info_cache'])
 
     def test_run_compute_api_method_unknown_instance(self):
         # Unknown instance should send a broadcast up that instance
@@ -900,19 +909,36 @@ class CellsTargetedMethodsTestCase(test.TestCase):
             topic='compute')
         self.assertEqual(expected_result, result)
 
+    def test_service_delete(self):
+        fake_service = dict(id=42, host='fake_host', binary='nova-compute',
+                            topic='compute')
+
+        ctxt = self.ctxt.elevated()
+        db.service_create(ctxt, fake_service)
+
+        self.src_msg_runner.service_delete(
+            ctxt, self.tgt_cell_name, fake_service['id'])
+        self.assertRaises(exception.ServiceNotFound,
+                          db.service_get, ctxt, fake_service['id'])
+
     def test_proxy_rpc_to_manager_call(self):
         fake_topic = 'fake-topic'
-        fake_rpc_message = 'fake-rpc-message'
+        fake_rpc_message = {'method': 'fake_rpc_method', 'args': {}}
         fake_host_name = 'fake-host-name'
 
         self.mox.StubOutWithMock(self.tgt_db_inst,
                                  'service_get_by_compute_host')
-        self.mox.StubOutWithMock(rpc, 'call')
-
         self.tgt_db_inst.service_get_by_compute_host(self.ctxt,
                                                      fake_host_name)
-        rpc.call(self.ctxt, fake_topic,
-                 fake_rpc_message, timeout=5).AndReturn('fake_result')
+
+        target = oslo_messaging.Target(topic='fake-topic')
+        rpcclient = self.mox.CreateMockAnything()
+
+        self.mox.StubOutWithMock(rpc, 'get_client')
+        rpc.get_client(target).AndReturn(rpcclient)
+        rpcclient.prepare(timeout=5).AndReturn(rpcclient)
+        rpcclient.call(mox.IgnoreArg(),
+                       'fake_rpc_method').AndReturn('fake_result')
 
         self.mox.ReplayAll()
 
@@ -927,16 +953,20 @@ class CellsTargetedMethodsTestCase(test.TestCase):
 
     def test_proxy_rpc_to_manager_cast(self):
         fake_topic = 'fake-topic'
-        fake_rpc_message = 'fake-rpc-message'
+        fake_rpc_message = {'method': 'fake_rpc_method', 'args': {}}
         fake_host_name = 'fake-host-name'
 
         self.mox.StubOutWithMock(self.tgt_db_inst,
                                  'service_get_by_compute_host')
-        self.mox.StubOutWithMock(rpc, 'cast')
-
         self.tgt_db_inst.service_get_by_compute_host(self.ctxt,
                                                      fake_host_name)
-        rpc.cast(self.ctxt, fake_topic, fake_rpc_message)
+
+        target = oslo_messaging.Target(topic='fake-topic')
+        rpcclient = self.mox.CreateMockAnything()
+
+        self.mox.StubOutWithMock(rpc, 'get_client')
+        rpc.get_client(target).AndReturn(rpcclient)
+        rpcclient.cast(mox.IgnoreArg(), 'fake_rpc_method')
 
         self.mox.ReplayAll()
 
@@ -947,7 +977,7 @@ class CellsTargetedMethodsTestCase(test.TestCase):
                 fake_topic,
                 fake_rpc_message, False, timeout=None)
 
-    def test_task_log_get_all_targetted(self):
+    def test_task_log_get_all_targeted(self):
         task_name = 'fake_task_name'
         begin = 'fake_begin'
         end = 'fake_end'
@@ -983,9 +1013,9 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         self.assertEqual('fake_result', result)
 
     def test_actions_get(self):
-        fake_uuid = fake_instance_actions.FAKE_UUID
-        fake_req_id = fake_instance_actions.FAKE_REQUEST_ID1
-        fake_act = fake_instance_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
+        fake_uuid = fake_server_actions.FAKE_UUID
+        fake_req_id = fake_server_actions.FAKE_REQUEST_ID1
+        fake_act = fake_server_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
 
         self.mox.StubOutWithMock(self.tgt_db_inst, 'actions_get')
         self.tgt_db_inst.actions_get(self.ctxt,
@@ -999,9 +1029,9 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         self.assertEqual([jsonutils.to_primitive(fake_act)], result)
 
     def test_action_get_by_request_id(self):
-        fake_uuid = fake_instance_actions.FAKE_UUID
-        fake_req_id = fake_instance_actions.FAKE_REQUEST_ID1
-        fake_act = fake_instance_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
+        fake_uuid = fake_server_actions.FAKE_UUID
+        fake_req_id = fake_server_actions.FAKE_REQUEST_ID1
+        fake_act = fake_server_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
 
         self.mox.StubOutWithMock(self.tgt_db_inst, 'action_get_by_request_id')
         self.tgt_db_inst.action_get_by_request_id(self.ctxt,
@@ -1014,8 +1044,8 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         self.assertEqual(jsonutils.to_primitive(fake_act), result)
 
     def test_action_events_get(self):
-        fake_action_id = fake_instance_actions.FAKE_ACTION_ID1
-        fake_events = fake_instance_actions.FAKE_EVENTS[fake_action_id]
+        fake_action_id = fake_server_actions.FAKE_ACTION_ID1
+        fake_events = fake_server_actions.FAKE_EVENTS[fake_action_id]
 
         self.mox.StubOutWithMock(self.tgt_db_inst, 'action_events_get')
         self.tgt_db_inst.action_events_get(self.ctxt,
@@ -1076,7 +1106,7 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         self.assertEqual(0, len(responses))
 
     def test_call_compute_api_with_obj(self):
-        instance = instance_obj.Instance()
+        instance = objects.Instance()
         instance.uuid = uuidutils.generate_uuid()
         self.mox.StubOutWithMock(instance, 'refresh')
         # Using 'snapshot' for this test, because it
@@ -1093,8 +1123,33 @@ class CellsTargetedMethodsTestCase(test.TestCase):
                 extra_properties='props')
         self.assertEqual('foo', result)
 
+    def test_call_compute_api_with_obj_no_cache(self):
+        instance = objects.Instance()
+        instance.uuid = uuidutils.generate_uuid()
+        error = exception.InstanceInfoCacheNotFound(
+                                            instance_uuid=instance.uuid)
+        with mock.patch.object(instance, 'refresh', side_effect=error):
+            self.assertRaises(exception.InstanceInfoCacheNotFound,
+                              self.tgt_methods_cls._call_compute_api_with_obj,
+                              self.ctxt, instance, 'snapshot')
+
+    def test_call_delete_compute_api_with_obj_no_cache(self):
+        instance = objects.Instance()
+        instance.uuid = uuidutils.generate_uuid()
+        error = exception.InstanceInfoCacheNotFound(
+                                            instance_uuid=instance.uuid)
+        with contextlib.nested(
+            mock.patch.object(instance, 'refresh',
+                              side_effect=error),
+            mock.patch.object(self.tgt_compute_api, 'delete')) as (inst,
+                                                                   delete):
+            self.tgt_methods_cls._call_compute_api_with_obj(self.ctxt,
+                                                            instance,
+                                                            'delete')
+            delete.assert_called_once_with(self.ctxt, instance)
+
     def test_call_compute_with_obj_unknown_instance(self):
-        instance = instance_obj.Instance()
+        instance = objects.Instance()
         instance.uuid = uuidutils.generate_uuid()
         instance.vm_state = vm_states.ACTIVE
         instance.task_state = None
@@ -1120,13 +1175,16 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         message = FakeMessage()
         message.ctxt = self.ctxt
 
-        instance = instance_obj.Instance()
+        instance = objects.Instance()
         instance.cell_name = self.tgt_cell_name
         instance.obj_reset_changes()
         instance.task_state = 'meow'
         instance.vm_state = 'wuff'
         instance.user_data = 'foo'
-        self.assertEqual(set(['user_data', 'vm_state', 'task_state']),
+        instance.metadata = {'meta': 'data'}
+        instance.system_metadata = {'system': 'metadata'}
+        self.assertEqual(set(['user_data', 'vm_state', 'task_state',
+                              'metadata', 'system_metadata']),
                          instance.obj_what_changed())
 
         self.mox.StubOutWithMock(instance, 'save')
@@ -1280,7 +1338,7 @@ class CellsTargetedMethodsTestCase(test.TestCase):
                                           (), {}, (), {}, False)
 
     def test_snapshot_instance(self):
-        inst = instance_obj.Instance()
+        inst = objects.Instance()
         meth_cls = self.tgt_methods_cls
 
         self.mox.StubOutWithMock(inst, 'refresh')
@@ -1309,7 +1367,7 @@ class CellsTargetedMethodsTestCase(test.TestCase):
         meth_cls.snapshot_instance(message, inst, image_id='image-id')
 
     def test_backup_instance(self):
-        inst = instance_obj.Instance()
+        inst = objects.Instance()
         meth_cls = self.tgt_methods_cls
 
         self.mox.StubOutWithMock(inst, 'refresh')
@@ -1586,22 +1644,26 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
 
     def test_instance_fault_create_at_top(self):
         fake_instance_fault = {'id': 1,
-                               'other stuff': 2,
-                               'more stuff': 3}
-        expected_instance_fault = {'other stuff': 2,
-                                   'more stuff': 3}
+                               'message': 'fake-message',
+                               'details': 'fake-details'}
 
-        # Shouldn't be called for these 2 cells
-        self.mox.StubOutWithMock(self.src_db_inst, 'instance_fault_create')
-        self.mox.StubOutWithMock(self.mid_db_inst, 'instance_fault_create')
+        if_mock = mock.Mock(spec_set=objects.InstanceFault)
 
-        self.mox.StubOutWithMock(self.tgt_db_inst, 'instance_fault_create')
-        self.tgt_db_inst.instance_fault_create(self.ctxt,
-                                               expected_instance_fault)
-        self.mox.ReplayAll()
+        def _check_create():
+            self.assertEqual('fake-message', if_mock.message)
+            self.assertEqual('fake-details', if_mock.details)
+            # Should not be set
+            self.assertNotEqual(1, if_mock.id)
 
-        self.src_msg_runner.instance_fault_create_at_top(self.ctxt,
-                fake_instance_fault)
+        if_mock.create.side_effect = _check_create
+
+        with mock.patch.object(objects, 'InstanceFault') as if_obj_mock:
+            if_obj_mock.return_value = if_mock
+            self.src_msg_runner.instance_fault_create_at_top(
+                    self.ctxt, fake_instance_fault)
+
+        if_obj_mock.assert_called_once_with(context=self.ctxt)
+        if_mock.create.assert_called_once_with()
 
     def test_bw_usage_update_at_top(self):
         fake_bw_update_info = {'uuid': 'fake_uuid',

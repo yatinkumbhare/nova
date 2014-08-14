@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -63,11 +61,11 @@ class UsedLimitsController(wsgi.Controller):
             'totalSecurityGroupsUsed': 'security_groups',
         }
         used_limits = {}
-        for display_name, quota in quota_map.iteritems():
-            if quota in quotas:
-                reserved = (quotas[quota]['reserved']
+        for display_name, key in quota_map.iteritems():
+            if key in quotas:
+                reserved = (quotas[key]['reserved']
                             if self._reserved(req) else 0)
-                used_limits[display_name] = quotas[quota]['in_use'] + reserved
+                used_limits[display_name] = quotas[key]['in_use'] + reserved
 
         resp_obj.obj['limits']['absolute'].update(used_limits)
 
@@ -90,7 +88,7 @@ class Used_limits(extensions.ExtensionDescriptor):
     name = "UsedLimits"
     alias = ALIAS
     namespace = XMLNS
-    updated = "2012-07-13T00:00:00+00:00"
+    updated = "2012-07-13T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = UsedLimitsController(self.ext_mgr)

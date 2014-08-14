@@ -29,6 +29,7 @@ Programming HowTos and Tutorials
     development.environment
     unit_tests
     addmethod.openstackapi
+    gmr
 
 
 Background Concepts for Nova
@@ -37,12 +38,21 @@ Background Concepts for Nova
    :maxdepth: 3
 
    architecture
+   aggregates
    threading
    vmstates
    il8n
    filter_scheduler
    rpc
    hooks
+
+Development policies
+--------------------
+.. toctree::
+   :maxdepth: 3
+
+   policies
+
 
 Other Resources
 ---------------
@@ -53,28 +63,12 @@ Other Resources
    gerrit
    jenkins
 
-API Reference
--------------
-.. toctree::
-   :maxdepth: 3
-
-   ../api/autoindex
-
 Module Reference
 ----------------
 .. toctree::
    :maxdepth: 3
 
    services
-   database
-   compute
-   network
-   api
-   scheduler
-   fakes
-   nova
-   objectstore
-   glance
 
 
 Indices and tables

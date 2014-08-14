@@ -15,7 +15,7 @@
 
 from oslo.config import cfg
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.scheduler import filters
 from nova import servicegroup
@@ -38,13 +38,13 @@ class ComputeFilter(filters.BaseHostFilter):
         """Returns True for only active compute nodes."""
         service = host_state.service
         if service['disabled']:
-            LOG.debug(_("%(host_state)s is disabled, reason: %(reason)s"),
+            LOG.debug("%(host_state)s is disabled, reason: %(reason)s",
                       {'host_state': host_state,
                        'reason': service.get('disabled_reason')})
             return False
         else:
             if not self.servicegroup_api.service_is_up(service):
                 LOG.warn(_("%(host_state)s has not been heard from in a "
-                           " while"), {'host_state': host_state})
+                           "while"), {'host_state': host_state})
                 return False
         return True

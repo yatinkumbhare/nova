@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -21,11 +19,13 @@
 import time
 
 from oslo.config import cfg
+from oslo import messaging
 
 from nova.cells import rpcapi as cells_rpcapi
 from nova.compute import rpcapi as compute_rpcapi
+from nova.i18n import _, _LW
 from nova import manager
-from nova.openstack.common.gettextutils import _
+from nova import objects
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import memorycache
@@ -36,10 +36,7 @@ LOG = logging.getLogger(__name__)
 consoleauth_opts = [
     cfg.IntOpt('console_token_ttl',
                default=600,
-               help='How many seconds before deleting tokens'),
-    cfg.StrOpt('consoleauth_manager',
-               default='nova.consoleauth.manager.ConsoleAuthManager',
-               help='Manager for console auth'),
+               help='How many seconds before deleting tokens')
     ]
 
 CONF = cfg.CONF
@@ -50,7 +47,7 @@ CONF.import_opt('enable', 'nova.cells.opts', group='cells')
 class ConsoleAuthManager(manager.Manager):
     """Manages token based authentication."""
 
-    RPC_API_VERSION = '2.0'
+    target = messaging.Target(version='2.0')
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
         super(ConsoleAuthManager, self).__init__(service_name='consoleauth',
@@ -78,7 +75,14 @@ class ConsoleAuthManager(manager.Manager):
                       'internal_access_path': internal_access_path,
                       'last_activity_at': time.time()}
         data = jsonutils.dumps(token_dict)
-        self.mc.set(token.encode('UTF-8'), data, CONF.console_token_ttl)
+
+        # We need to log the warning message if the token is not cached
+        # successfully, because the failure will cause the console for
+        # instance to not be usable.
+        if not self.mc.set(token.encode('UTF-8'),
+                           data, CONF.console_token_ttl):
+            LOG.warning(_LW("Token: %(token)s failed to save into memcached."),
+                            {'token': token})
         tokens = self._get_tokens_for_instance(instance_uuid)
         # Remove the expired tokens from cache.
         for tok in tokens:
@@ -86,8 +90,11 @@ class ConsoleAuthManager(manager.Manager):
             if not token_str:
                 tokens.remove(tok)
         tokens.append(token)
-        self.mc.set(instance_uuid.encode('UTF-8'),
-                    jsonutils.dumps(tokens))
+        if not self.mc.set(instance_uuid.encode('UTF-8'),
+                           jsonutils.dumps(tokens)):
+            LOG.warning(_LW("Instance: %(instance_uuid)s failed to save "
+                            "into memcached"),
+                        {'instance_uuid': instance_uuid})
 
         LOG.audit(_("Received Token: %(token)s, %(token_dict)s"),
                   {'token': token, 'token_dict': token_dict})
@@ -104,7 +111,7 @@ class ConsoleAuthManager(manager.Manager):
             return self.cells_rpcapi.validate_console_port(context,
                     instance_uuid, token['port'], token['console_type'])
 
-        instance = self.db.instance_get_by_uuid(context, instance_uuid)
+        instance = objects.Instance.get_by_uuid(context, instance_uuid)
 
         return self.compute_rpcapi.validate_console_port(context,
                                             instance,

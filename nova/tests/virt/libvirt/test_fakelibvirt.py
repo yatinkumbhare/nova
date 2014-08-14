@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2010 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -62,8 +60,8 @@ def get_vm_xml(name="testname", uuid=None, source_type='file',
 
 
 class FakeLibvirtTests(test.NoDBTestCase):
-    def setUp(self):
-        super(FakeLibvirtTests, self).setUp()
+    def tearDown(self):
+        super(FakeLibvirtTests, self).tearDown()
         libvirt._reset()
 
     def get_openAuth_curry_func(self, readOnly=False):
@@ -87,6 +85,7 @@ class FakeLibvirtTests(test.NoDBTestCase):
     def test_openAuth_can_refuse_None_uri(self):
         conn_method = self.get_openAuth_curry_func()
         libvirt.allow_default_uri_connection = False
+        self.addCleanup(libvirt._reset)
         self.assertRaises(ValueError, conn_method, None)
 
     def test_openAuth_refuses_invalid_URI(self):
@@ -277,7 +276,7 @@ class FakeLibvirtTests(test.NoDBTestCase):
 
     def test_getVersion(self):
         conn = self.get_openAuth_curry_func()('qemu:///system')
-        self.assertTrue(type(conn.getVersion()) is int)
+        self.assertIsInstance(conn.getVersion(), int)
 
     def test_getCapabilities(self):
         conn = self.get_openAuth_curry_func()('qemu:///system')

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -22,10 +20,12 @@ class FakeResourceTracker(resource_tracker.ResourceTracker):
     """Version without a DB requirement."""
 
     def _create(self, context, values):
+        self._write_ext_resources(values)
         self.compute_node = values
         self.compute_node['id'] = 1
 
     def _update(self, context, values, prune_stats=False):
+        self._write_ext_resources(values)
         self.compute_node.update(values)
 
     def _get_service(self, context):

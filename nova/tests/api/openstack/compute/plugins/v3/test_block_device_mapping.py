@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
 import mox
 from oslo.config import cfg
 from webob import exc
@@ -73,7 +72,7 @@ class BlockDeviceMappingTest(test.TestCase):
         }
 
         if no_image:
-            body['server']['image_ref'] = ''
+            del body['server']['image_ref']
 
         body['server'].update(params)
 
@@ -84,9 +83,9 @@ class BlockDeviceMappingTest(test.TestCase):
         req.body = jsonutils.dumps(body)
 
         if override_controller:
-            override_controller.create(req, body).obj['server']
+            override_controller.create(req, body=body).obj['server']
         else:
-            self.controller.create(req, body).obj['server']
+            self.controller.create(req, body=body).obj['server']
 
     def test_create_instance_with_block_device_mapping_disabled(self):
         bdm = [{'device_name': 'foo'}]
@@ -104,8 +103,7 @@ class BlockDeviceMappingTest(test.TestCase):
                           override_controller=self.no_volumes_controller)
 
     def test_create_instance_with_volumes_enabled_no_image(self):
-        """
-        Test that the create will fail if there is no image
+        """Test that the create will fail if there is no image
         and no bdms supplied in the request
         """
         old_create = compute_api.API.create
@@ -155,7 +153,8 @@ class BlockDeviceMappingTest(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest, self._test_create, params)
+        self.assertRaises(exc.HTTPBadRequest,
+                          self._test_create, params, no_image=True)
 
     def test_create_instance_with_device_name_empty(self):
         self.bdm[0]['device_name'] = ''
@@ -169,7 +168,8 @@ class BlockDeviceMappingTest(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest, self._test_create, params)
+        self.assertRaises(exc.HTTPBadRequest,
+                          self._test_create, params, no_image=True)
 
     def test_create_instance_with_device_name_too_long(self):
         self.bdm[0]['device_name'] = 'a' * 256
@@ -183,7 +183,8 @@ class BlockDeviceMappingTest(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest, self._test_create, params)
+        self.assertRaises(exc.HTTPBadRequest,
+                          self._test_create, params, no_image=True)
 
     def test_create_instance_with_space_in_device_name(self):
         self.bdm[0]['device_name'] = 'v da'
@@ -198,7 +199,8 @@ class BlockDeviceMappingTest(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest, self._test_create, params)
+        self.assertRaises(exc.HTTPBadRequest,
+                          self._test_create, params, no_image=True)
 
     def test_create_instance_with_invalid_size(self):
         self.bdm[0]['volume_size'] = 'hello world'
@@ -212,7 +214,8 @@ class BlockDeviceMappingTest(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest, self._test_create, params)
+        self.assertRaises(exc.HTTPBadRequest,
+                          self._test_create, params, no_image=True)
 
     def test_create_instance_bdm(self):
         bdm = [{
@@ -243,7 +246,7 @@ class BlockDeviceMappingTest(test.TestCase):
         self.stubs.Set(compute_api.API, '_validate_bdm', _validate_bdm)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: bdm}
-        self._test_create(params)
+        self._test_create(params, no_image=True)
 
     def test_create_instance_bdm_missing_device_name(self):
         del self.bdm[0]['device_name']
@@ -263,7 +266,7 @@ class BlockDeviceMappingTest(test.TestCase):
         self.stubs.Set(compute_api.API, '_validate_bdm', _validate_bdm)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self._test_create(params)
+        self._test_create(params, no_image=True)
 
     def test_create_instance_bdm_validation_error(self):
         def _validate(*args, **kwargs):
@@ -273,62 +276,19 @@ class BlockDeviceMappingTest(test.TestCase):
                       '_validate', _validate)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest, self._test_create, params)
+        self.assertRaises(exc.HTTPBadRequest,
+                          self._test_create, params, no_image=True)
 
-
-class TestServerCreateRequestXMLDeserializer(test.TestCase):
-
-    def setUp(self):
-        super(TestServerCreateRequestXMLDeserializer, self).setUp()
-        ext_info = plugins.LoadedExtensionInfo()
-        servers_controller = servers.ServersController(extension_info=ext_info)
-        self.deserializer = servers.CreateDeserializer(servers_controller)
-
-    def test_request_with_block_device_mapping(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v3"
-            xmlns:%(alias)s="%(namespace)s"
-            name="new-server-test" image_ref="1" flavor_ref="1">
-       <%(alias)s:block_device_mapping>
-         <mapping uuid="7329b667-50c7-46a6-b913-cb2a09dfeee0"
-                  device_name="/dev/vda" source_type="volume"
-                  destination_type="volume" delete_on_termination="False" />
-         <mapping uuid="f31efb24-34d2-43e1-8b44-316052956a39"
-                  device_name="/dev/vdb" source_type="snapshot"
-                  destination_type="volume" delete_on_termination="False" />
-         <mapping device_name="/dev/vdc" source_type="blank"
-                  destination_type="local" />
-       </%(alias)s:block_device_mapping>
-    </server>""" % {
-           'alias': block_device_mapping.ALIAS,
-           'namespace': block_device_mapping.BlockDeviceMapping.namespace}
-
-        request = self.deserializer.deserialize(serial_request)
-
-        expected = {'server': {
-                'name': 'new-server-test',
-                'image_ref': '1',
-                'flavor_ref': '1',
-                block_device_mapping.ATTRIBUTE_NAME: [
-                    {
-                        'uuid': '7329b667-50c7-46a6-b913-cb2a09dfeee0',
-                        'device_name': '/dev/vda',
-                        'source_type': 'volume',
-                        'destination_type': 'volume',
-                        'delete_on_termination': 'False',
-                    },
-                    {
-                        'uuid': 'f31efb24-34d2-43e1-8b44-316052956a39',
-                        'device_name': '/dev/vdb',
-                        'source_type': 'snapshot',
-                        'destination_type': 'volume',
-                        'delete_on_termination': 'False',
-                    },
-                    {
-                        'device_name': '/dev/vdc',
-                        'source_type': 'blank',
-                        'destination_type': 'local',
-                    },
-                ]
-                }}
-        self.assertEqual(expected, request['body'])
+    @mock.patch('nova.compute.api.API._get_bdm_image_metadata')
+    def test_create_instance_non_bootable_volume_fails(self, fake_bdm_meta):
+        bdm = [{
+            'id': 1,
+            'bootable': False,
+            'volume_id': '1',
+            'status': 'active',
+            'device_name': 'vda',
+        }]
+        params = {'block_device_mapping': bdm}
+        fake_bdm_meta.side_effect = exception.InvalidBDMVolumeNotBootable(id=1)
+        self.assertRaises(exc.HTTPBadRequest, self._test_create, params,
+                          no_image=True)

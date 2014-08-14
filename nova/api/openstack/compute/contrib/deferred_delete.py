@@ -37,7 +37,9 @@ class DeferredDeleteController(wsgi.Controller):
         """Restore a previously deleted instance."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = self.compute_api.get(context, id, want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id,
+                                       want_objects=True)
+
         try:
             self.compute_api.restore(context, instance)
         except exception.QuotaError as error:
@@ -54,7 +56,9 @@ class DeferredDeleteController(wsgi.Controller):
         """Force delete of instance before deferred cleanup."""
         context = req.environ["nova.context"]
         authorize(context)
-        instance = self.compute_api.get(context, id, want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id,
+                                       want_objects=True)
+
         try:
             self.compute_api.force_delete(context, instance)
         except exception.InstanceInvalidState as state_error:
@@ -70,7 +74,7 @@ class Deferred_delete(extensions.ExtensionDescriptor):
     alias = "os-deferred-delete"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "deferred-delete/api/v1.1")
-    updated = "2011-09-01T00:00:00+00:00"
+    updated = "2011-09-01T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = DeferredDeleteController()

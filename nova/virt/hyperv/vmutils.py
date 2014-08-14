@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 Cloud.com, Inc
 # Copyright 2012 Cloudbase Solutions Srl / Pedro Navarro Perez
 # All Rights Reserved.
@@ -30,7 +28,7 @@ if sys.platform == 'win32':
 from oslo.config import cfg
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.virt.hyperv import constants
 
@@ -56,6 +54,11 @@ class HyperVAuthorizationException(HyperVException):
         super(HyperVException, self).__init__(message)
 
 
+class UnsupportedConfigDriveFormatException(HyperVException):
+    def __init__(self, message=None):
+        super(HyperVException, self).__init__(message)
+
+
 class VMUtils(object):
 
     # These constants can be overridden by inherited classes
@@ -66,6 +69,16 @@ class VMUtils(object):
     _IDE_DVD_RES_SUB_TYPE = 'Microsoft Virtual CD/DVD Disk'
     _IDE_CTRL_RES_SUB_TYPE = 'Microsoft Emulated IDE Controller'
     _SCSI_CTRL_RES_SUB_TYPE = 'Microsoft Synthetic SCSI Controller'
+
+    _SETTINGS_DEFINE_STATE_CLASS = 'Msvm_SettingsDefineState'
+    _VIRTUAL_SYSTEM_SETTING_DATA_CLASS = 'Msvm_VirtualSystemSettingData'
+    _RESOURCE_ALLOC_SETTING_DATA_CLASS = 'Msvm_ResourceAllocationSettingData'
+    _PROCESSOR_SETTING_DATA_CLASS = 'Msvm_ProcessorSettingData'
+    _MEMORY_SETTING_DATA_CLASS = 'Msvm_MemorySettingData'
+    _STORAGE_ALLOC_SETTING_DATA_CLASS = _RESOURCE_ALLOC_SETTING_DATA_CLASS
+    _SYNTHETIC_ETHERNET_PORT_SETTING_DATA_CLASS = \
+    'Msvm_SyntheticEthernetPortSettingData'
+    _AFFECTED_JOB_ELEMENT_CLASS = "Msvm_AffectedJobElement"
 
     _vm_power_states_map = {constants.HYPERV_VM_STATE_ENABLED: 2,
                             constants.HYPERV_VM_STATE_DISABLED: 3,
@@ -95,10 +108,10 @@ class VMUtils(object):
 
         vs_man_svc = self._conn.Msvm_VirtualSystemManagementService()[0]
         vmsettings = vm.associators(
-            wmi_association_class='Msvm_SettingsDefineState',
-            wmi_result_class='Msvm_VirtualSystemSettingData')
+            wmi_association_class=self._SETTINGS_DEFINE_STATE_CLASS,
+            wmi_result_class=self._VIRTUAL_SYSTEM_SETTING_DATA_CLASS)
         settings_paths = [v.path_() for v in vmsettings]
-        #See http://msdn.microsoft.com/en-us/library/cc160706%28VS.85%29.aspx
+        # See http://msdn.microsoft.com/en-us/library/cc160706%28VS.85%29.aspx
         (ret_val, summary_info) = vs_man_svc.GetSummaryInformation(
             [constants.VM_SUMMARY_NUM_PROCS,
              constants.VM_SUMMARY_ENABLED_STATE,
@@ -144,15 +157,19 @@ class VMUtils(object):
     def vm_exists(self, vm_name):
         return self._lookup_vm(vm_name) is not None
 
+    def get_vm_id(self, vm_name):
+        vm = self._lookup_vm_check(vm_name)
+        return vm.Name
+
     def _get_vm_setting_data(self, vm):
         vmsettings = vm.associators(
-            wmi_result_class='Msvm_VirtualSystemSettingData')
+            wmi_result_class=self._VIRTUAL_SYSTEM_SETTING_DATA_CLASS)
         # Avoid snapshots
         return [s for s in vmsettings if s.SettingType == 3][0]
 
     def _set_vm_memory(self, vm, vmsetting, memory_mb, dynamic_memory_ratio):
         mem_settings = vmsetting.associators(
-            wmi_result_class='Msvm_MemorySettingData')[0]
+            wmi_result_class=self._MEMORY_SETTING_DATA_CLASS)[0]
 
         max_mem = long(memory_mb)
         mem_settings.Limit = max_mem
@@ -175,7 +192,7 @@ class VMUtils(object):
 
     def _set_vm_vcpus(self, vm, vmsetting, vcpus_num, limit_cpu_features):
         procsetting = vmsetting.associators(
-            wmi_result_class='Msvm_ProcessorSettingData')[0]
+            wmi_result_class=self._PROCESSOR_SETTING_DATA_CLASS)[0]
         vcpus = long(vcpus_num)
         procsetting.VirtualQuantity = vcpus
         procsetting.Reservation = vcpus
@@ -203,15 +220,15 @@ class VMUtils(object):
         """Creates a VM."""
         vs_man_svc = self._conn.Msvm_VirtualSystemManagementService()[0]
 
-        LOG.debug(_('Creating VM %s'), vm_name)
+        LOG.debug('Creating VM %s', vm_name)
         vm = self._create_vm_obj(vs_man_svc, vm_name)
 
         vmsetting = self._get_vm_setting_data(vm)
 
-        LOG.debug(_('Setting memory for vm %s'), vm_name)
+        LOG.debug('Setting memory for vm %s', vm_name)
         self._set_vm_memory(vm, vmsetting, memory_mb, dynamic_memory_ratio)
 
-        LOG.debug(_('Set vCPUs for vm %s'), vm_name)
+        LOG.debug('Set vCPUs for vm %s', vm_name)
         self._set_vm_vcpus(vm, vmsetting, vcpus_num, limit_cpu_features)
 
     def _create_vm_obj(self, vs_man_svc, vm_name):
@@ -229,18 +246,18 @@ class VMUtils(object):
         vm = self._lookup_vm_check(vm_name)
 
         vmsettings = vm.associators(
-            wmi_result_class='Msvm_VirtualSystemSettingData')
+            wmi_result_class=self._VIRTUAL_SYSTEM_SETTING_DATA_CLASS)
         rasds = vmsettings[0].associators(
-            wmi_result_class='MSVM_ResourceAllocationSettingData')
+            wmi_result_class=self._RESOURCE_ALLOC_SETTING_DATA_CLASS)
         res = [r for r in rasds
                if r.ResourceSubType == self._SCSI_CTRL_RES_SUB_TYPE][0]
         return res.path_()
 
     def _get_vm_ide_controller(self, vm, ctrller_addr):
         vmsettings = vm.associators(
-            wmi_result_class='Msvm_VirtualSystemSettingData')
+            wmi_result_class=self._VIRTUAL_SYSTEM_SETTING_DATA_CLASS)
         rasds = vmsettings[0].associators(
-            wmi_result_class='MSVM_ResourceAllocationSettingData')
+            wmi_result_class=self._RESOURCE_ALLOC_SETTING_DATA_CLASS)
         return [r for r in rasds
                 if r.ResourceSubType == self._IDE_CTRL_RES_SUB_TYPE
                 and r.Address == str(ctrller_addr)][0].path_()
@@ -249,25 +266,27 @@ class VMUtils(object):
         vm = self._lookup_vm_check(vm_name)
         return self._get_vm_ide_controller(vm, ctrller_addr)
 
-    def get_attached_disks_count(self, scsi_controller_path):
-        volumes = self._conn.query("SELECT * FROM "
-                                   "Msvm_ResourceAllocationSettingData "
+    def get_attached_disks(self, scsi_controller_path):
+        volumes = self._conn.query("SELECT * FROM %(class_name)s "
                                    "WHERE ResourceSubType = "
                                    "'%(res_sub_type)s' AND "
                                    "Parent = '%(parent)s'" %
-                                   {'res_sub_type':
+                                   {"class_name":
+                                    self._RESOURCE_ALLOC_SETTING_DATA_CLASS,
+                                    'res_sub_type':
                                     self._PHYS_DISK_RES_SUB_TYPE,
                                     'parent':
                                     scsi_controller_path.replace("'", "''")})
-        return len(volumes)
+        return volumes
 
     def _get_new_setting_data(self, class_name):
         return self._conn.query("SELECT * FROM %s WHERE InstanceID "
                                 "LIKE '%%\\Default'" % class_name)[0]
 
-    def _get_new_resource_setting_data(
-            self, resource_sub_type,
-            class_name='Msvm_ResourceAllocationSettingData'):
+    def _get_new_resource_setting_data(self, resource_sub_type,
+                                       class_name=None):
+        if class_name is None:
+            class_name = self._RESOURCE_ALLOC_SETTING_DATA_CLASS
         return self._conn.query("SELECT * FROM %(class_name)s "
                                 "WHERE ResourceSubType = "
                                 "'%(res_sub_type)s' AND "
@@ -290,10 +309,10 @@ class VMUtils(object):
 
         drive = self._get_new_resource_setting_data(res_sub_type)
 
-        #Set the IDE ctrller as parent.
+        # Set the IDE ctrller as parent.
         drive.Parent = ctrller_path
         drive.Address = drive_addr
-        #Add the cloned disk drive object to the vm.
+        # Add the cloned disk drive object to the vm.
         new_resources = self._add_virt_resource(drive, vm.path_())
         drive_path = new_resources[0]
 
@@ -303,11 +322,11 @@ class VMUtils(object):
             res_sub_type = self._IDE_DVD_RES_SUB_TYPE
 
         res = self._get_new_resource_setting_data(res_sub_type)
-        #Set the new drive as the parent.
+        # Set the new drive as the parent.
         res.Parent = drive_path
         res.Connection = [path]
 
-        #Add the new vhd object as a virtual hard disk to the vm.
+        # Add the new vhd object as a virtual hard disk to the vm.
         self._add_virt_resource(res, vm.path_())
 
     def create_scsi_controller(self, vm_name):
@@ -347,17 +366,17 @@ class VMUtils(object):
 
     def create_nic(self, vm_name, nic_name, mac_address):
         """Create a (synthetic) nic and attach it to the vm."""
-        #Create a new nic
+        # Create a new nic
         new_nic_data = self._get_new_setting_data(
-            'Msvm_SyntheticEthernetPortSettingData')
+            self._SYNTHETIC_ETHERNET_PORT_SETTING_DATA_CLASS)
 
-        #Configure the nic
+        # Configure the nic
         new_nic_data.ElementName = nic_name
         new_nic_data.Address = mac_address.replace(':', '')
         new_nic_data.StaticMacAddress = 'True'
         new_nic_data.VirtualSystemIdentifiers = ['{' + str(uuid.uuid4()) + '}']
 
-        #Add the new nic to the vm
+        # Add the new nic to the vm
         vm = self._lookup_vm_check(vm_name)
 
         self._add_virt_resource(new_nic_data, vm.path_())
@@ -367,26 +386,19 @@ class VMUtils(object):
         vm = self._lookup_vm_check(vm_name)
         (job_path,
          ret_val) = vm.RequestStateChange(self._vm_power_states_map[req_state])
-        #Invalid state for current operation (32775) typically means that
-        #the VM is already in the state requested
+        # Invalid state for current operation (32775) typically means that
+        # the VM is already in the state requested
         self.check_ret_val(ret_val, job_path, [0, 32775])
-        LOG.debug(_("Successfully changed vm state of %(vm_name)s "
-                    "to %(req_state)s"),
+        LOG.debug("Successfully changed vm state of %(vm_name)s "
+                  "to %(req_state)s",
                   {'vm_name': vm_name, 'req_state': req_state})
+
+    def _get_disk_resource_disk_path(self, disk_resource):
+        return disk_resource.Connection
 
     def get_vm_storage_paths(self, vm_name):
         vm = self._lookup_vm_check(vm_name)
-
-        vmsettings = vm.associators(
-            wmi_result_class='Msvm_VirtualSystemSettingData')
-        rasds = vmsettings[0].associators(
-            wmi_result_class='Msvm_ResourceAllocationSettingData')
-        disk_resources = [r for r in rasds
-                          if r.ResourceSubType ==
-                          self._IDE_DISK_RES_SUB_TYPE]
-        volume_resources = [r for r in rasds
-                            if r.ResourceSubType ==
-                            self._PHYS_DISK_RES_SUB_TYPE]
+        (disk_resources, volume_resources) = self._get_vm_disks(vm)
 
         volume_drives = []
         for volume_resource in volume_resources:
@@ -395,15 +407,30 @@ class VMUtils(object):
 
         disk_files = []
         for disk_resource in disk_resources:
-            disk_files.extend([c for c in disk_resource.Connection])
+            disk_files.extend(
+                [c for c in self._get_disk_resource_disk_path(disk_resource)])
 
         return (disk_files, volume_drives)
+
+    def _get_vm_disks(self, vm):
+        vmsettings = vm.associators(
+            wmi_result_class=self._VIRTUAL_SYSTEM_SETTING_DATA_CLASS)
+        rasds = vmsettings[0].associators(
+            wmi_result_class=self._STORAGE_ALLOC_SETTING_DATA_CLASS)
+        disk_resources = [r for r in rasds if
+                          r.ResourceSubType in
+                          [self._IDE_DISK_RES_SUB_TYPE,
+                           self._IDE_DVD_RES_SUB_TYPE]]
+        volume_resources = [r for r in rasds if
+                            r.ResourceSubType == self._PHYS_DISK_RES_SUB_TYPE]
+
+        return (disk_resources, volume_resources)
 
     def destroy_vm(self, vm_name):
         vm = self._lookup_vm_check(vm_name)
 
         vs_man_svc = self._conn.Msvm_VirtualSystemManagementService()[0]
-        #Remove the VM. Does not destroy disks.
+        # Remove the VM. Does not destroy disks.
         (job_path, ret_val) = vs_man_svc.DestroyVirtualSystem(vm.path_())
         self.check_ret_val(ret_val, job_path)
 
@@ -450,28 +477,12 @@ class VMUtils(object):
                                           job_state)
         desc = job.Description
         elap = job.ElapsedTime
-        LOG.debug(_("WMI job succeeded: %(desc)s, Elapsed=%(elap)s"),
+        LOG.debug("WMI job succeeded: %(desc)s, Elapsed=%(elap)s",
                   {'desc': desc, 'elap': elap})
         return job
 
     def _get_wmi_obj(self, path):
         return wmi.WMI(moniker=path.replace('\\', '/'))
-
-    def _clone_wmi_obj(self, wmi_class, wmi_obj):
-        """Clone a WMI object."""
-        cl = getattr(self._conn, wmi_class)  # get the class
-        newinst = cl.new()
-        #Copy the properties from the original.
-        for prop in wmi_obj._properties:
-            if prop == "VirtualSystemIdentifiers":
-                strguid = []
-                strguid.append(str(uuid.uuid4()))
-                newinst.Properties_.Item(prop).Value = strguid
-            else:
-                prop_value = wmi_obj.Properties_.Item(prop).Value
-                newinst.Properties_.Item(prop).Value = prop_value
-
-        return newinst
 
     def _add_virt_resource(self, res_setting_data, vm_path):
         """Adds a new resource to the VM."""
@@ -511,7 +522,7 @@ class VMUtils(object):
         job_wmi_path = job_path.replace('\\', '/')
         job = wmi.WMI(moniker=job_wmi_path)
         snp_setting_data = job.associators(
-            wmi_result_class='Msvm_VirtualSystemSettingData')[0]
+            wmi_result_class=self._VIRTUAL_SYSTEM_SETTING_DATA_CLASS)[0]
         return snp_setting_data.path_()
 
     def remove_vm_snapshot(self, snapshot_path):
@@ -528,10 +539,12 @@ class VMUtils(object):
             self._remove_virt_resource(physical_disk, vm.path_())
 
     def _get_mounted_disk_resource_from_path(self, disk_path):
-        physical_disks = self._conn.query("SELECT * FROM "
-                                          "Msvm_ResourceAllocationSettingData"
-                                          " WHERE ResourceSubType = '%s'" %
-                                          self._PHYS_DISK_RES_SUB_TYPE)
+        physical_disks = self._conn.query("SELECT * FROM %(class_name)s "
+                             "WHERE ResourceSubType = '%(res_sub_type)s'" %
+                             {"class_name":
+                              self._RESOURCE_ALLOC_SETTING_DATA_CLASS,
+                              'res_sub_type':
+                              self._PHYS_DISK_RES_SUB_TYPE})
         for physical_disk in physical_disks:
             if physical_disk.HostResource:
                 if physical_disk.HostResource[0].lower() == disk_path.lower():
@@ -545,12 +558,15 @@ class VMUtils(object):
             return mounted_disks[0].path_()
 
     def get_controller_volume_paths(self, controller_path):
-        disks = self._conn.query("SELECT * FROM "
-                                 "Msvm_ResourceAllocationSettingData "
+        disks = self._conn.query("SELECT * FROM %(class_name)s "
                                  "WHERE ResourceSubType = '%(res_sub_type)s' "
                                  "AND Parent='%(parent)s'" %
-                                 {"res_sub_type": self._PHYS_DISK_RES_SUB_TYPE,
-                                  "parent": controller_path})
+                                 {"class_name":
+                                  self._RESOURCE_ALLOC_SETTING_DATA_CLASS,
+                                  "res_sub_type":
+                                  self._PHYS_DISK_RES_SUB_TYPE,
+                                  "parent":
+                                  controller_path})
         disk_data = {}
         for disk in disks:
             if disk.HostResource:

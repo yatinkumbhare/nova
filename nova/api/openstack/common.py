@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -19,10 +17,11 @@ import functools
 import itertools
 import os
 import re
-import urlparse
 
 from oslo.config import cfg
+import six.moves.urllib.parse as urlparse
 import webob
+from webob import exc
 
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
@@ -30,14 +29,16 @@ from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova.i18n import _LE
+from nova.i18n import _LW
 from nova.openstack.common import log as logging
 from nova import quota
 
 osapi_opts = [
     cfg.IntOpt('osapi_max_limit',
                default=1000,
-               help='the maximum number of items returned in a single '
+               help='The maximum number of items returned in a single '
                     'response from a collection resource'),
     cfg.StrOpt('osapi_compute_link_prefix',
                help='Base URL that will be presented to users in links '
@@ -52,6 +53,12 @@ CONF.register_opts(osapi_opts)
 LOG = logging.getLogger(__name__)
 QUOTAS = quota.QUOTAS
 
+CONF.import_opt('enable', 'nova.cells.opts', group='cells')
+
+# NOTE(cyeoh): A common regexp for acceptable names (user supplied)
+# that we want all new extensions to conform to unless there is a very
+# good reason not to.
+VALID_NAME_REGEX = re.compile("^(?! )[\w. _-]+(?<! )$", re.UNICODE)
 
 XML_NS_V11 = 'http://docs.openstack.org/compute/api/v1.1'
 
@@ -60,7 +67,11 @@ _STATE_MAP = {
     vm_states.ACTIVE: {
         'default': 'ACTIVE',
         task_states.REBOOTING: 'REBOOT',
+        task_states.REBOOT_PENDING: 'REBOOT',
+        task_states.REBOOT_STARTED: 'REBOOT',
         task_states.REBOOTING_HARD: 'HARD_REBOOT',
+        task_states.REBOOT_PENDING_HARD: 'HARD_REBOOT',
+        task_states.REBOOT_STARTED_HARD: 'HARD_REBOOT',
         task_states.UPDATING_PASSWORD: 'PASSWORD',
         task_states.REBUILDING: 'REBUILD',
         task_states.REBUILD_BLOCK_DEVICE_MAPPING: 'REBUILD',
@@ -120,23 +131,24 @@ def status_from_state(vm_state, task_state='default'):
     task_map = _STATE_MAP.get(vm_state, dict(default='UNKNOWN'))
     status = task_map.get(task_state, task_map['default'])
     if status == "UNKNOWN":
-        LOG.error(_("status is UNKNOWN from vm_state=%(vm_state)s "
-                    "task_state=%(task_state)s. Bad upgrade or db "
-                    "corrupted?"),
+        LOG.error(_LE("status is UNKNOWN from vm_state=%(vm_state)s "
+                      "task_state=%(task_state)s. Bad upgrade or db "
+                      "corrupted?"),
                   {'vm_state': vm_state, 'task_state': task_state})
     return status
 
 
-def task_and_vm_state_from_status(status):
-    """Map the server status string to list of vm states and
+def task_and_vm_state_from_status(statuses):
+    """Map the server's multiple status strings to list of vm states and
     list of task states.
     """
     vm_states = set()
     task_states = set()
+    lower_statuses = [status.lower() for status in statuses]
     for state, task_map in _STATE_MAP.iteritems():
         for task_state, mapped_state in task_map.iteritems():
             status_string = mapped_state
-            if status.lower() == status_string.lower():
+            if status_string.lower() in lower_statuses:
                 vm_states.add(state)
                 task_states.add(task_state)
     # Add sort to avoid different order on set in Python 3
@@ -230,29 +242,6 @@ def get_limit_and_marker(request, max_limit=CONF.osapi_max_limit):
     return limit, marker
 
 
-def limited_by_marker(items, request, max_limit=CONF.osapi_max_limit):
-    """Return a slice of items according to the requested marker and limit."""
-    limit, marker = get_limit_and_marker(request, max_limit)
-
-    limit = min(max_limit, limit)
-    start_index = 0
-    if marker:
-        start_index = -1
-        for i, item in enumerate(items):
-            if 'flavorid' in item:
-                if item['flavorid'] == marker:
-                    start_index = i + 1
-                    break
-            elif item['id'] == marker or item.get('uuid') == marker:
-                start_index = i + 1
-                break
-        if start_index < 0:
-            msg = _('marker [%s] not found') % marker
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-    range_end = start_index + limit
-    return items[start_index:range_end]
-
-
 def get_id_from_href(href):
     """Return the id or uuid portion of a url.
 
@@ -287,9 +276,8 @@ def remove_version_from_href(href):
     new_path = '/'.join(url_parts)
 
     if new_path == parsed_url.path:
-        msg = _('href %s does not contain version') % href
-        LOG.debug(msg)
-        raise ValueError(msg)
+        LOG.debug('href %s does not contain version' % href)
+        raise ValueError(_('href %s does not contain version') % href)
 
     parsed_url = list(parsed_url)
     parsed_url[2] = new_path
@@ -371,7 +359,7 @@ def get_networks_for_instance(context, instance):
 
 
 def raise_http_conflict_for_instance_invalid_state(exc, action):
-    """Return a webob.exc.HTTPConflict instance containing a message
+    """Raises a webob.exc.HTTPConflict instance containing a message
     appropriate to return via the API based on the original
     InstanceInvalidState exception.
     """
@@ -465,8 +453,8 @@ def check_snapshots_enabled(f):
     @functools.wraps(f)
     def inner(*args, **kwargs):
         if not CONF.allow_instance_snapshots:
-            LOG.warn(_('Rejecting snapshot request, snapshots currently'
-                       ' disabled'))
+            LOG.warn(_LW('Rejecting snapshot request, snapshots currently'
+                         ' disabled'))
             msg = _("Instance snapshots are not permitted at this time.")
             raise webob.exc.HTTPBadRequest(explanation=msg)
         return f(*args, **kwargs)
@@ -477,8 +465,7 @@ class ViewBuilder(object):
     """Model API responses as dictionaries."""
 
     def _get_project_id(self, request):
-        """
-        Get project id from request url if present or empty string
+        """Get project id from request url if present or empty string
         otherwise
         """
         project_id = request.environ["nova.context"].project_id
@@ -530,10 +517,18 @@ class ViewBuilder(object):
                               items,
                               collection_name,
                               id_key="uuid"):
-        """Retrieve 'next' link, if applicable."""
+        """Retrieve 'next' link, if applicable. This is included if:
+        1) 'limit' param is specified and equals the number of items.
+        2) 'limit' param is specified but it exceeds CONF.osapi_max_limit,
+        in this case the number of items is CONF.osapi_max_limit.
+        3) 'limit' param is NOT specified but the number of items is
+        CONF.osapi_max_limit.
+        """
         links = []
-        limit = int(request.params.get("limit", 0))
-        if limit and limit == len(items):
+        max_items = min(
+            int(request.params.get("limit", CONF.osapi_max_limit)),
+            CONF.osapi_max_limit)
+        if max_items and max_items == len(items):
             last_item = items[-1]
             if id_key in last_item:
                 last_item_id = last_item[id_key]
@@ -564,3 +559,24 @@ class ViewBuilder(object):
     def _update_compute_link_prefix(self, orig_url):
         return self._update_link_prefix(orig_url,
                                         CONF.osapi_compute_link_prefix)
+
+
+def get_instance(compute_api, context, instance_id, want_objects=False,
+                 expected_attrs=None):
+    """Fetch an instance from the compute API, handling error checking."""
+    try:
+        return compute_api.get(context, instance_id,
+                               want_objects=want_objects,
+                               expected_attrs=expected_attrs)
+    except exception.InstanceNotFound as e:
+        raise exc.HTTPNotFound(explanation=e.format_message())
+
+
+def check_cells_enabled(function):
+    @functools.wraps(function)
+    def inner(*args, **kwargs):
+        if not CONF.cells.enable:
+            msg = _("Cells is not enabled.")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
+        return function(*args, **kwargs)
+    return inner

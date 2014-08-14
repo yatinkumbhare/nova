@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Citrix Systems, Inc.
 # Copyright 2011 OpenStack Foundation
 #
@@ -15,12 +13,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 """
-:mod:`vmwareapi` -- Nova support for VMware ESX/ESXi Server through VMware API.
+:mod:`vmwareapi` -- Nova support for VMware vCenter through VMware API.
 """
 # NOTE(sdague) for nicer compute_driver specification
 from nova.virt.vmwareapi import driver
 from nova.virt.vmwareapi import contrail
 
+# VMwareESXDriver is deprecated in Juno. This property definition
+# allows those configurations to work which reference it while
+# logging a deprecation warning
 VMwareESXDriver = driver.VMwareESXDriver
 ContrailESXDriver = contrail.ContrailESXDriver
 VMwareVCDriver = driver.VMwareVCDriver

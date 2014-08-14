@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Netease, LLC.
 # All Rights Reserved.
 #
@@ -58,13 +56,13 @@ class ExtendedAZController(wsgi.Controller):
 
 
 class Extended_availability_zone(extensions.ExtensionDescriptor):
-    """Extended Server Attributes support."""
+    """Extended Availability Zone support."""
 
     name = "ExtendedAvailabilityZone"
     alias = "OS-EXT-AZ"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "extended_availability_zone/api/v2")
-    updated = "2013-01-30T00:00:00+00:00"
+    updated = "2013-01-30T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = ExtendedAZController()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011-2013 University of Southern California / ISI
 # All Rights Reserved.
 #
@@ -27,9 +25,9 @@ from oslo.config import cfg
 
 from nova.compute import flavors
 from nova import exception
+from nova.i18n import _
 from nova.openstack.common.db import exception as db_exc
 from nova.openstack.common import fileutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.baremetal import baremetal_states
@@ -83,8 +81,7 @@ def get_partition_sizes(instance):
 
 
 def get_tftp_image_info(instance):
-    """
-    Generate the paths for tftp files for this instance.
+    """Generate the paths for tftp files for this instance.
 
     Raises NovaException if
     - instance does not contain kernel_id
@@ -131,8 +128,8 @@ class Tilera(base.NodeDriver):
         fileutils.ensure_tree(
                 os.path.join(CONF.baremetal.tftp_root, instance['uuid']))
 
-        LOG.debug(_("Fetching kernel and ramdisk for instance %s") %
-                        instance['name'])
+        LOG.debug("Fetching kernel and ramdisk for instance %s",
+                  instance['name'])
         for label in image_info.keys():
             (uuid, path) = image_info[label]
             bm_utils.cache_image(
@@ -162,13 +159,14 @@ class Tilera(base.NodeDriver):
         fileutils.ensure_tree(get_image_dir_path(instance))
         image_path = get_image_file_path(instance)
 
-        LOG.debug(_("Fetching image %(ami)s for instance %(name)s") %
-                        {'ami': image_meta['id'], 'name': instance['name']})
+        LOG.debug("Fetching image %(ami)s for instance %(name)s",
+                  {'ami': image_meta['id'], 'name': instance['name']})
         bm_utils.cache_image(context=context,
                              target=image_path,
                              image_id=image_meta['id'],
                              user_id=instance['user_id'],
-                             project_id=instance['project_id']
+                             project_id=instance['project_id'],
+                             clean=True,
                         )
 
         return [image_meta['id'], image_path]
@@ -198,14 +196,14 @@ class Tilera(base.NodeDriver):
         if instance['hostname']:
             injected_files.append(('/etc/hostname', instance['hostname']))
 
-        LOG.debug(_("Injecting files into image for instance %(name)s") %
-                        {'name': instance['name']})
+        LOG.debug("Injecting files into image for instance %(name)s",
+                  {'name': instance['name']})
 
         bm_utils.inject_into_image(
                     image=get_image_file_path(instance),
                     key=ssh_key,
                     net=net_config,
-                    metadata=instance['metadata'],
+                    metadata=utils.instance_meta(instance),
                     admin_password=admin_password,
                     files=injected_files,
                     partition=partition,
@@ -235,14 +233,15 @@ class Tilera(base.NodeDriver):
         This method writes the instances config file, and then creates
         symlinks for each MAC address in the instance.
 
-        By default, the complete layout looks like this:
+        By default, the complete layout looks like this::
 
-        /tftpboot/
-            ./{uuid}/
-                 kernel
-            ./fs_node_id/
+            /tftpboot/
+                ./{uuid}/
+                     kernel
+                ./fs_node_id/
+
         """
-        image_info = get_tftp_image_info(instance)
+        get_tftp_image_info(instance)
         (root_mb, swap_mb) = get_partition_sizes(instance)
         tilera_nfs_path = get_tilera_nfs_path(node['id'])
         image_file_path = get_image_file_path(instance)
@@ -288,7 +287,7 @@ class Tilera(base.NodeDriver):
                 bm_utils.unlink_without_raise(path)
 
         try:
-            macs = self._collect_mac_addresses(context, node)
+            self._collect_mac_addresses(context, node)
         except db_exc.DBError:
             pass
 
@@ -298,8 +297,7 @@ class Tilera(base.NodeDriver):
                 os.path.join(CONF.baremetal.tftp_root, instance['uuid']))
 
     def _iptables_set(self, node_ip, user_data):
-        """
-        Sets security setting (iptables:port) if needed.
+        """Sets security setting (iptables:port) if needed.
 
         iptables -A INPUT -p tcp ! -s $IP --dport $PORT -j DROP
         /tftpboot/iptables_rule script sets iptables rule on the given node.
@@ -322,7 +320,7 @@ class Tilera(base.NodeDriver):
 
             status = row.get('task_state')
             if (status == baremetal_states.DEPLOYING and
-                    locals['started'] == False):
+                    locals['started'] is False):
                 LOG.info(_('Tilera deploy started for instance %s')
                            % instance['uuid'])
                 locals['started'] = True

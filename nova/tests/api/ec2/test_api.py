@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -98,7 +96,7 @@ class FakeHttplibConnection(object):
         pass
 
 
-class XmlConversionTestCase(test.TestCase):
+class XmlConversionTestCase(test.NoDBTestCase):
     """Unit test api xml conversion."""
     def test_number_conversion(self):
         conv = ec2utils._try_convert
@@ -129,7 +127,7 @@ class XmlConversionTestCase(test.TestCase):
         self.assertEqual(conv(''), '')
 
 
-class Ec2utilsTestCase(test.TestCase):
+class Ec2utilsTestCase(test.NoDBTestCase):
     def test_ec2_id_to_id(self):
         self.assertEqual(ec2utils.ec2_id_to_id('i-0000001e'), 30)
         self.assertEqual(ec2utils.ec2_id_to_id('ami-1d'), 29)
@@ -284,10 +282,9 @@ class ApiEc2TestCase(test.TestCase):
         return self.http
 
     def test_return_valid_isoformat(self):
-        """
-            Ensure that the ec2 api returns datetime in xs:dateTime
-            (which apparently isn't datetime.isoformat())
-            NOTE(ken-pepple): https://bugs.launchpad.net/nova/+bug/721297
+        """Ensure that the ec2 api returns datetime in xs:dateTime
+           (which apparently isn't datetime.isoformat())
+           NOTE(ken-pepple): https://bugs.launchpad.net/nova/+bug/721297
         """
         conv = apirequest._database_to_isoformat
         # sqlite database representation with microseconds
@@ -401,26 +398,26 @@ class ApiEc2TestCase(test.TestCase):
             (True, "test name", bad_amazon_ec2),
             (False, bad_strict_ec2, "test desc"),
         ]
-        for test in test_raise:
+        for t in test_raise:
             self.expect_http()
             self.mox.ReplayAll()
-            self.flags(ec2_strict_validation=test[0])
+            self.flags(ec2_strict_validation=t[0])
             self.assertRaises(boto_exc.EC2ResponseError,
                               self.ec2.create_security_group,
-                              test[1],
-                              test[2])
+                              t[1],
+                              t[2])
         test_accept = [
             (False, bad_amazon_ec2, "test desc"),
             (False, "test name", bad_amazon_ec2),
         ]
-        for test in test_accept:
+        for t in test_accept:
             self.expect_http()
             self.mox.ReplayAll()
-            self.flags(ec2_strict_validation=test[0])
-            self.ec2.create_security_group(test[1], test[2])
+            self.flags(ec2_strict_validation=t[0])
+            self.ec2.create_security_group(t[1], t[2])
             self.expect_http()
             self.mox.ReplayAll()
-            self.ec2.delete_security_group(test[1])
+            self.ec2.delete_security_group(t[1])
 
     def test_group_name_valid_length_security_group(self):
         """Test that we sanely handle invalid security group names.
@@ -440,8 +437,7 @@ class ApiEc2TestCase(test.TestCase):
                 'test group')
 
     def test_authorize_revoke_security_group_cidr(self):
-        """
-        Test that we can add and remove CIDR based rules
+        """Test that we can add and remove CIDR based rules
         to a security group
         """
         self.expect_http()
@@ -544,8 +540,7 @@ class ApiEc2TestCase(test.TestCase):
         self.assertEqual(rv[0].name, 'default')
 
     def test_authorize_revoke_security_group_cidr_v6(self):
-        """
-        Test that we can add and remove CIDR based rules
+        """Test that we can add and remove CIDR based rules
         to a security group for IPv6
         """
         self.expect_http()
@@ -596,8 +591,7 @@ class ApiEc2TestCase(test.TestCase):
         self.assertEqual(rv[0].name, 'default')
 
     def test_authorize_revoke_security_group_foreign_group(self):
-        """
-        Test that we can grant and revoke another security group access
+        """Test that we can grant and revoke another security group access
         to a security group
         """
         self.expect_http()

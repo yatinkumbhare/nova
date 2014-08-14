@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,12 +12,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import uuid
+
+from nova.compute import flavors
 from nova import context
 from nova import db
 from nova import exception
 from nova.objects import instance_group
 from nova import test
 from nova.tests.objects import test_objects
+from nova.tests import utils as tests_utils
 
 
 class _TestInstanceGroupObjects(test.TestCase):
@@ -36,23 +38,19 @@ class _TestInstanceGroupObjects(test.TestCase):
                 'project_id': self.project_id}
 
     def _create_instance_group(self, context, values, policies=None,
-                               metadata=None, members=None):
+                               members=None):
         return db.instance_group_create(context, values, policies=policies,
-                                        metadata=metadata, members=members)
+                                        members=members)
 
     def test_get_by_uuid(self):
         values = self._get_default_values()
-        metadata = {'key11': 'value1',
-                    'key12': 'value2'}
         policies = ['policy1', 'policy2']
         members = ['instance_id1', 'instance_id2']
         db_result = self._create_instance_group(self.context, values,
-                                                metadata=metadata,
                                                 policies=policies,
                                                 members=members)
         obj_result = instance_group.InstanceGroup.get_by_uuid(self.context,
                                                               db_result.uuid)
-        self.assertEqual(obj_result.metadetails, metadata)
         self.assertEqual(obj_result.members, members)
         self.assertEqual(obj_result.policies, policies)
 
@@ -103,19 +101,6 @@ class _TestInstanceGroupObjects(test.TestCase):
         result = db.instance_group_get(self.context, db_result['uuid'])
         self.assertEqual(result['members'], members)
 
-    def test_save_metadata(self):
-        values = self._get_default_values()
-        db_result = self._create_instance_group(self.context, values)
-        obj_result = instance_group.InstanceGroup.get_by_uuid(self.context,
-                                                              db_result.uuid)
-        metadata = {'foo': 'bar'}
-        obj_result.metadetails = metadata
-        obj_result.save()
-        metadata1 = db.instance_group_metadata_get(self.context,
-                                                   db_result['uuid'])
-        for key, value in metadata.iteritems():
-            self.assertEqual(value, metadata[key])
-
     def test_create(self):
         group1 = instance_group.InstanceGroup()
         group1.uuid = 'fake-uuid'
@@ -149,17 +134,6 @@ class _TestInstanceGroupObjects(test.TestCase):
         self.assertEqual(group1.id, group2.id)
         self.assertEqual(group1.members, group2.members)
 
-    def test_create_with_metadata(self):
-        group1 = instance_group.InstanceGroup()
-        metadata = {'foo': 'bar'}
-        group1.metadetails = metadata
-        group1.create(self.context)
-        group2 = instance_group.InstanceGroup.get_by_uuid(self.context,
-                                                          group1.uuid)
-        self.assertEqual(group1.id, group2.id)
-        for key, value in metadata.iteritems():
-            self.assertEqual(value, group2.metadetails[key])
-
     def test_recreate_fails(self):
         group = instance_group.InstanceGroup()
         group.create(self.context)
@@ -177,13 +151,17 @@ class _TestInstanceGroupObjects(test.TestCase):
                           db.instance_group_get, self.context, result['uuid'])
 
     def _populate_instances(self):
-        instances = [('f1', 'p1'), ('f2', 'p1'),
-                     ('f3', 'p2'), ('f4', 'p2')]
+        instances = [(str(uuid.uuid4()), 'f1', 'p1'),
+                     (str(uuid.uuid4()), 'f2', 'p1'),
+                     (str(uuid.uuid4()), 'f3', 'p2'),
+                     (str(uuid.uuid4()), 'f4', 'p2')]
         for instance in instances:
             values = self._get_default_values()
             values['uuid'] = instance[0]
-            values['project_id'] = instance[1]
+            values['name'] = instance[1]
+            values['project_id'] = instance[2]
             self._create_instance_group(self.context, values)
+        return instances
 
     def test_list_all(self):
         self._populate_instances()
@@ -209,7 +187,87 @@ class _TestInstanceGroupObjects(test.TestCase):
                 self.assertIsInstance(il.objects[i],
                                       instance_group.InstanceGroup)
                 self.assertEqual(il.objects[i].uuid, groups[i]['uuid'])
+                self.assertEqual(il.objects[i].name, groups[i]['name'])
                 self.assertEqual(il.objects[i].project_id, id)
+
+    def test_get_by_name(self):
+        self._populate_instances()
+        ctxt = context.RequestContext('fake_user', 'p1')
+        ig = instance_group.InstanceGroup.get_by_name(ctxt, 'f1')
+        self.assertEqual('f1', ig.name)
+
+    def test_get_by_hint(self):
+        instances = self._populate_instances()
+        for instance in instances:
+            ctxt = context.RequestContext('fake_user', instance[2])
+            ig = instance_group.InstanceGroup.get_by_hint(ctxt, instance[1])
+            self.assertEqual(instance[1], ig.name)
+            ig = instance_group.InstanceGroup.get_by_hint(ctxt, instance[0])
+            self.assertEqual(instance[0], ig.uuid)
+
+    def test_add_members(self):
+        instance_ids = ['fakeid1', 'fakeid2']
+        values = self._get_default_values()
+        group = self._create_instance_group(self.context, values)
+        members = instance_group.InstanceGroup.add_members(self.context,
+                group.uuid, instance_ids)
+        group = instance_group.InstanceGroup.get_by_uuid(self.context,
+                group.uuid)
+        for instance in instance_ids:
+            self.assertIn(instance, members)
+            self.assertIn(instance, group.members)
+
+    def test_get_hosts(self):
+        instance1 = tests_utils.get_test_instance(self.context,
+                flavor=flavors.get_default_flavor(), obj=True)
+        instance1.host = 'hostA'
+        instance1.save()
+        instance2 = tests_utils.get_test_instance(self.context,
+                flavor=flavors.get_default_flavor(), obj=True)
+        instance2.host = 'hostB'
+        instance2.save()
+        instance3 = tests_utils.get_test_instance(self.context,
+                flavor=flavors.get_default_flavor(), obj=True)
+        instance3.host = 'hostB'
+        instance3.save()
+
+        instance_ids = [instance1.uuid, instance2.uuid, instance3.uuid]
+        values = self._get_default_values()
+        group = self._create_instance_group(self.context, values)
+        instance_group.InstanceGroup.add_members(self.context, group.uuid,
+                instance_ids)
+
+        group = instance_group.InstanceGroup.get_by_uuid(self.context,
+                group.uuid)
+        hosts = group.get_hosts(self.context)
+        self.assertEqual(2, len(hosts))
+        self.assertIn('hostA', hosts)
+        self.assertIn('hostB', hosts)
+        hosts = group.get_hosts(self.context, exclude=[instance1.uuid])
+        self.assertEqual(1, len(hosts))
+        self.assertIn('hostB', hosts)
+
+    def test_get_hosts_with_some_none(self):
+        instance1 = tests_utils.get_test_instance(self.context,
+                flavor=flavors.get_default_flavor(), obj=True)
+        instance1.host = None
+        instance1.save()
+        instance2 = tests_utils.get_test_instance(self.context,
+                flavor=flavors.get_default_flavor(), obj=True)
+        instance2.host = 'hostB'
+        instance2.save()
+
+        instance_ids = [instance1.uuid, instance2.uuid]
+        values = self._get_default_values()
+        group = self._create_instance_group(self.context, values)
+        instance_group.InstanceGroup.add_members(self.context, group.uuid,
+                instance_ids)
+
+        group = instance_group.InstanceGroup.get_by_uuid(self.context,
+                group.uuid)
+        hosts = group.get_hosts(self.context)
+        self.assertEqual(1, len(hosts))
+        self.assertIn('hostB', hosts)
 
 
 class TestInstanceGroupObject(test_objects._LocalTest,

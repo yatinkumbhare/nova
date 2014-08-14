@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright (c) 2013 The Johns Hopkins University/Applied Physics Laboratory
 # All Rights Reserved.
 #
@@ -21,8 +20,8 @@ all invocations of get_key.
 
 
 from nova import exception
+from nova.i18n import _
 from nova.keymgr import mock_key_mgr
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 
 
@@ -30,11 +29,11 @@ LOG = logging.getLogger(__name__)
 
 
 class SingleKeyManager(mock_key_mgr.MockKeyManager):
-    """
-    This key manager implementation supports all the methods specified by the
-    key manager interface. This implementation creates a single key in response
-    to all invocations of create_key. Side effects (e.g., raising exceptions)
-    for each method are handled as specified by the key manager interface.
+    """This key manager implementation supports all the methods specified by
+    the key manager interface. This implementation creates a single key in
+    response to all invocations of create_key. Side effects
+    (e.g., raising exceptions) for each method are handled as specified by
+    the key manager interface.
     """
 
     def __init__(self):
@@ -64,7 +63,7 @@ class SingleKeyManager(mock_key_mgr.MockKeyManager):
 
     def delete_key(self, ctxt, key_id, **kwargs):
         if ctxt is None:
-            raise exception.NotAuthorized()
+            raise exception.Forbidden()
 
         if key_id != self.key_id:
             raise exception.KeyManagerError(

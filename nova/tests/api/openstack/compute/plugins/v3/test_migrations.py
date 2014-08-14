@@ -1,5 +1,3 @@
-# vim: tabstop=5 shiftwidth=4 softtabstop=4
-
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,11 +14,11 @@
 
 import datetime
 
-from lxml import etree
-
 from nova.api.openstack.compute.plugins.v3 import migrations
 from nova import context
 from nova import exception
+from nova import objects
+from nova.objects import base
 from nova.openstack.common.fixture import moxstubout
 from nova import test
 
@@ -39,6 +37,8 @@ fake_migrations = [
         'new_instance_type_id': 2,
         'created_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
         'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
+        'deleted_at': None,
+        'deleted': False
     },
     {
         'id': 5678,
@@ -53,8 +53,16 @@ fake_migrations = [
         'new_instance_type_id': 6,
         'created_at': datetime.datetime(2013, 10, 22, 13, 42, 2),
         'updated_at': datetime.datetime(2013, 10, 22, 13, 42, 2),
+        'deleted_at': None,
+        'deleted': False
     }
 ]
+
+migrations_obj = base.obj_make_list(
+    'fake-context',
+    objects.MigrationList(),
+    objects.Migration,
+    fake_migrations)
 
 
 class FakeRequest(object):
@@ -74,16 +82,22 @@ class MigrationsTestCase(test.NoDBTestCase):
         self.mox = mox_fixture.mox
 
     def test_index(self):
-        migrations_in_progress = {'migrations': fake_migrations}
+        migrations_in_progress = {
+            'migrations': migrations.output(migrations_obj)}
+
+        for mig in migrations_in_progress['migrations']:
+            self.assertIn('id', mig)
+            self.assertNotIn('deleted', mig)
+            self.assertNotIn('deleted_at', mig)
+
         filters = {'host': 'host1', 'status': 'migrating',
                    'cell_name': 'ChildCell'}
         self.req.GET = filters
         self.mox.StubOutWithMock(self.controller.compute_api,
                                  "get_migrations")
 
-        self.controller.compute_api.\
-            get_migrations(self.context, filters).\
-            AndReturn(fake_migrations)
+        self.controller.compute_api.get_migrations(
+            self.context, filters).AndReturn(migrations_obj)
         self.mox.ReplayAll()
 
         response = self.controller.index(self.req)
@@ -99,24 +113,3 @@ class MigrationsTestCase(test.NoDBTestCase):
 
         self.assertRaises(exception.PolicyNotAuthorized, self.controller.index,
                           self.req)
-
-
-class MigrationsTemplateTest(test.NoDBTestCase):
-    def setUp(self):
-        super(MigrationsTemplateTest, self).setUp()
-        self.serializer = migrations.MigrationsTemplate()
-
-    def test_index_serialization(self):
-        res_xml = self.serializer.serialize({'migrations': fake_migrations})
-
-        tree = etree.XML(res_xml)
-        children = tree.findall('migration')
-        self.assertEqual(tree.tag, 'migrations')
-        self.assertEqual(2, len(children))
-
-        for idx, child in enumerate(children):
-            self.assertEqual(child.tag, 'migration')
-            migration = fake_migrations[idx]
-            for attr in migration.keys():
-                self.assertEqual(str(migration[attr]),
-                                 child.get(attr))

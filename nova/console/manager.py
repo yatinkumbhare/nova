@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -20,11 +18,11 @@
 import socket
 
 from oslo.config import cfg
+from oslo import messaging
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova import exception
 from nova import manager
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova import utils
@@ -54,7 +52,7 @@ class ConsoleProxyManager(manager.Manager):
 
     """
 
-    RPC_API_VERSION = '2.0'
+    target = messaging.Target(version='2.0')
 
     def __init__(self, console_driver=None, *args, **kwargs):
         if not console_driver:
@@ -78,7 +76,7 @@ class ConsoleProxyManager(manager.Manager):
                                                            pool['id'],
                                                            instance['uuid'])
         except exception.NotFound:
-            LOG.debug(_('Adding console'), instance=instance)
+            LOG.debug('Adding console', instance=instance)
             password = utils.generate_password(8)
             port = self.driver.get_port(context)
             console_data = {'instance_name': name,
@@ -96,9 +94,9 @@ class ConsoleProxyManager(manager.Manager):
         try:
             console = self.db.console_get(context, console_id)
         except exception.NotFound:
-            LOG.debug(_('Tried to remove non-existent console '
-                            '%(console_id)s.') %
-                            {'console_id': console_id})
+            LOG.debug('Tried to remove non-existent console '
+                      '%(console_id)s.',
+                      {'console_id': console_id})
             return
         self.db.console_delete(context, console_id)
         self.driver.teardown_console(context, console)
@@ -112,9 +110,9 @@ class ConsoleProxyManager(manager.Manager):
                                                          self.host,
                                                          console_type)
         except exception.NotFound:
-            #NOTE(mdragon): Right now, the only place this info exists is the
-            #               compute worker's flagfile, at least for
-            #               xenserver. Thus we ned to ask.
+            # NOTE(mdragon): Right now, the only place this info exists is the
+            #                compute worker's flagfile, at least for
+            #                xenserver. Thus we ned to ask.
             if CONF.stub_compute:
                 pool_info = {'address': '127.0.0.1',
                              'username': 'test',

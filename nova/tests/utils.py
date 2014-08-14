@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -28,7 +26,8 @@ from nova import exception
 from nova.image import glance
 from nova.network import minidns
 from nova.network import model as network_model
-from nova.objects import instance as instance_obj
+from nova import objects
+import nova.utils
 
 CONF = cfg.CONF
 CONF.import_opt('use_ipv6', 'nova.netconf')
@@ -48,54 +47,54 @@ def get_test_image_info(context, instance_ref):
     return image_service.show(context, image_id)
 
 
-def get_test_instance_type(context=None, options=None):
+def get_test_flavor(context=None, options=None):
     options = options or {}
     if not context:
         context = get_test_admin_context()
 
-    test_instance_type = {'name': 'kinda.big',
-                          'flavorid': 'someid',
-                          'memory_mb': 2048,
-                          'vcpus': 4,
-                          'root_gb': 40,
-                          'ephemeral_gb': 80,
-                          'swap': 1024}
+    test_flavor = {'name': 'kinda.big',
+                   'flavorid': 'someid',
+                   'memory_mb': 2048,
+                   'vcpus': 4,
+                   'root_gb': 40,
+                   'ephemeral_gb': 80,
+                   'swap': 1024}
 
-    test_instance_type.update(options)
+    test_flavor.update(options)
 
     try:
-        instance_type_ref = nova.db.flavor_create(context,
-                                                         test_instance_type)
+        flavor_ref = nova.db.flavor_create(context, test_flavor)
     except (exception.FlavorExists, exception.FlavorIdExists):
-        instance_type_ref = nova.db.flavor_get_by_name(context,
-                                                              'kinda.big')
-    return instance_type_ref
+        flavor_ref = nova.db.flavor_get_by_name(context, 'kinda.big')
+    return flavor_ref
 
 
-def get_test_instance(context=None, instance_type=None, obj=False):
+def get_test_instance(context=None, flavor=None, obj=False):
     if not context:
         context = get_test_admin_context()
 
-    if not instance_type:
-        instance_type = get_test_instance_type(context)
+    if not flavor:
+        flavor = get_test_flavor(context)
 
     metadata = {}
-    flavors.save_flavor_info(metadata, instance_type, '')
+    flavors.save_flavor_info(metadata, flavor, '')
 
     test_instance = {'memory_kb': '2048000',
                      'basepath': '/some/path',
                      'bridge_name': 'br100',
                      'vcpus': 4,
                      'root_gb': 40,
-                     'project_id': 'fake',
                      'bridge': 'br101',
                      'image_ref': 'cedef40a-ed67-4d10-800e-17455edce175',
                      'instance_type_id': '5',
                      'system_metadata': metadata,
-                     'extra_specs': {}}
+                     'extra_specs': {},
+                     'user_id': context.user_id,
+                     'project_id': context.project_id,
+                     }
 
     if obj:
-        instance = instance_obj.Instance(context, **test_instance)
+        instance = objects.Instance(context, **test_instance)
         instance.create()
     else:
         instance = nova.db.instance_create(context, test_instance)
@@ -106,7 +105,6 @@ def get_test_network_info(count=1):
     ipv6 = CONF.use_ipv6
     fake = 'fake'
     fake_ip = '0.0.0.0'
-    fake_netmask = '255.255.255.255'
     fake_vlan = 100
     fake_bridge_interface = 'eth0'
 
@@ -152,6 +150,11 @@ def is_osx():
     return platform.mac_ver()[0] != ''
 
 
+def coreutils_readlink_available():
+    _out, err = nova.utils.trycmd('readlink', '-nm', '/')
+    return err == ''
+
+
 test_dns_managers = []
 
 
@@ -190,6 +193,7 @@ def is_ipv6_supported():
     has_ipv6_support = socket.has_ipv6
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.close()
     except socket.error as e:
         if e.errno == errno.EAFNOSUPPORT:
             has_ipv6_support = False
@@ -206,3 +210,8 @@ def is_ipv6_supported():
             has_ipv6_support = False
 
     return has_ipv6_support
+
+
+def get_api_version(request):
+    if request.path[2:3].isdigit():
+        return int(request.path[2:3])

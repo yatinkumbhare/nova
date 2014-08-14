@@ -17,38 +17,18 @@
 
 import webob.exc
 
+from nova.api.openstack.compute.schemas.v3 import hosts
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
+from nova.api import validation
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 ALIAS = 'os-hosts'
 authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
-
-
-class HostIndexTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('hosts')
-        elem = xmlutil.SubTemplateElement(root, 'host', selector='hosts')
-        elem.set('host_name')
-        elem.set('service')
-        elem.set('zone')
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class HostShowTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('host')
-        elem = xmlutil.make_flat_dict('resource', selector='host',
-                                      subselector='resource')
-        root.append(elem)
-
-        return xmlutil.MasterTemplate(root, 1)
 
 
 class HostController(wsgi.Controller):
@@ -58,44 +38,43 @@ class HostController(wsgi.Controller):
         super(HostController, self).__init__()
 
     @extensions.expected_errors(())
-    @wsgi.serializers(xml=HostIndexTemplate)
     def index(self, req):
-        """
-        :returns: A dict in the format:
+        """Returns a dict in the format
 
-            {'hosts': [{'host_name': 'some.host.name',
-               'service': 'cells',
-               'zone': 'internal'},
-              {'host_name': 'some.other.host.name',
-               'service': 'cells',
-               'zone': 'internal'},
-              {'host_name': 'some.celly.host.name',
-               'service': 'cells',
-               'zone': 'internal'},
-              {'host_name': 'console1.host.com',
-               'service': 'consoleauth',
-               'zone': 'internal'},
-              {'host_name': 'network1.host.com',
-               'service': 'network',
-               'zone': 'internal'},
-              {'host_name': 'netwwork2.host.com',
-               'service': 'network',
-               'zone': 'internal'},
-              {'host_name': 'compute1.host.com',
-               'service': 'compute',
-               'zone': 'nova'},
-              {'host_name': 'compute2.host.com',
-               'service': 'compute',
-               'zone': 'nova'},
-              {'host_name': 'sched1.host.com',
-               'service': 'scheduler',
-               'zone': 'internal'},
-              {'host_name': 'sched2.host.com',
-               'service': 'scheduler',
-               'zone': 'internal'},
-              {'host_name': 'vol1.host.com',
-               'service': 'volume'},
-               'zone': 'internal']}
+        |   {'hosts': [{'host_name': 'some.host.name',
+        |     'service': 'cells',
+        |     'zone': 'internal'},
+        |    {'host_name': 'some.other.host.name',
+        |     'service': 'cells',
+        |     'zone': 'internal'},
+        |    {'host_name': 'some.celly.host.name',
+        |     'service': 'cells',
+        |     'zone': 'internal'},
+        |    {'host_name': 'console1.host.com',
+        |     'service': 'consoleauth',
+        |     'zone': 'internal'},
+        |    {'host_name': 'network1.host.com',
+        |     'service': 'network',
+        |     'zone': 'internal'},
+        |    {'host_name': 'netwwork2.host.com',
+        |     'service': 'network',
+        |     'zone': 'internal'},
+        |    {'host_name': 'compute1.host.com',
+        |     'service': 'compute',
+        |     'zone': 'nova'},
+        |    {'host_name': 'compute2.host.com',
+        |     'service': 'compute',
+        |     'zone': 'nova'},
+        |    {'host_name': 'sched1.host.com',
+        |     'service': 'scheduler',
+        |     'zone': 'internal'},
+        |    {'host_name': 'sched2.host.com',
+        |     'service': 'scheduler',
+        |     'zone': 'internal'},
+        |    {'host_name': 'vol1.host.com',
+        |     'service': 'volume'},
+        |     'zone': 'internal']}
+
         """
         context = req.environ['nova.context']
         authorize(context)
@@ -103,6 +82,9 @@ class HostController(wsgi.Controller):
         zone = req.GET.get('zone', None)
         if zone:
             filters['availability_zone'] = zone
+        service = req.GET.get('service')
+        if service:
+            filters['topic'] = service
         services = self.api.service_get_all(context, filters=filters,
                                             set_zones=True)
         hosts = []
@@ -113,51 +95,29 @@ class HostController(wsgi.Controller):
         return {'hosts': hosts}
 
     @extensions.expected_errors((400, 404, 501))
+    @validation.schema(hosts.update)
     def update(self, req, id, body):
-        """
-        :param body: example format {'host': {'status': 'enable',
+        """:param body: example format {'host': {'status': 'enable',
                                      'maintenance_mode': 'enable'}}
-        :returns:
+           :returns:
         """
-        def read_enabled(orig_val, msg):
-            """
-            :param orig_val: A string with either 'enable' or 'disable'. May
-                             be surrounded by whitespace, and case doesn't
-                             matter
-            :param msg: The message to be passed to HTTPBadRequest. A single
-                        %s will be replaced with orig_val.
-            :returns:   True for 'enabled' and False for 'disabled'
+        def read_enabled(orig_val):
+            """:param orig_val: A string with either 'enable' or 'disable'. May
+                                be surrounded by whitespace, and case doesn't
+                                matter
+               :returns: True for 'enabled' and False for 'disabled'
             """
             val = orig_val.strip().lower()
-            if val == "enable":
-                return True
-            elif val == "disable":
-                return False
-            else:
-                raise webob.exc.HTTPBadRequest(explanation=msg % orig_val)
+            return val == "enable"
         context = req.environ['nova.context']
         authorize(context)
         # See what the user wants to 'update'
-        if not self.is_valid_body(body, 'host'):
-            raise webob.exc.HTTPBadRequest(
-                explanation=_("The request body invalid"))
-        params = dict([(k.strip().lower(), v)
-                       for k, v in body['host'].iteritems()])
-        orig_status = status = params.pop('status', None)
-        orig_maint_mode = maint_mode = params.pop('maintenance_mode', None)
-        # Validate the request
-        if len(params) > 0:
-            # Some extra param was passed. Fail.
-            explanation = _("Invalid update setting: '%s'") % params.keys()[0]
-            raise webob.exc.HTTPBadRequest(explanation=explanation)
-        if orig_status is not None:
-            status = read_enabled(orig_status, _("Invalid status: '%s'"))
-        if orig_maint_mode is not None:
-            maint_mode = read_enabled(orig_maint_mode, _("Invalid mode: '%s'"))
-        if status is None and maint_mode is None:
-            explanation = _("'status' or 'maintenance_mode' needed for "
-                            "host update")
-            raise webob.exc.HTTPBadRequest(explanation=explanation)
+        status = body['host'].get('status')
+        maint_mode = body['host'].get('maintenance_mode')
+        if status is not None:
+            status = read_enabled(status)
+        if maint_mode is not None:
+            maint_mode = read_enabled(maint_mode)
         # Make the calls and merge the results
         result = {'host': id}
         if status is not None:
@@ -194,9 +154,9 @@ class HostController(wsgi.Controller):
                         on the host.
         """
         if enabled:
-            LOG.audit(_("Enabling host %s.") % host_name)
+            LOG.audit(_("Enabling host %s."), host_name)
         else:
-            LOG.audit(_("Disabling host %s.") % host_name)
+            LOG.audit(_("Disabling host %s."), host_name)
         try:
             result = self.api.set_host_enabled(context, host_name=host_name,
                                                enabled=enabled)
@@ -290,7 +250,6 @@ class HostController(wsgi.Controller):
         return project_map
 
     @extensions.expected_errors((403, 404))
-    @wsgi.serializers(xml=HostShowTemplate)
     def show(self, req, id):
         """Shows the physical/usage resource given by hosts.
 
@@ -334,7 +293,6 @@ class Hosts(extensions.V3APIExtensionBase):
 
     name = "Hosts"
     alias = ALIAS
-    namespace = "http://docs.openstack.org/compute/ext/hosts/api/v3"
     version = 1
 
     def get_resources(self):

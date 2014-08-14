@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
 #
@@ -16,7 +14,6 @@
 #    under the License.
 
 
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.tests.integrated.api import client
 from nova.tests.integrated import integrated_helpers
@@ -32,7 +29,7 @@ class LoginTest(integrated_helpers._IntegratedTestBase):
         # Simple check - we list flavors - so we know we're logged in.
         flavors = self.api.get_flavors()
         for flavor in flavors:
-            LOG.debug(_("flavor: %s") % flavor)
+            LOG.debug("flavor: %s", flavor)
 
 
 class LoginTestV3(client.TestOpenStackClientV3Mixin, LoginTest):

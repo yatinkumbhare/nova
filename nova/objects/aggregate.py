@@ -15,6 +15,7 @@
 from nova.compute import utils as compute_utils
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
 
@@ -58,6 +59,9 @@ class Aggregate(base.NovaPersistentObject, base.NovaObject):
 
     @base.remotable
     def create(self, context):
+        if self.obj_attr_is_set('id'):
+            raise exception.ObjectActionError(action='create',
+                                              reason='already created')
         self._assert_no_hosts('create')
         updates = self.obj_get_changes()
         payload = dict(updates)
@@ -115,7 +119,6 @@ class Aggregate(base.NovaPersistentObject, base.NovaObject):
                 to_add[key] = value
                 self.metadata[key] = value
         db.aggregate_metadata_add(context, self.id, to_add)
-        payload['meta_data'] = to_add
         compute_utils.notify_about_aggregate_update(context,
                                                     "updatemetadata.end",
                                                     payload)
@@ -147,20 +150,48 @@ class Aggregate(base.NovaPersistentObject, base.NovaObject):
 class AggregateList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added key argument to get_by_host()
-    VERSION = '1.1'
+    #              Aggregate <= version 1.1
+    # Version 1.2: Added get_by_metadata_key
+    VERSION = '1.2'
 
     fields = {
         'objects': fields.ListOfObjectsField('Aggregate'),
         }
+    child_versions = {
+        '1.0': '1.1',
+        '1.1': '1.1',
+        # NOTE(danms): Aggregate was at 1.1 before we added this
+        '1.2': '1.1',
+        }
+
+    @classmethod
+    def _filter_db_aggregates(cls, db_aggregates, hosts):
+        if not isinstance(hosts, set):
+            hosts = set(hosts)
+        filtered_aggregates = []
+        for db_aggregate in db_aggregates:
+            for host in db_aggregate['hosts']:
+                if host in hosts:
+                    filtered_aggregates.append(db_aggregate)
+                    break
+        return filtered_aggregates
 
     @base.remotable_classmethod
     def get_all(cls, context):
         db_aggregates = db.aggregate_get_all(context)
-        return base.obj_make_list(context, AggregateList(), Aggregate,
+        return base.obj_make_list(context, cls(context), objects.Aggregate,
                                   db_aggregates)
 
     @base.remotable_classmethod
     def get_by_host(cls, context, host, key=None):
         db_aggregates = db.aggregate_get_by_host(context, host, key=key)
-        return base.obj_make_list(context, AggregateList(), Aggregate,
+        return base.obj_make_list(context, cls(context), objects.Aggregate,
+                                  db_aggregates)
+
+    @base.remotable_classmethod
+    def get_by_metadata_key(cls, context, key, hosts=None):
+        db_aggregates = db.aggregate_get_by_metadata_key(context, key=key)
+        if hosts:
+            db_aggregates = cls._filter_db_aggregates(db_aggregates, hosts)
+        return base.obj_make_list(context, cls(context), objects.Aggregate,
                                   db_aggregates)

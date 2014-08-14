@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright 2011 Justin Santa Barbara
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -26,7 +24,7 @@ class GetCallArgsTestCase(test.NoDBTestCase):
         args = ()
         kwargs = {'instance': {'uuid': 1}, 'red': 3, 'blue': 4}
         callargs = safe_utils.getcallargs(self._test_func, *args, **kwargs)
-        #implicit self counts as an arg
+        # implicit self counts as an arg
         self.assertEqual(4, len(callargs))
         self.assertIn('instance', callargs)
         self.assertEqual({'uuid': 1}, callargs['instance'])
@@ -39,7 +37,7 @@ class GetCallArgsTestCase(test.NoDBTestCase):
         args = ({'uuid': 1}, 3, 4)
         kwargs = {}
         callargs = safe_utils.getcallargs(self._test_func, *args, **kwargs)
-        #implicit self counts as an arg
+        # implicit self counts as an arg
         self.assertEqual(4, len(callargs))
         self.assertIn('instance', callargs)
         self.assertEqual({'uuid': 1}, callargs['instance'])
@@ -52,7 +50,7 @@ class GetCallArgsTestCase(test.NoDBTestCase):
         args = ({'uuid': 1}, 3)
         kwargs = {'blue': 4}
         callargs = safe_utils.getcallargs(self._test_func, *args, **kwargs)
-        #implicit self counts as an arg
+        # implicit self counts as an arg
         self.assertEqual(4, len(callargs))
         self.assertIn('instance', callargs)
         self.assertEqual({'uuid': 1}, callargs['instance'])
@@ -65,7 +63,7 @@ class GetCallArgsTestCase(test.NoDBTestCase):
         args = ()
         kwargs = {'instance': {'uuid': 1}, 'red': 3}
         callargs = safe_utils.getcallargs(self._test_func, *args, **kwargs)
-        #implicit self counts as an arg
+        # implicit self counts as an arg
         self.assertEqual(4, len(callargs))
         self.assertIn('instance', callargs)
         self.assertEqual({'uuid': 1}, callargs['instance'])
@@ -78,7 +76,7 @@ class GetCallArgsTestCase(test.NoDBTestCase):
         args = ({'uuid': 1}, 3)
         kwargs = {}
         callargs = safe_utils.getcallargs(self._test_func, *args, **kwargs)
-        #implicit self counts as an arg
+        # implicit self counts as an arg
         self.assertEqual(4, len(callargs))
         self.assertIn('instance', callargs)
         self.assertEqual({'uuid': 1}, callargs['instance'])

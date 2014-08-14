@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright (c) 2012 Rackspace Hosting
 # All Rights Reserved.
 #
@@ -17,15 +16,24 @@
 Tests For Compute w/ Cells
 """
 import functools
+import inspect
 
+import mock
 from oslo.config import cfg
 
+from nova.cells import manager
 from nova.compute import api as compute_api
 from nova.compute import cells_api as compute_cells_api
+from nova.compute import flavors
+from nova.compute import vm_states
+from nova import context
 from nova import db
-from nova.openstack.common import jsonutils
+from nova import objects
+from nova.openstack.common import timeutils
 from nova import quota
+from nova import test
 from nova.tests.compute import test_compute
+from nova.tests import fake_instance
 
 
 ORIG_COMPUTE_API = None
@@ -89,23 +97,6 @@ def deploy_stubs(stubs, api, original_instance=None):
     stubs.Set(api, '_cast_to_cells', cast)
 
 
-def wrap_create_instance(func):
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        instance = self._create_fake_instance()
-
-        def fake(*args, **kwargs):
-            return instance
-
-        self.stubs.Set(self, '_create_fake_instance', fake)
-        original_instance = jsonutils.to_primitive(instance)
-        deploy_stubs(self.stubs, self.compute_api,
-                     original_instance=original_instance)
-        return func(self, *args, **kwargs)
-
-    return wrapper
-
-
 class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
     def setUp(self):
         super(CellsComputeAPITestCase, self).setUp()
@@ -147,6 +138,9 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
     def test_evacuate(self):
         self.skipTest("Test is incompatible with cells.")
 
+    def test_error_evacuate(self):
+        self.skipTest("Test is incompatible with cells.")
+
     def test_delete_instance_no_cell(self):
         cells_rpcapi = self.compute_api.cells_rpcapi
         self.mox.StubOutWithMock(cells_rpcapi,
@@ -183,6 +177,143 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
         response = self.compute_api.get_migrations(self.context, filters)
 
         self.assertEqual(migrations, response)
+
+    @mock.patch('nova.cells.messaging._TargetedMessage')
+    def test_rebuild_sig(self, mock_msg):
+        # TODO(belliott) Cells could benefit from better testing to ensure API
+        # and manager signatures stay up to date
+
+        def wire(version):
+            # wire the rpc cast directly to the manager method to make sure
+            # the signature matches
+            cells_mgr = manager.CellsManager()
+
+            def cast(context, method, *args, **kwargs):
+                fn = getattr(cells_mgr, method)
+                fn(context, *args, **kwargs)
+
+            cells_mgr.cast = cast
+            return cells_mgr
+
+        cells_rpcapi = self.compute_api.cells_rpcapi
+        client = cells_rpcapi.client
+
+        with mock.patch.object(client, 'prepare', side_effect=wire):
+            inst = self._create_fake_instance_obj()
+            inst.cell_name = 'mycell'
+
+            cells_rpcapi.rebuild_instance(self.context, inst, 'pass', None,
+                                          None, None, None, None,
+                                          recreate=False,
+                                          on_shared_storage=False, host='host',
+                                          preserve_ephemeral=True, kwargs=None)
+
+        # one targeted message should have been created
+        self.assertEqual(1, mock_msg.call_count)
+
+
+class CellsConductorAPIRPCRedirect(test.NoDBTestCase):
+    def setUp(self):
+        super(CellsConductorAPIRPCRedirect, self).setUp()
+
+        self.compute_api = compute_cells_api.ComputeCellsAPI()
+        self.cells_rpcapi = mock.MagicMock()
+        self.compute_api._compute_task_api.cells_rpcapi = self.cells_rpcapi
+
+        self.context = context.RequestContext('fake', 'fake')
+
+    @mock.patch.object(compute_api.API, '_record_action_start')
+    @mock.patch.object(compute_api.API, '_provision_instances')
+    @mock.patch.object(compute_api.API, '_check_and_transform_bdm')
+    @mock.patch.object(compute_api.API, '_get_image')
+    @mock.patch.object(compute_api.API, '_validate_and_build_base_options')
+    def test_build_instances(self, _validate, _get_image, _check_bdm,
+                             _provision, _record_action_start):
+        _get_image.return_value = (None, 'fake-image')
+        _validate.return_value = (None, 1)
+        _check_bdm.return_value = 'bdms'
+        _provision.return_value = 'instances'
+
+        self.compute_api.create(self.context, 'fake-flavor', 'fake-image')
+
+        # Subsequent tests in class are verifying the hooking.  We don't check
+        # args since this is verified in compute test code.
+        self.assertTrue(self.cells_rpcapi.build_instances.called)
+
+    @mock.patch.object(compute_api.API, '_record_action_start')
+    @mock.patch.object(compute_api.API, '_resize_cells_support')
+    @mock.patch.object(compute_api.API, '_reserve_quota_delta')
+    @mock.patch.object(compute_api.API, '_upsize_quota_delta')
+    @mock.patch.object(objects.Instance, 'save')
+    @mock.patch.object(flavors, 'extract_flavor')
+    @mock.patch.object(compute_api.API, '_check_auto_disk_config')
+    def test_resize_instance(self, _check, _extract, _save, _upsize, _reserve,
+                             _cells, _record):
+        _extract.return_value = {'name': 'fake', 'id': 'fake'}
+        orig_system_metadata = {}
+        instance = fake_instance.fake_instance_obj(self.context,
+                vm_state=vm_states.ACTIVE, cell_name='fake-cell',
+                launched_at=timeutils.utcnow(),
+                system_metadata=orig_system_metadata,
+                expected_attrs=['system_metadata'])
+
+        self.compute_api.resize(self.context, instance)
+        self.assertTrue(self.cells_rpcapi.resize_instance.called)
+
+    @mock.patch.object(objects.Instance, 'save')
+    def test_live_migrate_instance(self, instance_save):
+        orig_system_metadata = {}
+        instance = fake_instance.fake_instance_obj(self.context,
+                vm_state=vm_states.ACTIVE, cell_name='fake-cell',
+                launched_at=timeutils.utcnow(),
+                system_metadata=orig_system_metadata,
+                expected_attrs=['system_metadata'])
+
+        self.compute_api.live_migrate(self.context, instance,
+                True, True, 'fake_dest_host')
+
+        self.assertTrue(self.cells_rpcapi.live_migrate_instance.called)
+
+    @mock.patch.object(objects.Instance, 'save')
+    @mock.patch.object(objects.Instance, 'get_flavor')
+    @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(compute_api.API, '_get_image')
+    @mock.patch.object(compute_api.API, '_check_auto_disk_config')
+    @mock.patch.object(compute_api.API, '_checks_for_create_and_rebuild')
+    @mock.patch.object(compute_api.API, '_record_action_start')
+    def test_rebuild_instance(self, _record_action_start,
+        _checks_for_create_and_rebuild, _check_auto_disk_config,
+        _get_image, bdm_get_by_instance_uuid, get_flavor, instance_save):
+        orig_system_metadata = {}
+        instance = fake_instance.fake_instance_obj(self.context,
+                vm_state=vm_states.ACTIVE, cell_name='fake-cell',
+                launched_at=timeutils.utcnow(),
+                system_metadata=orig_system_metadata,
+                expected_attrs=['system_metadata'])
+        get_flavor.return_value = ''
+        image_href = ''
+        image = {"min_ram": 10, "min_disk": 1,
+                 "properties": {'architecture': 'x86_64'}}
+        admin_pass = ''
+        files_to_inject = []
+        bdms = []
+
+        _get_image.return_value = (None, image)
+        bdm_get_by_instance_uuid.return_value = bdms
+
+        self.compute_api.rebuild(self.context, instance, image_href,
+                                 admin_pass, files_to_inject)
+
+        self.assertTrue(self.cells_rpcapi.rebuild_instance.called)
+
+    def test_check_equal(self):
+        task_api = self.compute_api.compute_task_api
+        tests = set()
+        for (name, value) in inspect.getmembers(self, inspect.ismethod):
+            if name.startswith('test_') and name != 'test_check_equal':
+                tests.add(name[5:])
+        if tests != set(task_api.cells_compatible):
+            self.fail("Testcases not equivalent to cells_compatible list")
 
 
 class CellsComputePolicyTestCase(test_compute.ComputePolicyTestCase):

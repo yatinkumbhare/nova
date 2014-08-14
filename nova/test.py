@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -28,29 +26,34 @@ eventlet.monkey_patch(os=False)
 
 import copy
 import gettext
+import logging
 import os
 import shutil
 import sys
-import tempfile
 import uuid
 
 import fixtures
 from oslo.config import cfg
+from oslo.messaging import conffixture as messaging_conffixture
 import testtools
 
 from nova import context
 from nova import db
 from nova.db import migration
+from nova.db.sqlalchemy import api as session
 from nova.network import manager as network_manager
+from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.db.sqlalchemy import session
+from nova.openstack.common.fixture import logging as log_fixture
 from nova.openstack.common.fixture import moxstubout
-from nova.openstack.common import log as logging
+from nova.openstack.common import log as nova_logging
 from nova.openstack.common import timeutils
 from nova import paths
+from nova import rpc
 from nova import service
 from nova.tests import conf_fixture
 from nova.tests import policy_fixture
+from nova import utils
 
 
 test_opts = [
@@ -62,13 +65,19 @@ test_opts = [
 CONF = cfg.CONF
 CONF.register_opts(test_opts)
 CONF.import_opt('connection',
-                'nova.openstack.common.db.sqlalchemy.session',
+                'nova.openstack.common.db.options',
                 group='database')
-CONF.import_opt('sqlite_db', 'nova.openstack.common.db.sqlalchemy.session')
+CONF.import_opt('sqlite_db', 'nova.openstack.common.db.options',
+                group='database')
 CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v3')
 CONF.set_override('use_stderr', False)
 
-logging.setup('nova')
+nova_logging.setup('nova')
+
+# NOTE(comstud): Make sure we have all of the objects loaded. We do this
+# at module import time, because we may be using mock decorators in our
+# tests that run at import time.
+objects.register_all()
 
 _DB_CACHE = None
 _TRUE_VALUES = ('True', 'true', '1', 'yes')
@@ -192,6 +201,23 @@ class TestingException(Exception):
     pass
 
 
+class NullHandler(logging.Handler):
+    """custom default NullHandler to attempt to format the record.
+
+    Used in conjunction with
+    log_fixture.get_logging_handle_error_fixture to detect formatting errors in
+    debug level logs without saving the logs.
+    """
+    def handle(self, record):
+        self.format(record)
+
+    def emit(self, record):
+        pass
+
+    def createLock(self):
+        self.lock = None
+
+
 class TestCase(testtools.TestCase):
     """Test case base class for all unit tests.
 
@@ -199,6 +225,11 @@ class TestCase(testtools.TestCase):
     `NoDBTestCase` first.
     """
     USES_DB = True
+
+    # NOTE(rpodolyaka): this attribute can be overridden in subclasses in order
+    #                   to scale the global test timeout value set for each
+    #                   test case separately. Use 0 value to disable timeout.
+    TIMEOUT_SCALING_FACTOR = 1
 
     def setUp(self):
         """Run before each test method to initialize test environment."""
@@ -209,11 +240,18 @@ class TestCase(testtools.TestCase):
         except ValueError:
             # If timeout value is invalid do not set a timeout.
             test_timeout = 0
+
+        if self.TIMEOUT_SCALING_FACTOR >= 0:
+            test_timeout *= self.TIMEOUT_SCALING_FACTOR
+        else:
+            raise ValueError('TIMEOUT_SCALING_FACTOR value must be >= 0')
+
         if test_timeout > 0:
             self.useFixture(fixtures.Timeout(test_timeout, gentle=True))
         self.useFixture(fixtures.NestedTempfile())
         self.useFixture(fixtures.TempHomeDir())
         self.useFixture(TranslationFixture())
+        self.useFixture(log_fixture.get_logging_handle_error_fixture())
 
         if os.environ.get('OS_STDOUT_CAPTURE') in _TRUE_VALUES:
             stdout = self.useFixture(fixtures.StringStream('stdout')).stream
@@ -222,16 +260,45 @@ class TestCase(testtools.TestCase):
             stderr = self.useFixture(fixtures.StringStream('stderr')).stream
             self.useFixture(fixtures.MonkeyPatch('sys.stderr', stderr))
 
+        rpc.add_extra_exmods('nova.test')
+        self.addCleanup(rpc.clear_extra_exmods)
+        self.addCleanup(rpc.cleanup)
+
+        # set root logger to debug
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+
+        # supports collecting debug level for local runs
+        if os.environ.get('OS_DEBUG') in _TRUE_VALUES:
+            level = logging.DEBUG
+        else:
+            level = logging.INFO
+
+        # Collect logs
         fs = '%(levelname)s [%(name)s] %(message)s'
-        self.log_fixture = self.useFixture(fixtures.FakeLogger(format=fs))
+        self.useFixture(fixtures.FakeLogger(format=fs, level=None))
+        root.handlers[0].setLevel(level)
+
+        if level > logging.DEBUG:
+            # Just attempt to format debug level logs, but don't save them
+            handler = NullHandler()
+            self.useFixture(fixtures.LogHandler(handler, nuke_handlers=False))
+            handler.setLevel(logging.DEBUG)
+
         self.useFixture(conf_fixture.ConfFixture(CONF))
+
+        self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
+        self.messaging_conf.transport_driver = 'fake'
+        self.useFixture(self.messaging_conf)
+
+        rpc.init(CONF)
 
         if self.USES_DB:
             global _DB_CACHE
             if not _DB_CACHE:
                 _DB_CACHE = Database(session, migration,
                         sql_connection=CONF.database.connection,
-                        sqlite_db=CONF.sqlite_db,
+                        sqlite_db=CONF.database.sqlite_db,
                         sqlite_clean_db=CONF.sqlite_clean_db)
 
             self.useFixture(_DB_CACHE)
@@ -244,6 +311,11 @@ class TestCase(testtools.TestCase):
             objects_base.NovaObject._obj_classes)
         self.addCleanup(self._restore_obj_registry)
 
+        # NOTE(mnaser): All calls to utils.is_neutron() are cached in
+        # nova.utils._IS_NEUTRON.  We set it to None to avoid any
+        # caching of that value.
+        utils._IS_NEUTRON = None
+
         mox_fixture = self.useFixture(moxstubout.MoxStubout())
         self.mox = mox_fixture.mox
         self.stubs = mox_fixture.stubs
@@ -253,8 +325,7 @@ class TestCase(testtools.TestCase):
         CONF.set_override('fatal_exception_format_errors', True)
         CONF.set_override('enabled', True, 'osapi_v3')
         CONF.set_override('force_dhcp_release', False)
-        # This will be cleaned up by the NestedTempfile fixture
-        CONF.set_override('lock_path', tempfile.mkdtemp())
+        CONF.set_override('periodic_enable', False)
 
     def _restore_obj_registry(self):
         objects_base.NovaObject._obj_classes = self._base_test_obj_backup
@@ -302,9 +373,14 @@ class TimeOverride(fixtures.Fixture):
 
 
 class NoDBTestCase(TestCase):
-    """
-    `NoDBTestCase` differs from TestCase in that DB access is not supported.
+    """`NoDBTestCase` differs from TestCase in that DB access is not supported.
     This makes tests run significantly faster. If possible, all new tests
     should derive from this class.
     """
     USES_DB = False
+
+
+class BaseHookTestCase(NoDBTestCase):
+    def assert_has_hook(self, expected_name, func):
+        self.assertTrue(hasattr(func, '__hook_name__'))
+        self.assertEqual(expected_name, func.__hook_name__)

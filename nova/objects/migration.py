@@ -13,9 +13,10 @@
 #    under the License.
 
 from nova import db
+from nova import exception
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova.objects import instance as instance_obj
 
 
 class Migration(base.NovaPersistentObject, base.NovaObject):
@@ -57,8 +58,10 @@ class Migration(base.NovaPersistentObject, base.NovaObject):
 
     @base.remotable
     def create(self, context):
+        if self.obj_attr_is_set('id'):
+            raise exception.ObjectActionError(action='create',
+                                              reason='already created')
         updates = self.obj_get_changes()
-        updates.pop('id', None)
         db_migration = db.migration_create(context, updates)
         self._from_db_object(context, self, db_migration)
 
@@ -72,26 +75,22 @@ class Migration(base.NovaPersistentObject, base.NovaObject):
 
     @property
     def instance(self):
-        return instance_obj.Instance.get_by_uuid(self._context,
-                                                 self.instance_uuid)
-
-
-def _make_list(context, list_obj, item_cls, db_list):
-    list_obj.objects = []
-    for db_item in db_list:
-        item = item_cls._from_db_object(context, item_cls(), db_item)
-        list_obj.objects.append(item)
-    list_obj.obj_reset_changes()
-    return list_obj
+        return objects.Instance.get_by_uuid(self._context, self.instance_uuid)
 
 
 class MigrationList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
+    #              Migration <= 1.1
     # Version 1.1: Added use_slave to get_unconfirmed_by_dest_compute
     VERSION = '1.1'
 
     fields = {
         'objects': fields.ListOfObjectsField('Migration'),
+        }
+    child_versions = {
+        '1.0': '1.1',
+        # NOTE(danms): Migration was at 1.1 before we added this
+        '1.1': '1.1',
         }
 
     @base.remotable_classmethod
@@ -99,15 +98,18 @@ class MigrationList(base.ObjectListBase, base.NovaObject):
                                         dest_compute, use_slave=False):
         db_migrations = db.migration_get_unconfirmed_by_dest_compute(
             context, confirm_window, dest_compute, use_slave=use_slave)
-        return _make_list(context, MigrationList(), Migration, db_migrations)
+        return base.obj_make_list(context, cls(context), objects.Migration,
+                                  db_migrations)
 
     @base.remotable_classmethod
     def get_in_progress_by_host_and_node(cls, context, host, node):
         db_migrations = db.migration_get_in_progress_by_host_and_node(
             context, host, node)
-        return _make_list(context, MigrationList(), Migration, db_migrations)
+        return base.obj_make_list(context, cls(context), objects.Migration,
+                                  db_migrations)
 
     @base.remotable_classmethod
     def get_by_filters(cls, context, filters):
         db_migrations = db.migration_get_all_by_filters(context, filters)
-        return _make_list(context, MigrationList(), Migration, db_migrations)
+        return base.obj_make_list(context, cls(context), objects.Migration,
+                                  db_migrations)

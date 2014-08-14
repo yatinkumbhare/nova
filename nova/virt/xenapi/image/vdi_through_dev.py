@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -16,10 +14,11 @@
 #    under the License.
 
 import contextlib
-import eventlet
-from eventlet import greenio
 import os
 import tarfile
+
+import eventlet
+from eventlet import greenio
 
 from nova.image import glance
 from nova import utils
@@ -38,7 +37,7 @@ class VdiThroughDevStore(object):
             context, session, instance, vdi_uuids, image_id)
         return command.upload_image()
 
-    def download_image(self, context, session, instance, image_id):
+    def download_image(self, context, session, image_id):
         # TODO(matelakat) Move through-dev image download functionality to this
         # method.
         raise NotImplementedError()

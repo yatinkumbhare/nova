@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -19,7 +17,7 @@ from nova.compute import utils as compute_utils
 from nova.conductor.tasks import live_migrate
 from nova import db
 from nova import exception
-from nova.objects import instance as instance_obj
+from nova import objects
 from nova.scheduler import utils as scheduler_utils
 from nova import test
 from nova.tests import fake_instance
@@ -38,8 +36,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                 power_state=power_state.RUNNING,
                 memory_mb=512,
                 image_ref=self.instance_image)
-        self.instance = instance_obj.Instance._from_db_object(
-                self.context, instance_obj.Instance(), db_instance)
+        self.instance = objects.Instance._from_db_object(
+                self.context, objects.Instance(), db_instance)
         self.destination = "destination"
         self.block_migration = "bm"
         self.disk_over_commit = "doc"
@@ -240,7 +238,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
         compute_utils.get_image_metadata(self.context,
-                self.task.image_service, self.instance_image,
+                self.task.image_api, self.instance_image,
                 self.instance).AndReturn("image")
         scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
                                            mox.IgnoreArg()).AndReturn({})
@@ -284,7 +282,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
         compute_utils.get_image_metadata(self.context,
-                self.task.image_service, self.instance_image,
+                self.task.image_api, self.instance_image,
                 self.instance).AndReturn("image")
         scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
                                            mox.IgnoreArg()).AndReturn({})
@@ -322,7 +320,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
 
         compute_utils.get_image_metadata(self.context,
-                self.task.image_service, self.instance_image,
+                self.task.image_api, self.instance_image,
                 self.instance).AndReturn("image")
         scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
                                            mox.IgnoreArg()).AndReturn({})
@@ -352,7 +350,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                 '_check_compatible_with_source_hypervisor')
 
         compute_utils.get_image_metadata(self.context,
-                self.task.image_service, self.instance_image,
+                self.task.image_api, self.instance_image,
                 self.instance).AndReturn("image")
         scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
                                            mox.IgnoreArg()).AndReturn({})
@@ -371,7 +369,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task.scheduler_rpcapi,
                                  'select_destinations')
         compute_utils.get_image_metadata(self.context,
-                self.task.image_service, self.instance_image,
+                self.task.image_api, self.instance_image,
                 self.instance).AndReturn("image")
         scheduler_utils.build_request_spec(self.context, mox.IgnoreArg(),
                                            mox.IgnoreArg()).AndReturn({})

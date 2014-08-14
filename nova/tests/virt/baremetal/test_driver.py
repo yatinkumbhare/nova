@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright 2012 Hewlett-Packard Development Company, L.P.
@@ -20,13 +19,17 @@
 
 """Tests for the base baremetal driver class."""
 
+import mock
 import mox
-
 from oslo.config import cfg
 
+from nova.compute import flavors
 from nova.compute import power_state
+from nova.compute import task_states
 from nova import db as main_db
 from nova import exception
+from nova import objects
+from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.image import fake as fake_image
 from nova.tests import utils
@@ -36,7 +39,6 @@ from nova.virt.baremetal import baremetal_states
 from nova.virt.baremetal import db
 from nova.virt.baremetal import driver as bm_driver
 from nova.virt.baremetal import fake
-from nova.virt.baremetal import pxe
 from nova.virt import fake as fake_virt
 
 
@@ -71,6 +73,10 @@ class BareMetalDriverNoDBTestCase(test.NoDBTestCase):
         self.assertIsInstance(self.driver.volume_driver, fake.FakeVolumeDriver)
         self.assertIsInstance(self.driver.firewall_driver,
                               fake.FakeFirewallDriver)
+
+    def test_driver_capabilities(self):
+        self.assertTrue(self.driver.capabilities['has_imagecache'])
+        self.assertFalse(self.driver.capabilities['supports_recreate'])
 
 
 class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
@@ -116,8 +122,8 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
         if ephemeral:
             result['instance'] = utils.get_test_instance()
         else:
-            flavor = utils.get_test_instance_type(options={'ephemeral_gb': 0})
-            result['instance'] = utils.get_test_instance(instance_type=flavor)
+            flavor = utils.get_test_flavor(options={'ephemeral_gb': 0})
+            result['instance'] = utils.get_test_instance(flavor=flavor)
         result['instance']['node'] = result['node']['uuid']
         result['spawn_params'] = dict(
                 admin_password='test_pass',
@@ -135,6 +141,23 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
                 network_info=result['spawn_params']['network_info'],
                 block_device_info=result['spawn_params']['block_device_info'],
             )
+
+        instance = objects.Instance._from_db_object(
+            self.context, objects.Instance(), result['instance'])
+        instance.node = result['node']['uuid']
+
+        result['rebuild_params'] = dict(
+            context=self.context,
+            instance=instance,
+            image_meta=utils.get_test_image_info(None, result['instance']),
+            injected_files=[('/fake/path', 'hello world')],
+            admin_password='test_pass',
+            bdms={},
+            detach_block_devices=self.mox.CreateMockAnything(),
+            attach_block_devices=self.mox.CreateMockAnything(),
+            network_info=result['spawn_params']['network_info'],
+            block_device_info=result['spawn_params']['block_device_info'],
+        )
 
         return result
 
@@ -163,6 +186,16 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
                 node['instance']['uuid'])
         self.assertEqual(instance['default_ephemeral_device'], '/dev/sda1')
 
+    def test_set_default_ephemeral_device(self):
+        instance = objects.Instance(context=self.context)
+        instance.system_metadata = flavors.save_flavor_info(
+            {}, flavors.get_default_flavor())
+        instance.system_metadata['instance_type_ephemeral_gb'] = 1
+        with mock.patch.object(instance, 'save') as mock_save:
+            self.driver._set_default_ephemeral_device(instance)
+            mock_save.assert_called_once_with()
+            self.assertEqual('/dev/sda1', instance.default_ephemeral_device)
+
     def test_spawn_no_ephemeral_ok(self):
         node = self._create_node(ephemeral=False)
         self.driver.spawn(**node['spawn_params'])
@@ -172,7 +205,30 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
         self.assertEqual(row['instance_name'], node['instance']['hostname'])
         instance = main_db.instance_get_by_uuid(self.context,
                 node['instance']['uuid'])
-        self.assertEqual(instance['default_ephemeral_device'], None)
+        self.assertIsNone(instance['default_ephemeral_device'])
+
+    def _test_rebuild(self, ephemeral):
+        node = self._create_node(ephemeral=ephemeral)
+        self.driver.spawn(**node['spawn_params'])
+        after_spawn = db.bm_node_get(self.context, node['node']['id'])
+
+        instance = node['rebuild_params']['instance']
+        instance.task_state = task_states.REBUILDING
+        instance.save(expected_task_state=[None])
+        self.driver.rebuild(preserve_ephemeral=ephemeral,
+                            **node['rebuild_params'])
+        after_rebuild = db.bm_node_get(self.context, node['node']['id'])
+
+        self.assertEqual(after_rebuild['task_state'], baremetal_states.ACTIVE)
+        self.assertEqual(after_rebuild['preserve_ephemeral'], ephemeral)
+        self.assertEqual(after_spawn['instance_uuid'],
+                         after_rebuild['instance_uuid'])
+
+    def test_rebuild_ok(self):
+        self._test_rebuild(ephemeral=False)
+
+    def test_rebuild_preserve_ephemeral(self):
+        self._test_rebuild(ephemeral=True)
 
     def test_macs_from_nic_for_instance(self):
         node = self._create_node()
@@ -242,6 +298,41 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
         row = db.bm_node_get(self.context, node['node']['id'])
         self.assertEqual(row['task_state'], baremetal_states.DELETED)
 
+    def test_spawn_prepared(self):
+        node = self._create_node()
+
+        def update_2prepared(context, node, instance, state):
+            row = db.bm_node_get(context, node['id'])
+            self.assertEqual(row['task_state'], baremetal_states.BUILDING)
+            db.bm_node_update(
+                context, node['id'],
+                {'task_state': baremetal_states.PREPARED})
+
+        self.mox.StubOutWithMock(fake.FakeDriver, 'activate_node')
+        self.mox.StubOutWithMock(bm_driver, '_update_state')
+
+        bm_driver._update_state(
+            self.context,
+            mox.IsA(node['node']),
+            node['instance'],
+            baremetal_states.PREPARED).WithSideEffects(update_2prepared)
+        fake.FakeDriver.activate_node(
+            self.context,
+            mox.IsA(node['node']),
+            node['instance']).AndRaise(test.TestingException)
+        bm_driver._update_state(
+            self.context,
+            mox.IsA(node['node']),
+            node['instance'],
+            baremetal_states.ERROR).AndRaise(test.TestingException)
+        self.mox.ReplayAll()
+
+        self.assertRaises(test.TestingException,
+                          self.driver.spawn, **node['spawn_params'])
+
+        row = db.bm_node_get(self.context, node['node']['id'])
+        self.assertEqual(row['task_state'], baremetal_states.PREPARED)
+
     def test_spawn_fails_to_cleanup(self):
         node = self._create_node()
 
@@ -257,6 +348,19 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
 
         row = db.bm_node_get(self.context, node['node']['id'])
         self.assertEqual(row['task_state'], baremetal_states.ERROR)
+
+    def test_spawn_destroy_images_on_deploy(self):
+        node = self._create_node()
+        self.driver.driver.destroy_images = mock.MagicMock()
+        self.driver.spawn(**node['spawn_params'])
+        row = db.bm_node_get(self.context, node['node']['id'])
+        self.assertEqual(row['task_state'], baremetal_states.ACTIVE)
+        self.assertEqual(row['instance_uuid'], node['instance']['uuid'])
+        self.assertEqual(row['instance_name'], node['instance']['hostname'])
+        instance = main_db.instance_get_by_uuid(self.context,
+                node['instance']['uuid'])
+        self.assertIsNotNone(instance)
+        self.assertEqual(1, self.driver.driver.destroy_images.call_count)
 
     def test_destroy_ok(self):
         node = self._create_node()
@@ -293,6 +397,10 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
         self.assertEqual(resources['memory_mb_used'], 0)
         self.assertEqual(resources['supported_instances'],
                 '[["test", "baremetal", "baremetal"]]')
+        self.assertEqual(resources['stats'],
+                         '{"cpu_arch": "test", "baremetal_driver": '
+                         '"nova.virt.baremetal.fake.FakeDriver", '
+                         '"test_spec": "test_value"}')
 
         self.driver.spawn(**node['spawn_params'])
         resources = self.driver.get_available_resource(node['node']['uuid'])
@@ -302,7 +410,8 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
         self.driver.destroy(**node['destroy_params'])
         resources = self.driver.get_available_resource(node['node']['uuid'])
         self.assertEqual(resources['memory_mb_used'], 0)
-        self.assertEqual(resources['stats']['test_spec'], 'test_value')
+        stats = jsonutils.loads(resources['stats'])
+        self.assertEqual(stats['test_spec'], 'test_value')
 
     def test_get_available_nodes(self):
         self.assertEqual(0, len(self.driver.get_available_nodes()))
@@ -387,20 +496,6 @@ class BareMetalDriverWithDBTestCase(bm_db_base.BMDBTestCase):
         res = self.driver.get_info(node['instance'])
         # prior to the fix, returned power_state was SHUTDOWN
         self.assertEqual(res['state'], power_state.NOSTATE)
-        self.mox.VerifyAll()
-
-    def test_dhcp_options_for_instance(self):
-        node = self._create_node()
-        fake_bootfile = "pxelinux.0"
-        self.mox.StubOutWithMock(pxe, 'get_pxe_bootfile_name')
-        pxe.get_pxe_bootfile_name(mox.IgnoreArg()).AndReturn(fake_bootfile)
-        self.mox.ReplayAll()
-        expected = [{'opt_name': 'bootfile-name', 'opt_value': fake_bootfile},
-                    {'opt_name': 'server-ip-address', 'opt_value': CONF.my_ip},
-                    {'opt_name': 'tftp-server', 'opt_value': CONF.my_ip}]
-
-        res = self.driver.dhcp_options_for_instance(node['instance'])
-        self.assertEqual(expected.sort(), res.sort())
         self.mox.VerifyAll()
 
     def test_attach_volume(self):

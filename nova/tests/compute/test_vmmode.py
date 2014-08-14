@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright (C) 2012 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,10 +12,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from nova.compute import vm_mode
 from nova import exception
 from nova import test
-
-from nova.compute import vm_mode
 
 
 class ComputeVMModeTest(test.NoDBTestCase):
@@ -47,3 +44,22 @@ class ComputeVMModeTest(test.NoDBTestCase):
         inst = dict(vm_mode="hvm")
         mode = vm_mode.get_from_instance(inst)
         self.assertEqual(mode, "hvm")
+
+    def test_name_pv_compat(self):
+        mode = vm_mode.name('pv')
+        self.assertEqual(vm_mode.XEN, mode)
+
+    def test_name_hv_compat(self):
+        mode = vm_mode.name('hv')
+        self.assertEqual(vm_mode.HVM, mode)
+
+    def test_name_hvm(self):
+        mode = vm_mode.name('hvm')
+        self.assertEqual(vm_mode.HVM, mode)
+
+    def test_name_none(self):
+        mode = vm_mode.name(None)
+        self.assertIsNone(mode)
+
+    def test_name_invalid(self):
+        self.assertRaises(exception.Invalid, vm_mode.name, 'invalid')

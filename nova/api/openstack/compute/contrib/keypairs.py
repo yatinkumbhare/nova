@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -26,7 +24,7 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova.compute import api as compute_api
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 authorize = extensions.extension_authorizer('compute', 'keypairs')
@@ -66,8 +64,7 @@ class KeypairController(object):
 
     @wsgi.serializers(xml=KeypairTemplate)
     def create(self, req, body):
-        """
-        Create or import keypair.
+        """Create or import keypair.
 
         Sending name will generate a key and return private_key
         and fingerprint.
@@ -114,15 +111,13 @@ class KeypairController(object):
             raise webob.exc.HTTPConflict(explanation=exc.format_message())
 
     def delete(self, req, id):
-        """
-        Delete a keypair with a given name
-        """
+        """Delete a keypair with a given name."""
         context = req.environ['nova.context']
         authorize(context, action='delete')
         try:
             self.api.delete_key_pair(context, context.user_id, id)
-        except exception.KeypairNotFound:
-            raise webob.exc.HTTPNotFound()
+        except exception.KeypairNotFound as exc:
+            raise webob.exc.HTTPNotFound(explanation=exc.format_message())
         return webob.Response(status_int=202)
 
     @wsgi.serializers(xml=KeypairTemplate)
@@ -133,15 +128,13 @@ class KeypairController(object):
 
         try:
             keypair = self.api.get_key_pair(context, context.user_id, id)
-        except exception.KeypairNotFound:
-            raise webob.exc.HTTPNotFound()
+        except exception.KeypairNotFound as exc:
+            raise webob.exc.HTTPNotFound(explanation=exc.format_message())
         return {'keypair': keypair}
 
     @wsgi.serializers(xml=KeypairsTemplate)
     def index(self, req):
-        """
-        List of keypairs for a user
-        """
+        """List of keypairs for a user."""
         context = req.environ['nova.context']
         authorize(context, action='index')
         key_pairs = self.api.get_key_pairs(context, context.user_id)
@@ -203,7 +196,7 @@ class Keypairs(extensions.ExtensionDescriptor):
     name = "Keypairs"
     alias = "os-keypairs"
     namespace = "http://docs.openstack.org/compute/ext/keypairs/api/v1.1"
-    updated = "2011-08-08T00:00:00+00:00"
+    updated = "2011-08-08T00:00:00Z"
 
     def get_resources(self):
         resources = []

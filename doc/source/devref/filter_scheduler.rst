@@ -77,7 +77,7 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
 * |AggregateCoreFilter| - filters hosts by CPU core number with per-aggregate
   ``cpu_allocation_ratio`` setting. If no per-aggregate value is found, it will
   fall back to the global default ``cpu_allocation_ratio``. If more than one value
-  is found for a host (meaning the host is in two differenet aggregate with
+  is found for a host (meaning the host is in two different aggregate with
   different ratio settings), the minimum value will be used.
 * |IsolatedHostsFilter| - filter based on ``image_isolated``, ``host_isolated``
   and ``restrict_isolated_hosts_to_isolated_images`` flags.
@@ -87,14 +87,31 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
 * |AggregateRamFilter| - filters hosts by RAM with per-aggregate
   ``ram_allocation_ratio`` setting. If no per-aggregate value is found, it will
   fall back to the global default ``ram_allocation_ratio``. If more than one value
-  is found for a host (meaning the host is in two differenet aggregate with
+  is found for a host (meaning the host is in two different aggregate with
   different ratio settings), the minimum value will be used.
+* |DiskFilter| - filters hosts by their disk allocation. Only hosts with sufficient
+  disk space to host the instance are passed.
+  ``disk_allocation_ration`` setting. It's virtual disk to physical disk
+  allocation ratio and it's 1.0 by default. The total allow allocated disk size will
+  be physical disk multiplied this ratio.
+* |NumInstancesFilter| - filters hosts by number of running instances on it.
+  hosts with too many instances will be filtered.
+  ``max_instances_per_host`` setting. Maximum number of instances allowed to run on
+  this host, the host will be ignored by scheduler if more than ``max_instances_per_host``
+  are already existing on the host.
+* |IoOpsFilter| - filters hosts by concurrent I/O operations on it.
+  hosts with too many concurrent I/O operations will be filtered.
+  ``max_io_ops_per_host`` setting. Maximum number of I/O intensive instances allowed to
+  run on this host, the host will be ignored by scheduler if more than ``max_io_ops_per_host``
+  instances such as build/resize/snapshot etc are running on it.
+* |PciPassthroughFilter| - Filter that schedules instances on a host if the host
+  has devices to meet the device requests in the 'extra_specs' for the flavor.
 * |SimpleCIDRAffinityFilter| - allows to put a new instance on a host within
   the same IP block.
 * |DifferentHostFilter| - allows to put the instance on a different host from a
   set of instances.
 * |SameHostFilter| - puts the instance on the same host as another instance in
-  a set of of instances.
+  a set of instances.
 * |RetryFilter| - filters hosts that have been attempted for scheduling.
   Only passes hosts that have not been previously attempted.
 * |TrustedFilter| - filters hosts based on their trust.  Only passes hosts
@@ -102,11 +119,27 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
 * |TypeAffinityFilter| - Only passes hosts that are not already running an
   instance of the requested type.
 * |AggregateTypeAffinityFilter| - limits instance_type by aggregate.
-* |GroupAntiAffinityFilter| - ensures that each instance in group is on a
-  different host.
-* |GroupAffinityFilter| - ensures that each instance in group is on a same
-  host with one of the instance host in a group.
+* |ServerGroupAntiAffinityFilter| - This filter implements anti-affinity for a
+  server group.  First you must create a server group with a policy of
+  'anti-affinity' via the server groups API.  Then, when you boot a new server,
+  provide a scheduler hint of 'group=<uuid>' where <uuid> is the UUID of the
+  server group you created.  This will result in the server getting added to the
+  group.  When the server gets scheduled, anti-affinity will be enforced among
+  all servers in that group.
+* |ServerGroupAffinityFilter| - This filter works the same way as
+  ServerGroupAntiAffinityFilter.  The difference is that when you create the server
+  group, you should specify a policy of 'affinity'.
+* |GroupAntiAffinityFilter| - This filter is deprecated in favor of
+  ServerGroupAntiAffinityFilter.  Note that this should not be enabled at the
+  same time as GroupAffinityFilter or neither filter will work properly.
+* |GroupAffinityFilter| - This filter is deprecated in favor of
+  ServerGroupAffinityFilter.  Note that this should not be enabled at the same
+  time as GroupAntiAffinityFilter or neither filter will work properly.
 * |AggregateMultiTenancyIsolation| - isolate tenants in specific aggregates.
+* |AggregateImagePropertiesIsolation| - isolates hosts based on image
+  properties and aggregate metadata.
+* |MetricsFilter| - filters hosts based on metrics weight_setting. Only hosts with
+  the available metrics are passed.
 
 Now we can focus on these standard filter classes in details. I will pass the
 simplest ones, such as |AllHostsFilter|, |CoreFilter| and |RamFilter| are,
@@ -232,12 +265,13 @@ The default values for these settings in nova.conf are:
 ::
 
     --scheduler_available_filters=nova.scheduler.filters.standard_filters
-    --scheduler_default_filters=RamFilter,ComputeFilter,AvailabilityZoneFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter
+    --scheduler_default_filters=RamFilter,ComputeFilter,AvailabilityZoneFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter'
 
 With this configuration, all filters in ``nova.scheduler.filters``
 would be available, and by default the |RamFilter|, |ComputeFilter|,
-|AvailabilityZoneFilter|, |ComputeCapabilitiesFilter|, and
-|ImagePropertiesFilter| would be used.
+|AvailabilityZoneFilter|, |ComputeCapabilitiesFilter|,
+|ImagePropertiesFilter|, |ServerGroupAntiAffinityFilter|,
+and |ServerGroupAffinityFilter| would be used.
 
 If you want to create **your own filter** you just need to inherit from
 |BaseHostFilter| and implement one method:
@@ -263,27 +297,35 @@ default when no filters are specified in the request.
 Weights
 -------
 
-Filter Scheduler uses so-called **weights** during its work.
+Filter Scheduler uses the so called **weights** during its work. A weigher is a
+way to select the best suitable host from a group of valid hosts by giving
+weights to all the hosts in the list.
 
-The Filter Scheduler weights hosts based on the config option
+In order to prioritize one weigher against another, all the weighers have to
+define a multiplier that will be applied before computing the weight for a node.
+All the weights are normalized beforehand so that the  multiplier can be applied
+easily. Therefore the final weight for the object will be::
+
+    weight = w1_multiplier * norm(w1) + w2_multiplier * norm(w2) + ...
+
+A weigher should be a subclass of ``weights.BaseHostWeigher`` and they must
+implement the ``weight_multiplier`` and ``weight_object`` methods. If the
+``weight_objects`` method is overridden it just return a list of weights, and not
+modify the weight of the object directly, since final weights are normalized and
+computed by ``weight.BaseWeightHandler``.
+
+The Filter Scheduler weighs hosts based on the config option
 `scheduler_weight_classes`, this defaults to
-`nova.scheduler.weights.all_weighers`, which selects all the available weighers
-in the package nova.scheduler.weights. Hosts are then weighted and sorted with
-the largest weight winning. For each host, the final weight is calculated by
-summing up all weigher's weight value multiplying its own weight_mutiplier:
+`nova.scheduler.weights.all_weighers`, which selects the following weighers:
 
-::
+* |RamWeigher| Hosts are then weighted and sorted with the largest weight winning.
+  If the multiplier is negative, the host with less RAM available will win (useful
+  for stacking hosts, instead of spreading).
+* |MetricsWeigher| This weigher can compute the weight based on the compute node
+  host's various metrics. The to-be weighed metrics and their weighing ratio
+  are specified in the configuration file as the followings::
 
-    final_weight = 0
-    for each weigher:
-        final_weight += weigher's weight_mutiplier * weigher's calculated weight value
-
-The weigher's weight_mutiplier can be set in the configuration file, e.g.
-
-::
-
-    [metrics]
-    weight_multiplier=1.0
+    metrics_weight_setting = name1=1.0, name2=-1.0
 
 Filter Scheduler finds local list of acceptable hosts by repeated filtering and
 weighing. Each time it chooses a host, it virtually consumes resources on it,
@@ -311,6 +353,10 @@ in :mod:``nova.tests.scheduler``.
 .. |JsonFilter| replace:: :class:`JsonFilter <nova.scheduler.filters.json_filter.JsonFilter>`
 .. |RamFilter| replace:: :class:`RamFilter <nova.scheduler.filters.ram_filter.RamFilter>`
 .. |AggregateRamFilter| replace:: :class:`AggregateRamFilter <nova.scheduler.filters.ram_filter.AggregateRamFilter>`
+.. |DiskFilter| replace:: :class:`DiskFilter <nova.scheduler.filters.disk_filter.DiskFilter>`
+.. |NumInstancesFilter| replace:: :class:`NumInstancesFilter <nova.scheduler.filters.num_instances_filter.NumInstancesFilter>`
+.. |IoOpsFilter| replace:: :class:`IoOpsFilter <nova.scheduler.filters.io_ops_filter.IoOpsFilter>`
+.. |PciPassthroughFilter| replace:: :class:`PciPassthroughFilter <nova.scheduler.filters.pci_passthrough_filter.PciPassthroughFilter>`
 .. |SimpleCIDRAffinityFilter| replace:: :class:`SimpleCIDRAffinityFilter <nova.scheduler.filters.affinity_filter.SimpleCIDRAffinityFilter>`
 .. |GroupAntiAffinityFilter| replace:: :class:`GroupAntiAffinityFilter <nova.scheduler.filters.affinity_filter.GroupAntiAffinityFilter>`
 .. |GroupAffinityFilter| replace:: :class:`GroupAffinityFilter <nova.scheduler.filters.affinity_filter.GroupAffinityFilter>`
@@ -320,5 +366,11 @@ in :mod:``nova.tests.scheduler``.
 .. |TrustedFilter| replace:: :class:`TrustedFilter <nova.scheduler.filters.trusted_filter.TrustedFilter>`
 .. |TypeAffinityFilter| replace:: :class:`TypeAffinityFilter <nova.scheduler.filters.type_filter.TypeAffinityFilter>`
 .. |AggregateTypeAffinityFilter| replace:: :class:`AggregateTypeAffinityFilter <nova.scheduler.filters.type_filter.AggregateTypeAffinityFilter>`
+.. |ServerGroupAntiAffinityFilter| replace:: :class:`ServerGroupAntiAffinityFilter <nova.scheduler.filters.affinity_filter.ServerGroupAntiAffinityFilter>`
+.. |ServerGroupAffinityFilter| replace:: :class:`ServerGroupAntiAffinityFilter <nova.scheduler.filters.affinity_filter.ServerGroupAffinityFilter>`
 .. |AggregateInstanceExtraSpecsFilter| replace:: :class:`AggregateInstanceExtraSpecsFilter <nova.scheduler.filters.aggregate_instance_extra_specs.AggregateInstanceExtraSpecsFilter>`
 .. |AggregateMultiTenancyIsolation| replace:: :class:`AggregateMultiTenancyIsolation <nova.scheduler.filters.aggregate_multitenancy_isolation.AggregateMultiTenancyIsolation>`
+.. |RamWeigher| replace:: :class:`RamWeigher <nova.scheduler.weights.all_weighers.RamWeigher>`
+.. |AggregateImagePropertiesIsolation| replace:: :class:`AggregateImagePropertiesIsolation <nova.scheduler.filters.aggregate_image_properties_isolation.AggregateImagePropertiesIsolation>`
+.. |MetricsFilter| replace:: :class:`MetricsFilter <nova.scheduler.filters.metrics_filter.MetricsFilter>`
+.. |MetricsWeigher| replace:: :class:`MetricsWeigher <nova.scheduler.weights.metrics.MetricsWeigher>`

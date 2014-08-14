@@ -17,8 +17,9 @@
 Claim objects for use with resource tracking.
 """
 
-from nova.objects import instance as instance_obj
-from nova.openstack.common.gettextutils import _
+from nova import exception
+from nova.i18n import _
+from nova.objects import base as obj_base
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.pci import pci_request
@@ -41,10 +42,6 @@ class NopClaim(object):
     def memory_mb(self):
         return 0
 
-    @property
-    def vcpus(self):
-        return 0
-
     def __enter__(self):
         return self
 
@@ -56,8 +53,8 @@ class NopClaim(object):
         pass
 
     def __str__(self):
-        return "[Claim: %d MB memory, %d GB disk, %d VCPUS]" % (self.memory_mb,
-                self.disk_gb, self.vcpus)
+        return "[Claim: %d MB memory, %d GB disk]" % (self.memory_mb,
+                self.disk_gb)
 
 
 class Claim(NopClaim):
@@ -71,10 +68,11 @@ class Claim(NopClaim):
     correct decisions with respect to host selection.
     """
 
-    def __init__(self, instance, tracker, overhead=None):
+    def __init__(self, instance, tracker, resources, overhead=None,
+                 limits=None):
         super(Claim, self).__init__()
         # Stash a copy of the instance at the current point of time
-        if isinstance(instance, instance_obj.Instance):
+        if isinstance(instance, obj_base.NovaObject):
             self.instance = instance.obj_clone()
         else:
             # This does not use copy.deepcopy() because it could be
@@ -88,6 +86,10 @@ class Claim(NopClaim):
 
         self.overhead = overhead
 
+        # Check claim at constructor to avoid mess code
+        # Raise exception ComputeResourcesUnavailable if claim failed
+        self._claim_test(resources, limits)
+
     @property
     def disk_gb(self):
         return self.instance['root_gb'] + self.instance['ephemeral_gb']
@@ -96,18 +98,14 @@ class Claim(NopClaim):
     def memory_mb(self):
         return self.instance['memory_mb'] + self.overhead['memory_mb']
 
-    @property
-    def vcpus(self):
-        return self.instance['vcpus']
-
     def abort(self):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug(_("Aborting claim: %s") % self, instance=self.instance)
+        LOG.debug("Aborting claim: %s" % self, instance=self.instance)
         self.tracker.abort_instance_claim(self.instance)
 
-    def test(self, resources, limits=None):
+    def _claim_test(self, resources, limits=None):
         """Test if this claim can be satisfied given available resources and
         optional oversubscription limits
 
@@ -124,29 +122,25 @@ class Claim(NopClaim):
         # unlimited:
         memory_mb_limit = limits.get('memory_mb')
         disk_gb_limit = limits.get('disk_gb')
-        vcpu_limit = limits.get('vcpu')
 
         msg = _("Attempting claim: memory %(memory_mb)d MB, disk %(disk_gb)d "
-                "GB, VCPUs %(vcpus)d")
-        params = {'memory_mb': self.memory_mb, 'disk_gb': self.disk_gb,
-                  'vcpus': self.vcpus}
+                "GB")
+        params = {'memory_mb': self.memory_mb, 'disk_gb': self.disk_gb}
         LOG.audit(msg % params, instance=self.instance)
 
-        # Test for resources:
-        can_claim = (self._test_memory(resources, memory_mb_limit) and
-                     self._test_disk(resources, disk_gb_limit) and
-                     self._test_cpu(resources, vcpu_limit) and
-                     self._test_pci())
+        reasons = [self._test_memory(resources, memory_mb_limit),
+                   self._test_disk(resources, disk_gb_limit),
+                   self._test_pci()]
+        reasons = reasons + self._test_ext_resources(limits)
+        reasons = [r for r in reasons if r is not None]
+        if len(reasons) > 0:
+            raise exception.ComputeResourcesUnavailable(reason=
+                    "; ".join(reasons))
 
-        if can_claim:
-            LOG.audit(_("Claim successful"), instance=self.instance)
-        else:
-            LOG.audit(_("Claim failed"), instance=self.instance)
-
-        return can_claim
+        LOG.audit(_('Claim successful'), instance=self.instance)
 
     def _test_memory(self, resources, limit):
-        type_ = _("Memory")
+        type_ = _("memory")
         unit = "MB"
         total = resources['memory_mb']
         used = resources['memory_mb_used']
@@ -155,7 +149,7 @@ class Claim(NopClaim):
         return self._test(type_, unit, total, used, requested, limit)
 
     def _test_disk(self, resources, limit):
-        type_ = _("Disk")
+        type_ = _("disk")
         unit = "GB"
         total = resources['local_gb']
         used = resources['local_gb_used']
@@ -165,18 +159,16 @@ class Claim(NopClaim):
 
     def _test_pci(self):
         pci_requests = pci_request.get_instance_pci_requests(self.instance)
-        if not pci_requests:
-            return True
-        return self.tracker.pci_tracker.stats.support_requests(pci_requests)
 
-    def _test_cpu(self, resources, limit):
-        type_ = _("CPU")
-        unit = "VCPUs"
-        total = resources['vcpus']
-        used = resources['vcpus_used']
-        requested = self.vcpus
+        if pci_requests:
+            can_claim = self.tracker.pci_tracker.stats.support_requests(
+                pci_requests)
+            if not can_claim:
+                return _('Claim pci failed.')
 
-        return self._test(type_, unit, total, used, requested, limit)
+    def _test_ext_resources(self, limits):
+        return self.tracker.ext_resources_handler.test_resources(
+            self.instance, limits)
 
     def _test(self, type_, unit, total, used, requested, limit):
         """Test if the given type of resource needed for a claim can be safely
@@ -191,7 +183,7 @@ class Claim(NopClaim):
             # treat resource as unlimited:
             LOG.audit(_('%(type)s limit not specified, defaulting to '
                         'unlimited'), {'type': type_}, instance=self.instance)
-            return True
+            return
 
         free = limit - used
 
@@ -201,25 +193,22 @@ class Claim(NopClaim):
                   {'type': type_, 'limit': limit, 'free': free, 'unit': unit},
                   instance=self.instance)
 
-        can_claim = requested <= free
-
-        if not can_claim:
-            LOG.info(_('Unable to claim resources.  Free %(type)s %(free).02f '
-                       '%(unit)s < requested %(requested)d %(unit)s'),
-                     {'type': type_, 'free': free, 'unit': unit,
-                      'requested': requested},
-                     instance=self.instance)
-
-        return can_claim
+        if requested > free:
+            return (_('Free %(type)s %(free).02f '
+                      '%(unit)s < requested %(requested)d %(unit)s') %
+                      {'type': type_, 'free': free, 'unit': unit,
+                       'requested': requested})
 
 
 class ResizeClaim(Claim):
     """Claim used for holding resources for an incoming resize/migration
     operation.
     """
-    def __init__(self, instance, instance_type, tracker, overhead=None):
-        super(ResizeClaim, self).__init__(instance, tracker, overhead=overhead)
+    def __init__(self, instance, instance_type, tracker, resources,
+                 overhead=None, limits=None):
         self.instance_type = instance_type
+        super(ResizeClaim, self).__init__(instance, tracker, resources,
+                                          overhead=overhead, limits=limits)
         self.migration = None
 
     @property
@@ -231,21 +220,22 @@ class ResizeClaim(Claim):
     def memory_mb(self):
         return self.instance_type['memory_mb'] + self.overhead['memory_mb']
 
-    @property
-    def vcpus(self):
-        return self.instance_type['vcpus']
-
     def _test_pci(self):
         pci_requests = pci_request.get_instance_pci_requests(
             self.instance, 'new_')
-        if not pci_requests:
-            return True
+        if pci_requests:
+            claim = self.tracker.pci_tracker.stats.support_requests(
+                pci_requests)
+            if not claim:
+                return _('Claim pci failed.')
 
-        return self.tracker.pci_tracker.stats.support_requests(pci_requests)
+    def _test_ext_resources(self, limits):
+        return self.tracker.ext_resources_handler.test_resources(
+            self.instance_type, limits)
 
     def abort(self):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug(_("Aborting claim: %s") % self, instance=self.instance)
+        LOG.debug("Aborting claim: %s" % self, instance=self.instance)
         self.tracker.drop_resize_claim(self.instance, self.instance_type)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -23,16 +21,16 @@ from nova import network
 authorize = extensions.extension_authorizer('compute', 'floating_ip_pools')
 
 
-def _translate_floating_ip_view(pool):
+def _translate_floating_ip_view(pool_name):
     return {
-        'name': pool['name'],
+        'name': pool_name,
     }
 
 
 def _translate_floating_ip_pools_view(pools):
     return {
-        'floating_ip_pools': [_translate_floating_ip_view(pool)
-                              for pool in pools]
+        'floating_ip_pools': [_translate_floating_ip_view(pool_name)
+                              for pool_name in pools]
     }
 
 
@@ -80,7 +78,7 @@ class Floating_ip_pools(extensions.ExtensionDescriptor):
     alias = "os-floating-ip-pools"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "floating_ip_pools/api/v1.1")
-    updated = "2012-01-04T00:00:00+00:00"
+    updated = "2012-01-04T00:00:00Z"
 
     def get_resources(self):
         resources = []

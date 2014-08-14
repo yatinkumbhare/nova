@@ -16,27 +16,28 @@
 
 import base64
 import re
-import stevedore
 
 from oslo.config import cfg
+from oslo import messaging
 import six
+import stevedore
 import webob
 from webob import exc
 
 from nova.api.openstack import common
-from nova.api.openstack.compute.plugins.v3 import ips
+from nova.api.openstack.compute.schemas.v3 import servers as schema_servers
 from nova.api.openstack.compute.views import servers as views_servers
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
+from nova.api import validation
 from nova import compute
 from nova.compute import flavors
 from nova import exception
+from nova.i18n import _
+from nova.i18n import _LW
 from nova.image import glance
-from nova.objects import instance as instance_obj
-from nova.openstack.common.gettextutils import _
+from nova import objects
 from nova.openstack.common import log as logging
-from nova.openstack.common.rpc import common as rpc_common
 from nova.openstack.common import strutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
@@ -53,251 +54,7 @@ CONF.import_opt('extensions_blacklist', 'nova.api.openstack', group='osapi_v3')
 CONF.import_opt('extensions_whitelist', 'nova.api.openstack', group='osapi_v3')
 
 LOG = logging.getLogger(__name__)
-
-
-def make_fault(elem):
-    fault = xmlutil.SubTemplateElement(elem, 'fault', selector='fault')
-    fault.set('code')
-    fault.set('created')
-    msg = xmlutil.SubTemplateElement(fault, 'message')
-    msg.text = 'message'
-    det = xmlutil.SubTemplateElement(fault, 'details')
-    det.text = 'details'
-
-
-def make_server(elem, detailed=False):
-    elem.set('name')
-    elem.set('id')
-
-    if detailed:
-        elem.set('user_id')
-        elem.set('tenant_id')
-        elem.set('updated')
-        elem.set('created')
-        elem.set('host_id')
-        elem.set('status')
-        elem.set('progress')
-        elem.set('reservation_id')
-
-        # Attach image node
-        image = xmlutil.SubTemplateElement(elem, 'image', selector='image')
-        image.set('id')
-        xmlutil.make_links(image, 'links')
-
-        # Attach flavor node
-        flavor = xmlutil.SubTemplateElement(elem, 'flavor', selector='flavor')
-        flavor.set('id')
-        xmlutil.make_links(flavor, 'links')
-
-        # Attach fault node
-        make_fault(elem)
-
-        # Attach metadata node
-        elem.append(common.MetadataTemplate())
-
-        # Attach addresses node
-        elem.append(ips.AddressesTemplate())
-
-    xmlutil.make_links(elem, 'links')
-
-
-server_nsmap = {None: xmlutil.XMLNS_V11, 'atom': xmlutil.XMLNS_ATOM}
-
-
-class ServerTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('server', selector='server')
-        make_server(root, detailed=True)
-        return xmlutil.MasterTemplate(root, 1, nsmap=server_nsmap)
-
-
-class MinimalServersTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('servers')
-        elem = xmlutil.SubTemplateElement(root, 'server', selector='servers')
-        make_server(elem)
-        xmlutil.make_links(root, 'servers_links')
-        return xmlutil.MasterTemplate(root, 1, nsmap=server_nsmap)
-
-
-class ServersTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('servers')
-        elem = xmlutil.SubTemplateElement(root, 'server', selector='servers')
-        make_server(elem, detailed=True)
-        return xmlutil.MasterTemplate(root, 1, nsmap=server_nsmap)
-
-
-class ServerAdminPassTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('server')
-        root.set('admin_password')
-        return xmlutil.SlaveTemplate(root, 1, nsmap=server_nsmap)
-
-
-def FullServerTemplate():
-    master = ServerTemplate()
-    master.attach(ServerAdminPassTemplate())
-    return master
-
-
-class CommonDeserializer(wsgi.MetadataXMLDeserializer):
-    """Common deserializer to handle xml-formatted server create requests.
-
-    Handles standard server attributes as well as optional metadata
-    and personality attributes
-    """
-
-    metadata_deserializer = common.MetadataXMLDeserializer()
-    want_controller = True
-
-    def __init__(self, controller):
-        self.controller = controller
-
-    def _extract_server(self, node):
-        """Marshal the server attribute of a parsed request."""
-        server = {}
-        server_node = self.find_first_child_named(node, 'server')
-
-        attributes = ["name", "image_ref", "flavor_ref", "admin_password",
-                      "key_name"]
-        for attr in attributes:
-            if server_node.getAttribute(attr):
-                server[attr] = server_node.getAttribute(attr)
-
-        metadata_node = self.find_first_child_named(server_node, "metadata")
-        if metadata_node is not None:
-            server["metadata"] = self.extract_metadata(metadata_node)
-
-        networks = self._extract_networks(server_node)
-        if networks is not None:
-            server["networks"] = networks
-
-        if self.controller:
-            self.controller.server_create_xml_deserialize(server_node, server)
-
-        return server
-
-    def _extract_networks(self, server_node):
-        """Marshal the networks attribute of a parsed request."""
-        node = self.find_first_child_named(server_node, "networks")
-        if node is not None:
-            networks = []
-            for network_node in self.find_children_named(node,
-                                                         "network"):
-                item = {}
-                if network_node.hasAttribute("uuid"):
-                    item["uuid"] = network_node.getAttribute("uuid")
-                if network_node.hasAttribute("fixed_ip"):
-                    item["fixed_ip"] = network_node.getAttribute("fixed_ip")
-                if network_node.hasAttribute("port"):
-                    item["port"] = network_node.getAttribute("port")
-                networks.append(item)
-            return networks
-        else:
-            return None
-
-
-class ActionDeserializer(CommonDeserializer):
-    """Deserializer to handle xml-formatted server action requests.
-
-    Handles standard server attributes as well as optional metadata
-    and personality attributes
-    """
-
-    def default(self, string):
-        dom = xmlutil.safe_minidom_parse_string(string)
-        action_node = dom.childNodes[0]
-        action_name = action_node.tagName
-
-        action_deserializer = {
-            'create_image': self._action_create_image,
-            'reboot': self._action_reboot,
-            'rebuild': self._action_rebuild,
-            'resize': self._action_resize,
-            'confirm_resize': self._action_confirm_resize,
-            'revert_resize': self._action_revert_resize,
-        }.get(action_name, super(ActionDeserializer, self).default)
-
-        action_data = action_deserializer(action_node)
-
-        return {'body': {action_name: action_data}}
-
-    def _action_create_image(self, node):
-        return self._deserialize_image_action(node, ('name',))
-
-    def _action_reboot(self, node):
-        if not node.hasAttribute("type"):
-            raise AttributeError("No reboot type was specified in request")
-        return {"type": node.getAttribute("type")}
-
-    def _action_rebuild(self, node):
-        rebuild = {}
-        if node.hasAttribute("name"):
-            name = node.getAttribute("name")
-            if not name:
-                raise AttributeError("Name cannot be blank")
-            rebuild['name'] = name
-
-        metadata_node = self.find_first_child_named(node, "metadata")
-        if metadata_node is not None:
-            rebuild["metadata"] = self.extract_metadata(metadata_node)
-
-        if not node.hasAttribute("image_ref"):
-            raise AttributeError("No image_ref was specified in request")
-        rebuild["image_ref"] = node.getAttribute("image_ref")
-
-        if node.hasAttribute("admin_password"):
-            rebuild["admin_password"] = node.getAttribute("admin_password")
-
-        if self.controller:
-            self.controller.server_rebuild_xml_deserialize(node, rebuild)
-        return rebuild
-
-    def _action_resize(self, node):
-        resize = {}
-
-        if node.hasAttribute("flavor_ref"):
-            resize["flavor_ref"] = node.getAttribute("flavor_ref")
-        else:
-            raise AttributeError("No flavor_ref was specified in request")
-
-        if self.controller:
-            self.controller.server_resize_xml_deserialize(node, resize)
-        return resize
-
-    def _action_confirm_resize(self, node):
-        return None
-
-    def _action_revert_resize(self, node):
-        return None
-
-    def _deserialize_image_action(self, node, allowed_attributes):
-        data = {}
-        for attribute in allowed_attributes:
-            value = node.getAttribute(attribute)
-            if value:
-                data[attribute] = value
-        metadata_node = self.find_first_child_named(node, 'metadata')
-        if metadata_node is not None:
-            metadata = self.metadata_deserializer.extract_metadata(
-                                                        metadata_node)
-            data['metadata'] = metadata
-        return data
-
-
-class CreateDeserializer(CommonDeserializer):
-    """Deserializer to handle xml-formatted server create requests.
-
-    Handles standard server attributes as well as optional metadata
-    and personality attributes
-    """
-
-    def default(self, string):
-        """Deserialize an xml-formatted server create request."""
-        dom = xmlutil.safe_minidom_parse_string(string)
-        server = self._extract_server(dom)
-        return {'body': {'server': server}}
+authorizer = extensions.core_authorizer('compute:v3', 'servers')
 
 
 class ServersController(wsgi.Controller):
@@ -311,13 +68,11 @@ class ServersController(wsgi.Controller):
     EXTENSION_DESERIALIZE_EXTRACT_REBUILD_NAMESPACE = (
         'nova.api.v3.extensions.server.rebuild.deserialize')
 
-    EXTENSION_RESIZE_NAMESPACE = 'nova.api.v3.extensions.server.resize'
-    EXTENSION_DESERIALIZE_EXTRACT_RESIZE_NAMESPACE = (
-        'nova.api.v3.extensions.server.resize.deserialize')
-
     EXTENSION_UPDATE_NAMESPACE = 'nova.api.v3.extensions.server.update'
 
     _view_builder_class = views_servers.ViewBuilderV3
+
+    schema_server_create = schema_servers.base_create
 
     @staticmethod
     def _add_location(robj):
@@ -328,7 +83,7 @@ class ServersController(wsgi.Controller):
         link = filter(lambda l: l['rel'] == 'self',
                       robj.obj['server']['links'])
         if link:
-            robj['Location'] = link[0]['href'].encode('utf-8')
+            robj['Location'] = utils.utf8(link[0]['href'])
 
         # Convenience return
         return robj
@@ -346,13 +101,13 @@ class ServersController(wsgi.Controller):
                     if ext.obj.alias not in CONF.osapi_v3.extensions_blacklist:
                         return True
                     else:
-                        LOG.warning(_("Not loading %s because it is "
-                                      "in the blacklist"), ext.obj.alias)
+                        LOG.warn(_LW("Not loading %s because it is "
+                                     "in the blacklist"), ext.obj.alias)
                         return False
                 else:
-                    LOG.warning(
-                        _("Not loading %s because it is not in the whitelist"),
-                        ext.obj.alias)
+                    LOG.warn(
+                        _LW("Not loading %s because it is not in the "
+                            "whitelist"), ext.obj.alias)
                     return False
 
             def check_load_extension(ext):
@@ -364,14 +119,14 @@ class ServersController(wsgi.Controller):
                     # to implement multiple server (and other) entry
                     # points if hasattr(ext.obj, 'server_create'):
                     if hasattr(ext.obj, required_function):
-                        LOG.debug(_('extension %(ext_alias)s detected by '
-                                    'servers extension for function %(func)s'),
-                                    {'ext_alias': ext.obj.alias,
-                                     'func': required_function})
+                        LOG.debug('extension %(ext_alias)s detected by '
+                                  'servers extension for function %(func)s',
+                                  {'ext_alias': ext.obj.alias,
+                                   'func': required_function})
                         return check_whiteblack_lists(ext)
                     else:
                         LOG.debug(
-                            _('extension %(ext_alias)s is missing %(func)s'),
+                            'extension %(ext_alias)s is missing %(func)s',
                             {'ext_alias': ext.obj.alias,
                             'func': required_function})
                         return False
@@ -392,21 +147,7 @@ class ServersController(wsgi.Controller):
               invoke_kwds={"extension_info": self.extension_info},
               propagate_map_exceptions=True)
         if not list(self.create_extension_manager):
-            LOG.debug(_("Did not find any server create extensions"))
-
-        # Look for implementation of extension point of server create
-        # XML deserialization
-        self.create_xml_deserialize_manager = \
-          stevedore.enabled.EnabledExtensionManager(
-              namespace=self.EXTENSION_DESERIALIZE_EXTRACT_SERVER_NAMESPACE,
-              check_func=_check_load_extension(
-                  'server_xml_extract_server_deserialize'),
-              invoke_on_load=True,
-              invoke_kwds={"extension_info": self.extension_info},
-              propagate_map_exceptions=True)
-        if not list(self.create_xml_deserialize_manager):
-            LOG.debug(_("Did not find any server create xml deserializer"
-                        " extensions"))
+            LOG.debug("Did not find any server create extensions")
 
         # Look for implementation of extension point of server rebuild
         self.rebuild_extension_manager = \
@@ -417,46 +158,7 @@ class ServersController(wsgi.Controller):
                 invoke_kwds={"extension_info": self.extension_info},
                 propagate_map_exceptions=True)
         if not list(self.rebuild_extension_manager):
-            LOG.debug(_("Did not find any server rebuild extensions"))
-
-        # Look for implementation of extension point of server rebuild
-        # XML deserialization
-        self.rebuild_xml_deserialize_manager = \
-            stevedore.enabled.EnabledExtensionManager(
-                namespace=self.EXTENSION_DESERIALIZE_EXTRACT_REBUILD_NAMESPACE,
-                check_func=_check_load_extension(
-                    'server_xml_extract_rebuild_deserialize'),
-                invoke_on_load=True,
-                invoke_kwds={"extension_info": self.extension_info},
-                propagate_map_exceptions=True)
-        if not list(self.rebuild_xml_deserialize_manager):
-            LOG.debug(_("Did not find any server rebuild xml deserializer"
-                        " extensions"))
-
-        # Look for implementation of extension point of server resize
-        self.resize_extension_manager = \
-            stevedore.enabled.EnabledExtensionManager(
-                namespace=self.EXTENSION_RESIZE_NAMESPACE,
-                check_func=_check_load_extension('server_resize'),
-                invoke_on_load=True,
-                invoke_kwds={"extension_info": self.extension_info},
-                propagate_map_exceptions=True)
-        if not list(self.resize_extension_manager):
-            LOG.debug(_("Did not find any server resize extensions"))
-
-        # Look for implementation of extension point of server resize
-        # XML deserialization
-        self.resize_xml_deserialize_manager = \
-            stevedore.enabled.EnabledExtensionManager(
-                namespace=self.EXTENSION_DESERIALIZE_EXTRACT_RESIZE_NAMESPACE,
-                check_func=_check_load_extension(
-                    'server_xml_extract_resize_deserialize'),
-                invoke_on_load=True,
-                invoke_kwds={"extension_info": self.extension_info},
-                propagate_map_exceptions=True)
-        if not list(self.resize_xml_deserialize_manager):
-            LOG.debug(_("Did not find any server resize xml deserializer"
-                        " extensions"))
+            LOG.debug("Did not find any server rebuild extensions")
 
         # Look for implementation of extension point of server update
         self.update_extension_manager = \
@@ -467,9 +169,23 @@ class ServersController(wsgi.Controller):
                 invoke_kwds={"extension_info": self.extension_info},
                 propagate_map_exceptions=True)
         if not list(self.update_extension_manager):
-            LOG.debug(_("Did not find any server update extensions"))
+            LOG.debug("Did not find any server update extensions")
 
-    @wsgi.serializers(xml=MinimalServersTemplate)
+        # Look for API schema of server create extension
+        self.create_schema_manager = \
+            stevedore.enabled.EnabledExtensionManager(
+                namespace=self.EXTENSION_CREATE_NAMESPACE,
+                check_func=_check_load_extension('get_server_create_schema'),
+                invoke_on_load=True,
+                invoke_kwds={"extension_info": self.extension_info},
+                propagate_map_exceptions=True)
+        if list(self.create_schema_manager):
+            self.create_schema_manager.map(self._create_extension_schema,
+                                           self.schema_server_create)
+        else:
+            LOG.debug("Did not find any server create schemas")
+
+    @extensions.expected_errors((400, 403))
     def index(self, req):
         """Returns a list of server names and ids for a given user."""
         try:
@@ -478,7 +194,7 @@ class ServersController(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=err.format_message())
         return servers
 
-    @wsgi.serializers(xml=ServersTemplate)
+    @extensions.expected_errors((400, 403))
     def detail(self, req):
         """Returns a list of server details for a given user."""
         try:
@@ -499,9 +215,11 @@ class ServersController(wsgi.Controller):
 
         # Verify search by 'status' contains a valid status.
         # Convert it to filter by vm_state or task_state for compute_api.
-        status = search_opts.pop('status', None)
-        if status is not None:
-            vm_state, task_state = common.task_and_vm_state_from_status(status)
+        search_opts.pop('status', None)
+        if 'status' in req.GET.keys():
+            statuses = req.GET.getall('status')
+            states = common.task_and_vm_state_from_status(statuses)
+            vm_state, task_state = states
             if not vm_state and not task_state:
                 return {'servers': []}
             search_opts['vm_state'] = vm_state
@@ -537,14 +255,14 @@ class ServersController(wsgi.Controller):
                 search_opts['deleted'] = True
             else:
                 msg = _("Only administrators may list deleted instances")
-                raise exc.HTTPBadRequest(explanation=msg)
+                raise exc.HTTPForbidden(explanation=msg)
 
         # If tenant_id is passed as a search parameter this should
         # imply that all_tenants is also enabled unless explicitly
         # disabled. Note that the tenant_id parameter is filtered out
         # by remove_invalid_options above unless the requestor is an
         # admin.
-        if 'tenant_id' in search_opts and not 'all_tenants' in search_opts:
+        if 'tenant_id' in search_opts and 'all_tenants' not in search_opts:
             # We do not need to add the all_tenants flag if the tenant
             # id associated with the token is the tenant id
             # specified. This is done so a request that does not need
@@ -579,17 +297,16 @@ class ServersController(wsgi.Controller):
         limit, marker = common.get_limit_and_marker(req)
         try:
             instance_list = self.compute_api.get_all(context,
-                                                     search_opts=search_opts,
-                                                     limit=limit,
-                                                     marker=marker,
-                                                     want_objects=True)
+                    search_opts=search_opts, limit=limit, marker=marker,
+                    want_objects=True, expected_attrs=['pci_devices'])
         except exception.MarkerNotFound:
             msg = _('marker [%s] not found') % marker
             raise exc.HTTPBadRequest(explanation=msg)
         except exception.FlavorNotFound:
             log_msg = _("Flavor '%s' could not be found ")
             LOG.debug(log_msg, search_opts['flavor'])
-            instance_list = []
+            # TODO(mriedem): Move to ObjectListBase.__init__ for empty lists.
+            instance_list = objects.InstanceList(objects=[])
 
         if is_detail:
             instance_list.fill_faults()
@@ -601,12 +318,9 @@ class ServersController(wsgi.Controller):
 
     def _get_server(self, context, req, instance_uuid):
         """Utility function for looking up an instance by uuid."""
-        try:
-            instance = self.compute_api.get(context, instance_uuid,
-                                            want_objects=True)
-        except exception.NotFound:
-            msg = _("Instance could not be found")
-            raise exc.HTTPNotFound(explanation=msg)
+        instance = common.get_instance(self.compute_api, context,
+                                       instance_uuid, want_objects=True,
+                                       expected_attrs=['pci_devices'])
         req.cache_db_instance(instance)
         return instance
 
@@ -622,13 +336,6 @@ class ServersController(wsgi.Controller):
     def _validate_server_name(self, value):
         self._check_string_length(value, 'Server name', max_length=255)
 
-    def _validate_device_name(self, value):
-        self._check_string_length(value, 'Device name', max_length=255)
-
-        if ' ' in value:
-            msg = _("Device name cannot include spaces.")
-            raise exc.HTTPBadRequest(explanation=msg)
-
     def _get_requested_networks(self, requested_networks):
         """Create a list of requested networks from the networks attribute."""
         networks = []
@@ -638,7 +345,8 @@ class ServersController(wsgi.Controller):
                 # if the fixed IP address is not provided then
                 # it will use one of the available IP address from the network
                 address = network.get('fixed_ip', None)
-                if address is not None and not utils.is_valid_ipv4(address):
+                if address is not None and not utils.is_valid_ip_address(
+                        address):
                     msg = _("Invalid fixed IP address (%s)") % address
                     raise exc.HTTPBadRequest(explanation=msg)
 
@@ -711,25 +419,21 @@ class ServersController(wsgi.Controller):
         except TypeError:
             return None
 
-    @wsgi.serializers(xml=ServerTemplate)
+    @extensions.expected_errors(404)
     def show(self, req, id):
         """Returns server details by server id."""
-        try:
-            context = req.environ['nova.context']
-            instance = self.compute_api.get(context, id, want_objects=True)
-            req.cache_db_instance(instance)
-            return self._view_builder.show(req, instance)
-        except exception.NotFound:
-            msg = _("Instance could not be found")
-            raise exc.HTTPNotFound(explanation=msg)
+        context = req.environ['nova.context']
+        instance = common.get_instance(self.compute_api, context, id,
+                                       want_objects=True,
+                                       expected_attrs=['pci_devices'])
+        req.cache_db_instance(instance)
+        return self._view_builder.show(req, instance)
 
+    @extensions.expected_errors((400, 403, 409, 413))
     @wsgi.response(202)
-    @wsgi.serializers(xml=FullServerTemplate)
-    @wsgi.deserializers(xml=CreateDeserializer)
+    @validation.schema(schema_server_create)
     def create(self, req, body):
         """Creates a new server for a given user."""
-        if not self.is_valid_body(body, 'server'):
-            raise exc.HTTPBadRequest(_("The request body is invalid"))
 
         context = req.environ['nova.context']
         server_dict = body['server']
@@ -774,7 +478,7 @@ class ServersController(wsgi.Controller):
         # Replace with an extension point when the os-networks
         # extension is ported. Currently reworked
         # to take into account is_neutron
-        #if (self.ext_mgr.is_loaded('os-networks')
+        # if (self.ext_mgr.is_loaded('os-networks')
         #        or utils.is_neutron()):
         #    requested_networks = server_dict.get('networks')
 
@@ -803,8 +507,9 @@ class ServersController(wsgi.Controller):
                             admin_password=password,
                             requested_networks=requested_networks,
                             **create_kwargs)
-        except exception.QuotaError as error:
-            raise exc.HTTPRequestEntityTooLarge(
+        except (exception.QuotaError,
+                exception.PortLimitExceeded) as error:
+            raise exc.HTTPForbidden(
                 explanation=error.format_message(),
                 headers={'Retry-After': 0})
         except exception.InvalidMetadataSize as error:
@@ -822,7 +527,7 @@ class ServersController(wsgi.Controller):
         except exception.ConfigDriveInvalidValue:
             msg = _("Invalid config_drive provided.")
             raise exc.HTTPBadRequest(explanation=msg)
-        except rpc_common.RemoteError as err:
+        except messaging.RemoteError as err:
             msg = "%(err_type)s: %(err_msg)s" % {'err_type': err.exc_type,
                                                  'err_msg': err.value}
             raise exc.HTTPBadRequest(explanation=msg)
@@ -835,20 +540,25 @@ class ServersController(wsgi.Controller):
                 exception.InvalidMetadata,
                 exception.InvalidRequest,
                 exception.MultiplePortsNotApplicable,
+                exception.InvalidFixedIpAndMaxCountRequest,
                 exception.InstanceUserDataMalformed,
+                exception.InstanceUserDataTooLarge,
                 exception.PortNotFound,
+                exception.FixedIpAlreadyInUse,
                 exception.SecurityGroupNotFound,
+                exception.PortRequiresFixedIP,
+                exception.NetworkRequiresSubnet,
                 exception.NetworkNotFound) as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
         except (exception.PortInUse,
+                exception.NetworkAmbiguous,
                 exception.NoUniqueMatch) as error:
             raise exc.HTTPConflict(explanation=error.format_message())
 
         # If the caller wanted a reservation_id, return it
         if return_reservation_id:
             return wsgi.ResponseObject(
-                {'servers_reservation': {'reservation_id': resv_id}},
-                xml=wsgi.XMLDictSerializer)
+                {'servers_reservation': {'reservation_id': resv_id}})
 
         req.cache_db_instances(instances)
         server = self._view_builder.create(req, instances[0])
@@ -862,26 +572,33 @@ class ServersController(wsgi.Controller):
 
     def _create_extension_point(self, ext, server_dict, create_kwargs):
         handler = ext.obj
-        LOG.debug(_("Running _create_extension_point for %s"), ext.obj)
+        LOG.debug("Running _create_extension_point for %s", ext.obj)
 
         handler.server_create(server_dict, create_kwargs)
 
     def _rebuild_extension_point(self, ext, rebuild_dict, rebuild_kwargs):
         handler = ext.obj
-        LOG.debug(_("Running _rebuild_extension_point for %s"), ext.obj)
+        LOG.debug("Running _rebuild_extension_point for %s", ext.obj)
 
         handler.server_rebuild(rebuild_dict, rebuild_kwargs)
 
     def _resize_extension_point(self, ext, resize_dict, resize_kwargs):
         handler = ext.obj
-        LOG.debug(_("Running _resize_extension_point for %s"), ext.obj)
+        LOG.debug("Running _resize_extension_point for %s", ext.obj)
 
         handler.server_resize(resize_dict, resize_kwargs)
 
     def _update_extension_point(self, ext, update_dict, update_kwargs):
         handler = ext.obj
-        LOG.debug(_("Running _update_extension_point for %s"), ext.obj)
+        LOG.debug("Running _update_extension_point for %s", ext.obj)
         handler.server_update(update_dict, update_kwargs)
+
+    def _create_extension_schema(self, ext, create_schema):
+        handler = ext.obj
+        LOG.debug("Running _create_extension_schema for %s", ext.obj)
+
+        schema = handler.get_server_create_schema()
+        create_schema['properties']['server']['properties'].update(schema)
 
     def _delete(self, context, req, instance_uuid):
         instance = self._get_server(context, req, instance_uuid)
@@ -896,7 +613,7 @@ class ServersController(wsgi.Controller):
         else:
             self.compute_api.delete(context, instance)
 
-    @wsgi.serializers(xml=ServerTemplate)
+    @extensions.expected_errors((400, 404))
     def update(self, req, id, body):
         """Update server then pass on to version-specific controller."""
         if not self.is_valid_body(body, 'server'):
@@ -918,21 +635,23 @@ class ServersController(wsgi.Controller):
             self.update_extension_manager.map(self._update_extension_point,
                                               body['server'], update_dict)
 
+        instance = common.get_instance(self.compute_api, ctxt, id,
+                                       want_objects=True,
+                                       expected_attrs=['pci_devices'])
         try:
-            instance = self.compute_api.get(ctxt, id, want_objects=True)
+            # NOTE(mikal): this try block needs to stay because save() still
+            # might throw an exception.
             req.cache_db_instance(instance)
             policy.enforce(ctxt, 'compute:update', instance)
             instance.update(update_dict)
             instance.save()
+            return self._view_builder.show(req, instance)
         except exception.NotFound:
             msg = _("Instance could not be found")
             raise exc.HTTPNotFound(explanation=msg)
 
-        return self._view_builder.show(req, instance)
-
+    @extensions.expected_errors((400, 404, 409))
     @wsgi.response(202)
-    @wsgi.serializers(xml=FullServerTemplate)
-    @wsgi.deserializers(xml=ActionDeserializer)
     @wsgi.action('confirm_resize')
     def _action_confirm_resize(self, req, id, body):
         context = req.environ['nova.context']
@@ -942,13 +661,14 @@ class ServersController(wsgi.Controller):
         except exception.MigrationNotFound:
             msg = _("Instance has not been resized.")
             raise exc.HTTPBadRequest(explanation=msg)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'confirm_resize')
 
+    @extensions.expected_errors((400, 404, 409))
     @wsgi.response(202)
-    @wsgi.serializers(xml=FullServerTemplate)
-    @wsgi.deserializers(xml=ActionDeserializer)
     @wsgi.action('revert_resize')
     def _action_revert_resize(self, req, id, body):
         context = req.environ['nova.context']
@@ -961,14 +681,15 @@ class ServersController(wsgi.Controller):
         except exception.FlavorNotFound:
             msg = _("Flavor used by the instance could not be found.")
             raise exc.HTTPBadRequest(explanation=msg)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'revert_resize')
         return webob.Response(status_int=202)
 
+    @extensions.expected_errors((400, 404, 409))
     @wsgi.response(202)
-    @wsgi.serializers(xml=FullServerTemplate)
-    @wsgi.deserializers(xml=ActionDeserializer)
     @wsgi.action('reboot')
     def _action_reboot(self, req, id, body):
         if 'reboot' in body and 'type' in body['reboot']:
@@ -992,6 +713,8 @@ class ServersController(wsgi.Controller):
 
         try:
             self.compute_api.reboot(context, instance, reboot_type)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'reboot')
@@ -1005,7 +728,7 @@ class ServersController(wsgi.Controller):
         try:
             self.compute_api.resize(context, instance, flavor_id, **kwargs)
         except exception.QuotaError as error:
-            raise exc.HTTPRequestEntityTooLarge(
+            raise exc.HTTPForbidden(
                 explanation=error.format_message(),
                 headers={'Retry-After': 0})
         except exception.FlavorNotFound:
@@ -1014,6 +737,10 @@ class ServersController(wsgi.Controller):
         except exception.CannotResizeToSameFlavor:
             msg = _("Resize requires a flavor change.")
             raise exc.HTTPBadRequest(explanation=msg)
+        except exception.CannotResizeDisk as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'resize')
@@ -1031,6 +758,7 @@ class ServersController(wsgi.Controller):
 
         return webob.Response(status_int=202)
 
+    @extensions.expected_errors((404, 409))
     @wsgi.response(204)
     def delete(self, req, id):
         """Destroys a server."""
@@ -1039,6 +767,8 @@ class ServersController(wsgi.Controller):
         except exception.NotFound:
             msg = _("Instance could not be found")
             raise exc.HTTPNotFound(explanation=msg)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'delete')
@@ -1080,9 +810,8 @@ class ServersController(wsgi.Controller):
 
         return common.get_id_from_href(flavor_ref)
 
+    @extensions.expected_errors((400, 401, 403, 404, 409))
     @wsgi.response(202)
-    @wsgi.serializers(xml=FullServerTemplate)
-    @wsgi.deserializers(xml=ActionDeserializer)
     @wsgi.action('resize')
     def _action_resize(self, req, id, body):
         """Resizes a given instance to the flavor size requested."""
@@ -1098,23 +827,14 @@ class ServersController(wsgi.Controller):
 
         resize_kwargs = {}
 
-        if list(self.resize_extension_manager):
-            self.resize_extension_manager.map(self._resize_extension_point,
-                                              resize_dict, resize_kwargs)
-
         return self._resize(req, id, flavor_ref, **resize_kwargs)
 
+    @extensions.expected_errors((400, 404, 409, 413))
     @wsgi.response(202)
-    @wsgi.serializers(xml=FullServerTemplate)
-    @wsgi.deserializers(xml=ActionDeserializer)
     @wsgi.action('rebuild')
     def _action_rebuild(self, req, id, body):
         """Rebuild an instance with the given attributes."""
-        try:
-            rebuild_dict = body['rebuild']
-        except (KeyError, TypeError):
-            msg = _('Invalid request body')
-            raise exc.HTTPBadRequest(explanation=msg)
+        rebuild_dict = body['rebuild']
 
         try:
             image_href = rebuild_dict["image_ref"]
@@ -1134,10 +854,15 @@ class ServersController(wsgi.Controller):
             'metadata': 'metadata',
         }
 
+        rebuild_kwargs = {}
+
         if 'name' in rebuild_dict:
             self._validate_server_name(rebuild_dict['name'])
 
-        rebuild_kwargs = {}
+        if 'preserve_ephemeral' in rebuild_dict:
+            rebuild_kwargs['preserve_ephemeral'] = strutils.bool_from_string(
+                rebuild_dict['preserve_ephemeral'], strict=True)
+
         if list(self.rebuild_extension_manager):
             self.rebuild_extension_manager.map(self._rebuild_extension_point,
                                                rebuild_dict, rebuild_kwargs)
@@ -1155,6 +880,8 @@ class ServersController(wsgi.Controller):
                                      image_href,
                                      password,
                                      **rebuild_kwargs)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'rebuild')
@@ -1185,9 +912,8 @@ class ServersController(wsgi.Controller):
         robj = wsgi.ResponseObject(view)
         return self._add_location(robj)
 
+    @extensions.expected_errors((400, 404, 409, 413))
     @wsgi.response(202)
-    @wsgi.serializers(xml=FullServerTemplate)
-    @wsgi.deserializers(xml=ActionDeserializer)
     @wsgi.action('create_image')
     @common.check_snapshots_enabled
     def _action_create_image(self, req, id, body):
@@ -1212,25 +938,20 @@ class ServersController(wsgi.Controller):
 
         instance = self._get_server(context, req, id)
 
-        bdms = self.compute_api.get_instance_bdms(context, instance,
-                                                  legacy=False)
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                    context, instance.uuid)
 
         try:
             if self.compute_api.is_volume_backed_instance(context, instance,
                                                           bdms):
                 img = instance['image_ref']
                 if not img:
-                    # NOTE(Vincent Hou) The private method
-                    # _get_bdm_image_metadata only works, when boot
-                    # device is set to 'vda'. It needs to be fixed later,
-                    # but tentatively we use it here.
-                    image_meta = {'properties': self.compute_api.
-                                    _get_bdm_image_metadata(context, bdms,
-                                                            legacy_bdm=False)}
+                    properties = bdms.root_metadata(
+                            context, self.compute_api.image_api,
+                            self.compute_api.volume_api)
+                    image_meta = {'properties': properties}
                 else:
-                    src_image = self.compute_api.\
-                        image_service.show(context, img)
-                    image_meta = dict(src_image)
+                    image_meta = self.compute_api.image_api.get(context, img)
 
                 image = self.compute_api.snapshot_volume_backed(
                                                        context,
@@ -1278,53 +999,11 @@ class ServersController(wsgi.Controller):
         return ('reservation_id', 'name', 'status', 'image', 'flavor',
                 'ip', 'changes_since', 'all_tenants')
 
-    def _server_create_xml_deserialize_extension_point(self, ext, server_node,
-                                                       server_dict):
-        handler = ext.obj
-        LOG.debug(_("Running create xml deserialize ep for %s"),
-                  handler.alias)
-        handler.server_xml_extract_server_deserialize(server_node,
-                                                      server_dict)
-
-    def server_create_xml_deserialize(self, server_node, server):
-        if list(self.create_xml_deserialize_manager):
-            self.create_xml_deserialize_manager.map(
-                self._server_create_xml_deserialize_extension_point,
-                server_node, server)
-
-    def _server_rebuild_xml_deserialize_extension_point(self, ext,
-                                                        rebuild_node,
-                                                        rebuild_dict):
-        handler = ext.obj
-        LOG.debug(_("Running rebuild xml deserialize ep for %s"),
-                  handler.alias)
-        handler.server_xml_extract_rebuild_deserialize(rebuild_node,
-                                                       rebuild_dict)
-
-    def server_rebuild_xml_deserialize(self, rebuild_node, rebuild_dict):
-        if list(self.rebuild_xml_deserialize_manager):
-            self.rebuild_xml_deserialize_manager.map(
-                self._server_rebuild_xml_deserialize_extension_point,
-                rebuild_node, rebuild_dict)
-
-    def _server_resize_xml_deserialize_extension_point(self, ext, resize_node,
-                                                       resize_dict):
-        handler = ext.obj
-        LOG.debug(_("Running rebuild xml deserialize ep for %s"),
-                  handler.alias)
-        handler.server_xml_extract_resize_deserialize(resize_node, resize_dict)
-
-    def server_resize_xml_deserialize(self, resize_node, resize_dict):
-        if list(self.resize_xml_deserialize_manager):
-            self.resize_xml_deserialize_manager.map(
-                self._server_resize_xml_deserialize_extension_point,
-                resize_node, resize_dict)
-
     def _get_instance(self, context, instance_uuid):
         try:
             attrs = ['system_metadata', 'metadata']
-            return instance_obj.Instance.get_by_uuid(context, instance_uuid,
-                                                     expected_attrs=attrs)
+            return objects.Instance.get_by_uuid(context, instance_uuid,
+                                                expected_attrs=attrs)
         except exception.InstanceNotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
 
@@ -1334,10 +1013,12 @@ class ServersController(wsgi.Controller):
         """Start an instance."""
         context = req.environ['nova.context']
         instance = self._get_instance(context, id)
-        LOG.debug(_('start instance'), instance=instance)
+        authorizer(context, instance, 'start')
+        LOG.debug('start instance', instance=instance)
         try:
             self.compute_api.start(context, instance)
-        except (exception.InstanceNotReady, exception.InstanceIsLocked) as e:
+        except (exception.InstanceNotReady, exception.InstanceIsLocked,
+                exception.InstanceInvalidState) as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
         return webob.Response(status_int=202)
 
@@ -1347,10 +1028,12 @@ class ServersController(wsgi.Controller):
         """Stop an instance."""
         context = req.environ['nova.context']
         instance = self._get_instance(context, id)
-        LOG.debug(_('stop instance'), instance=instance)
+        authorizer(context, instance, 'stop')
+        LOG.debug('stop instance', instance=instance)
         try:
             self.compute_api.stop(context, instance)
-        except (exception.InstanceNotReady, exception.InstanceIsLocked) as e:
+        except (exception.InstanceNotReady, exception.InstanceIsLocked,
+                exception.InstanceInvalidState) as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
         return webob.Response(status_int=202)
 
@@ -1363,7 +1046,7 @@ def remove_invalid_options(context, search_options, allowed_search_options):
     # Otherwise, strip out all unknown options
     unknown_options = [opt for opt in search_options
                         if opt not in allowed_search_options]
-    LOG.debug(_("Removing options '%s' from query"),
+    LOG.debug("Removing options '%s' from query",
               ", ".join(unknown_options))
     for opt in unknown_options:
         search_options.pop(opt, None)
@@ -1374,7 +1057,6 @@ class Servers(extensions.V3APIExtensionBase):
 
     name = "Servers"
     alias = "servers"
-    namespace = "http://docs.openstack.org/compute/core/servers/v3"
     version = 1
 
     def get_resources(self):

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -76,7 +74,7 @@ class Config_drive(extensions.ExtensionDescriptor):
     name = "ConfigDrive"
     alias = "os-config-drive"
     namespace = "http://docs.openstack.org/compute/ext/config_drive/api/v1.1"
-    updated = "2012-07-16T00:00:00+00:00"
+    updated = "2012-07-16T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = Controller(self.ext_mgr)

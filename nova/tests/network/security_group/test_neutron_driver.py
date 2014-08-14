@@ -13,10 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 import mox
-
 from neutronclient.common import exceptions as n_exc
 from neutronclient.v2_0 import client
 
@@ -83,6 +80,39 @@ class TestNeutronDriver(test.NoDBTestCase):
         sg_api = security_groups.NativeNeutronSecurityGroupAPI()
         self.assertRaises(exception.SecurityGroupLimitExceeded,
                           sg_api.add_rules, self.context, None, name, [vals])
+
+    def test_list_security_group_with_no_port_range_and_not_tcp_udp_icmp(self):
+        sg1 = {'description': 'default',
+               'id': '07f1362f-34f6-4136-819a-2dcde112269e',
+               'name': 'default',
+               'tenant_id': 'c166d9316f814891bcb66b96c4c891d6',
+               'security_group_rules':
+                   [{'direction': 'ingress',
+                     'ethertype': 'IPv4',
+                     'id': '0a4647f1-e1aa-488d-90e1-97a7d0293beb',
+                      'port_range_max': None,
+                      'port_range_min': None,
+                      'protocol': '51',
+                      'remote_group_id': None,
+                      'remote_ip_prefix': None,
+                      'security_group_id':
+                           '07f1362f-34f6-4136-819a-2dcde112269e',
+                      'tenant_id': 'c166d9316f814891bcb66b96c4c891d6'}]}
+
+        self.moxed_client.list_security_groups().AndReturn(
+            {'security_groups': [sg1]})
+        self.mox.ReplayAll()
+        sg_api = neutron_driver.SecurityGroupAPI()
+        result = sg_api.list(self.context)
+        expected = [{'rules':
+            [{'from_port': -1, 'protocol': '51', 'to_port': -1,
+              'parent_group_id': '07f1362f-34f6-4136-819a-2dcde112269e',
+              'cidr': '0.0.0.0/0', 'group_id': None,
+              'id': '0a4647f1-e1aa-488d-90e1-97a7d0293beb'}],
+            'project_id': 'c166d9316f814891bcb66b96c4c891d6',
+            'id': '07f1362f-34f6-4136-819a-2dcde112269e',
+            'name': 'default', 'description': 'default'}]
+        self.assertEqual(expected, result)
 
     def test_instances_security_group_bindings(self):
         server_id = 'c5a20e8d-c4b0-47cf-9dca-ebe4f758acb1'
@@ -163,7 +193,6 @@ class TestNeutronDriver(test.NoDBTestCase):
                  {'id': '2', 'device_id': 'dev_1', 'security_groups': ['2']}]
         port_list = {'ports': ports}
         sg1 = {'id': '1', 'name': 'wol'}
-        sg2 = {'id': '2', 'name': 'eor'}
         # User doesn't have access to sg2
         security_groups_list = {'security_groups': [sg1]}
 
@@ -179,3 +208,13 @@ class TestNeutronDriver(test.NoDBTestCase):
         result = sg_api.get_instances_security_groups_bindings(
                                   self.context, servers)
         self.assertEqual(result, sg_bindings)
+
+    def test_instance_empty_security_groups(self):
+
+        port_list = {'ports': [{'id': 1, 'device_id': '1',
+                     'security_groups': []}]}
+        self.moxed_client.list_ports(device_id=['1']).AndReturn(port_list)
+        self.mox.ReplayAll()
+        sg_api = neutron_driver.SecurityGroupAPI()
+        result = sg_api.get_instance_security_groups(self.context, '1')
+        self.assertEqual([], result)

@@ -12,14 +12,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova.compute import utils as compute_utils
+import traceback
+
+import mock
+
 from nova import db
 from nova.objects import instance_action
 from nova.openstack.common import timeutils
+from nova import test
 from nova.tests.objects import test_objects
 
 
-NOW = timeutils.utcnow()
+NOW = timeutils.utcnow().replace(microsecond=0)
 fake_action = {
     'created_at': NOW,
     'deleted_at': None,
@@ -51,81 +55,123 @@ fake_event = {
 
 
 class _TestInstanceActionObject(object):
-    def test_get_by_request_id(self):
-        self.mox.StubOutWithMock(db, 'action_get_by_request_id')
-        db.action_get_by_request_id(self.context, 'fake-uuid', 'fake-request'
-                                    ).AndReturn(fake_action)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'action_get_by_request_id')
+    def test_get_by_request_id(self, mock_get):
+        context = self.context
+        mock_get.return_value = fake_action
         action = instance_action.InstanceAction.get_by_request_id(
-            self.context, 'fake-uuid', 'fake-request')
-        self.assertEqual(fake_action['id'], action.id)
+            context, 'fake-uuid', 'fake-request')
+        self.compare_obj(action, fake_action)
+        mock_get.assert_called_once_with(context,
+            'fake-uuid', 'fake-request')
 
-    def test_action_start(self):
-        self.mox.StubOutWithMock(db, 'action_start')
-        db.action_start(self.context, compute_utils.pack_action_start(
-                self.context, 'fake-uuid', 'fake-action')).AndReturn(
-                    fake_action)
-        self.mox.ReplayAll()
-        action = instance_action.InstanceAction.action_start(
+    def test_pack_action_start(self):
+        values = instance_action.InstanceAction.pack_action_start(
             self.context, 'fake-uuid', 'fake-action')
-        self.assertEqual(fake_action['id'], action.id)
+        self.assertEqual(values['request_id'], self.context.request_id)
+        self.assertEqual(values['user_id'], self.context.user_id)
+        self.assertEqual(values['project_id'], self.context.project_id)
+        self.assertEqual(values['instance_uuid'], 'fake-uuid')
+        self.assertEqual(values['action'], 'fake-action')
+        self.assertEqual(values['start_time'].replace(tzinfo=None),
+                         self.context.timestamp)
 
-    def test_action_start_no_result(self):
-        self.mox.StubOutWithMock(db, 'action_start')
-        db.action_start(self.context, compute_utils.pack_action_start(
-                self.context, 'fake-uuid', 'fake-action')).AndReturn(
-                    fake_action)
-        self.mox.ReplayAll()
+    def test_pack_action_finish(self):
+        timeutils.set_time_override(override_time=NOW)
+        values = instance_action.InstanceAction.pack_action_finish(
+            self.context, 'fake-uuid')
+        self.assertEqual(values['request_id'], self.context.request_id)
+        self.assertEqual(values['instance_uuid'], 'fake-uuid')
+        self.assertEqual(values['finish_time'].replace(tzinfo=None), NOW)
+
+    @mock.patch.object(db, 'action_start')
+    def test_action_start(self, mock_start):
+        test_class = instance_action.InstanceAction
+        expected_packed_values = test_class.pack_action_start(
+            self.context, 'fake-uuid', 'fake-action')
+        mock_start.return_value = fake_action
+        action = instance_action.InstanceAction.action_start(
+            self.context, 'fake-uuid', 'fake-action', want_result=True)
+        mock_start.assert_called_once_with(self.context,
+                                           expected_packed_values)
+        self.compare_obj(action, fake_action)
+
+    @mock.patch.object(db, 'action_start')
+    def test_action_start_no_result(self, mock_start):
+        test_class = instance_action.InstanceAction
+        expected_packed_values = test_class.pack_action_start(
+            self.context, 'fake-uuid', 'fake-action')
+        mock_start.return_value = fake_action
         action = instance_action.InstanceAction.action_start(
             self.context, 'fake-uuid', 'fake-action', want_result=False)
+        mock_start.assert_called_once_with(self.context,
+                                           expected_packed_values)
         self.assertIsNone(action)
 
-    def test_action_finish(self):
-        timeutils.set_time_override()
-        self.mox.StubOutWithMock(db, 'action_finish')
-        db.action_finish(self.context, compute_utils.pack_action_finish(
-                self.context, 'fake-uuid')).AndReturn(fake_action)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'action_finish')
+    def test_action_finish(self, mock_finish):
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceAction
+        expected_packed_values = test_class.pack_action_finish(
+            self.context, 'fake-uuid')
+        mock_finish.return_value = fake_action
         action = instance_action.InstanceAction.action_finish(
             self.context, 'fake-uuid', want_result=True)
-        self.assertEqual(fake_action['id'], action.id)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
+        self.compare_obj(action, fake_action)
 
-    def test_action_finish_no_result(self):
-        timeutils.set_time_override()
-        self.mox.StubOutWithMock(db, 'action_finish')
-        db.action_finish(self.context, compute_utils.pack_action_finish(
-                self.context, 'fake-uuid')).AndReturn(fake_action)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'action_finish')
+    def test_action_finish_no_result(self, mock_finish):
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceAction
+        expected_packed_values = test_class.pack_action_finish(
+            self.context, 'fake-uuid')
+        mock_finish.return_value = fake_action
         action = instance_action.InstanceAction.action_finish(
             self.context, 'fake-uuid', want_result=False)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
         self.assertIsNone(action)
 
-    def test_finish(self):
-        timeutils.set_time_override()
-        self.mox.StubOutWithMock(db, 'action_start')
-        self.mox.StubOutWithMock(db, 'action_finish')
-        db.action_start(self.context, compute_utils.pack_action_start(
-                self.context, 'fake-uuid', 'fake-action')).AndReturn(
-                    fake_action)
-        db.action_finish(self.context, compute_utils.pack_action_finish(
-                self.context, 'fake-uuid')).AndReturn(fake_action)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'action_finish')
+    @mock.patch.object(db, 'action_start')
+    def test_finish(self, mock_start, mock_finish):
+        timeutils.set_time_override(override_time=NOW)
+        expected_packed_action_start = {
+            'request_id': self.context.request_id,
+            'user_id': self.context.user_id,
+            'project_id': self.context.project_id,
+            'instance_uuid': 'fake-uuid',
+            'action': 'fake-action',
+            'start_time': self.context.timestamp,
+        }
+        expected_packed_action_finish = {
+            'request_id': self.context.request_id,
+            'instance_uuid': 'fake-uuid',
+            'finish_time': NOW,
+        }
+        mock_start.return_value = fake_action
+        mock_finish.return_value = fake_action
         action = instance_action.InstanceAction.action_start(
             self.context, 'fake-uuid', 'fake-action')
-        action.finish()
+        action.finish(self.context)
+        mock_start.assert_called_once_with(self.context,
+                                           expected_packed_action_start)
+        mock_finish.assert_called_once_with(self.context,
+                                           expected_packed_action_finish)
+        self.compare_obj(action, fake_action)
 
-    def test_get_list(self):
-        timeutils.set_time_override()
-        self.mox.StubOutWithMock(db, 'actions_get')
-        actions = [dict(fake_action, id=1234),
-                   dict(fake_action, id=5678)]
-        db.actions_get(self.context, 'fake-uuid').AndReturn(actions)
-        self.mox.ReplayAll()
-        action_list = instance_action.InstanceActionList.get_by_instance_uuid(
+    @mock.patch.object(db, 'actions_get')
+    def test_get_list(self, mock_get):
+        fake_actions = [dict(fake_action, id=1234),
+                        dict(fake_action, id=5678)]
+        mock_get.return_value = fake_actions
+        obj_list = instance_action.InstanceActionList.get_by_instance_uuid(
             self.context, 'fake-uuid')
-        self.assertEqual(2, len(action_list))
-        for index, action in enumerate(action_list):
-            self.assertEqual(actions[index]['id'], action.id)
+        for index, action in enumerate(obj_list):
+            self.compare_obj(action, fake_actions[index])
+        mock_get.assert_called_once_with(self.context, 'fake-uuid')
 
 
 class TestInstanceActionObject(test_objects._LocalTest,
@@ -139,99 +185,181 @@ class TestRemoteInstanceActionObject(test_objects._RemoteTest,
 
 
 class _TestInstanceActionEventObject(object):
-    def test_get_by_id(self):
-        self.mox.StubOutWithMock(db, 'action_event_get_by_id')
-        db.action_event_get_by_id(self.context, 'fake-id').AndReturn(
-            fake_event)
-        self.mox.ReplayAll()
-        event = instance_action.InstanceActionEvent.get_by_id(self.context,
-                                                              'fake-id')
-        self.assertEqual(fake_event['id'], event.id)
+    @mock.patch.object(db, 'action_event_get_by_id')
+    def test_get_by_id(self, mock_get):
+        mock_get.return_value = fake_event
+        event = instance_action.InstanceActionEvent.get_by_id(
+            self.context, 'fake-action-id', 'fake-event-id')
+        self.compare_obj(event, fake_event)
+        mock_get.assert_called_once_with(self.context,
+            'fake-action-id', 'fake-event-id')
 
-    def test_event_start(self):
-        self.mox.StubOutWithMock(db, 'action_event_start')
-        db.action_event_start(
-            self.context,
-            compute_utils.pack_action_event_start(
-                self.context, 'fake-uuid', 'fake-event')).AndReturn(fake_event)
-        self.mox.ReplayAll()
-        event = instance_action.InstanceActionEvent.event_start(self.context,
-                                                                'fake-uuid',
-                                                                'fake-event')
-        self.assertEqual(fake_event['id'], event.id)
+    @mock.patch.object(db, 'action_event_start')
+    def test_event_start(self, mock_start):
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_start(
+            self.context, 'fake-uuid', 'fake-event')
+        mock_start.return_value = fake_event
+        event = instance_action.InstanceActionEvent.event_start(
+            self.context, 'fake-uuid', 'fake-event', want_result=True)
+        mock_start.assert_called_once_with(self.context,
+                                           expected_packed_values)
+        self.compare_obj(event, fake_event)
 
-    def test_event_start_no_result(self):
-        self.mox.StubOutWithMock(db, 'action_event_start')
-        db.action_event_start(
-            self.context,
-            compute_utils.pack_action_event_start(
-                'fake-uuid', 'fake-event')).AndReturn(fake_event)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'action_event_start')
+    def test_event_start_no_result(self, mock_start):
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_start(
+            self.context, 'fake-uuid', 'fake-event')
+        mock_start.return_value = fake_event
         event = instance_action.InstanceActionEvent.event_start(
             self.context, 'fake-uuid', 'fake-event', want_result=False)
+        mock_start.assert_called_once_with(self.context,
+                                           expected_packed_values)
         self.assertIsNone(event)
 
-    def test_event_finish(self):
-        self.mox.StubOutWithMock(db, 'action_event_finish')
-        db.action_event_start(
-            self.context,
-            compute_utils.pack_action_event_finish(
-                self.context, 'fake-uuid', 'fake-event', exc_val=None,
-                exc_tb=None)).AndReturn(fake_event)
-        self.mox.ReplayAll()
-        event = instance_action.InstanceActionEvent.event_finish(self.context,
-                                                                 'fake-uuid',
-                                                                 'fake-event')
-        self.assertEqual(fake_event['id'], event.id)
+    @mock.patch.object(db, 'action_event_finish')
+    def test_event_finish(self, mock_finish):
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_finish(
+            self.context, 'fake-uuid', 'fake-event')
+        expected_packed_values['finish_time'] = timeutils.utcnow()
+        mock_finish.return_value = fake_event
+        event = instance_action.InstanceActionEvent.event_finish(
+            self.context, 'fake-uuid', 'fake-event', want_result=True)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
+        self.compare_obj(event, fake_event)
 
-    def test_event_finish_no_result(self):
-        self.mox.StubOutWithMock(db, 'action_event_finish')
-        db.action_event_start(
-            self.context,
-            compute_utils.pack_action_event_finish(
-                self.context, 'fake-uuid', 'fake-event', exc_val=None,
-                exc_tb=None)).AndReturn(fake_event)
-        self.mox.ReplayAll()
+    @mock.patch.object(db, 'action_event_finish')
+    def test_event_finish_no_result(self, mock_finish):
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_finish(
+            self.context, 'fake-uuid', 'fake-event')
+        expected_packed_values['finish_time'] = timeutils.utcnow()
+        mock_finish.return_value = fake_event
         event = instance_action.InstanceActionEvent.event_finish(
             self.context, 'fake-uuid', 'fake-event', want_result=False)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
         self.assertIsNone(event)
 
-    def test_event_finish_with_failure(self):
-        self.mox.StubOutWithMock(db, 'action_event_finish')
-        db.action_event_start(
-            self.context,
-            compute_utils.pack_action_event_finish(
-                self.context, 'fake-uuid', 'fake-event', exc_val='fake-exc',
-                exc_tb='fake-tb')).AndReturn(fake_event)
-        self.mox.ReplayAll()
-        event = instance_action.InstanceActionEvent.event_finish_with_failure(
-            self.context, 'fake-uuid', 'fake-event', 'fake-exc', 'fake-tb')
-        self.assertEqual(fake_event['id'], event.id)
+    @mock.patch.object(traceback, 'format_tb')
+    @mock.patch.object(db, 'action_event_finish')
+    def test_event_finish_with_failure(self, mock_finish, mock_tb):
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_finish(
+            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb')
+        expected_packed_values['finish_time'] = timeutils.utcnow()
 
-    def test_finish(self):
-        self.mox.StubOutWithMock(db, 'action_event_finish')
-        db.action_event_start(
-            self.context,
-            compute_utils.pack_action_event_start(
-                self.context, 'fake-uuid', 'fake-event')).AndReturn(fake_event)
-        db.action_event_finish(
-            self.context,
-            compute_utils.pack_action_event_finish(
-                self.context, 'fake-uuid', 'fake-event', exc_val=None,
-                exc_tb=None)).AndReturn(fake_event)
-        self.mox.ReplayAll()
-        event = instance_action.InstanceActionEvent.event_start(
-            self.context, 'fake-uuid', 'fake-event')
-        event.finish()
+        mock_finish.return_value = fake_event
+        event = test_class.event_finish_with_failure(
+            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb',
+            want_result=True)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
+        self.compare_obj(event, fake_event)
 
-    def test_get_by_action(self):
-        self.mox.StubOutWithMock(db, 'action_events_get')
-        events = [dict(fake_event, id=1234),
-                  dict(fake_event, id=5678)]
-        db.action_events_get(self.context, 'fake-action').AndReturn(events)
-        self.mox.ReplayAll()
-        event_list = instance_action.InstanceActionEventList.get_by_action(
-            self.context, 'fake-action')
-        self.assertEqual(2, len(event_list))
-        for index, event in enumerate(event_list):
-            self.assertEqual(events[index]['id'], event.id)
+    @mock.patch.object(traceback, 'format_tb')
+    @mock.patch.object(db, 'action_event_finish')
+    def test_event_finish_with_failure_legacy(self, mock_finish, mock_tb):
+        # Tests that exc_tb is serialized when it's not a string type.
+        mock_tb.return_value = 'fake-tb'
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_finish(
+            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb')
+        expected_packed_values['finish_time'] = timeutils.utcnow()
+
+        mock_finish.return_value = fake_event
+        fake_tb = mock.sentinel.fake_tb
+        event = test_class.event_finish_with_failure(
+            self.context, 'fake-uuid', 'fake-event', exc_val='val',
+            exc_tb=fake_tb, want_result=True)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
+        self.compare_obj(event, fake_event)
+        mock_tb.assert_called_once_with(fake_tb)
+
+    @mock.patch.object(db, 'action_event_finish')
+    def test_event_finish_with_failure_legacy_unicode(self, mock_finish):
+        # Tests that traceback.format_tb is not called when exc_tb is unicode.
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_finish(
+            self.context, 'fake-uuid', 'fake-event', 'val', unicode('fake-tb'))
+        expected_packed_values['finish_time'] = timeutils.utcnow()
+
+        mock_finish.return_value = fake_event
+        event = test_class.event_finish_with_failure(
+            self.context, 'fake-uuid', 'fake-event', exc_val='val',
+            exc_tb=unicode('fake-tb'), want_result=True)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
+        self.compare_obj(event, fake_event)
+
+    @mock.patch.object(traceback, 'format_tb')
+    @mock.patch.object(db, 'action_event_finish')
+    def test_event_finish_with_failure_no_result(self, mock_finish, mock_tb):
+        # Tests that traceback.format_tb is not called when exc_tb is a str
+        # and want_result is False, so no event should come back.
+        mock_tb.return_value = 'fake-tb'
+        timeutils.set_time_override(override_time=NOW)
+        test_class = instance_action.InstanceActionEvent
+        expected_packed_values = test_class.pack_action_event_finish(
+            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb')
+        expected_packed_values['finish_time'] = timeutils.utcnow()
+
+        mock_finish.return_value = fake_event
+        event = test_class.event_finish_with_failure(
+            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb',
+            want_result=False)
+        mock_finish.assert_called_once_with(self.context,
+                                            expected_packed_values)
+        self.assertIsNone(event)
+        self.assertFalse(mock_tb.called)
+
+    @mock.patch.object(db, 'action_events_get')
+    def test_get_by_action(self, mock_get):
+        fake_events = [dict(fake_event, id=1234),
+                       dict(fake_event, id=5678)]
+        mock_get.return_value = fake_events
+        obj_list = instance_action.InstanceActionEventList.get_by_action(
+            self.context, 'fake-action-id')
+        for index, event in enumerate(obj_list):
+            self.compare_obj(event, fake_events[index])
+        mock_get.assert_called_once_with(self.context, 'fake-action-id')
+
+    @mock.patch('nova.objects.instance_action.InstanceActionEvent.'
+                'pack_action_event_finish')
+    @mock.patch('traceback.format_tb')
+    def test_event_finish_with_failure_serialized(self, mock_format,
+                                                  mock_pack):
+        mock_format.return_value = 'traceback'
+        mock_pack.side_effect = test.TestingException
+        self.assertRaises(
+            test.TestingException,
+            instance_action.InstanceActionEvent.event_finish_with_failure,
+            self.context, 'fake-uuid', 'fake-event',
+            exc_val=mock.sentinel.exc_val,
+            exc_tb=mock.sentinel.exc_tb)
+        mock_pack.assert_called_once_with(self.context, 'fake-uuid',
+                                          'fake-event',
+                                          exc_val=str(mock.sentinel.exc_val),
+                                          exc_tb='traceback')
+        mock_format.assert_called_once_with(mock.sentinel.exc_tb)
+
+
+class TestInstanceActionEventObject(test_objects._LocalTest,
+                                    _TestInstanceActionEventObject):
+    pass
+
+
+class TestRemoteInstanceActionEventObject(test_objects._RemoteTest,
+                                          _TestInstanceActionEventObject):
+    pass

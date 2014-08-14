@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2010 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,7 +17,7 @@ from lxml import etree
 import time
 import uuid
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 # Allow passing None to the various connect methods
 # (i.e. allow the client to rely on default URLs)
@@ -75,6 +73,13 @@ VIR_DOMAIN_SHUTOFF = 5
 VIR_DOMAIN_CRASHED = 6
 
 VIR_DOMAIN_XML_SECURE = 1
+VIR_DOMAIN_XML_INACTIVE = 2
+
+VIR_DOMAIN_BLOCK_REBASE_SHALLOW = 1
+VIR_DOMAIN_BLOCK_REBASE_REUSE_EXT = 2
+VIR_DOMAIN_BLOCK_REBASE_COPY = 8
+
+VIR_DOMAIN_BLOCK_JOB_ABORT_PIVOT = 2
 
 VIR_DOMAIN_EVENT_ID_LIFECYCLE = 0
 
@@ -113,6 +118,8 @@ VIR_MIGRATE_UNDEFINE_SOURCE = 16
 
 VIR_NODE_CPU_STATS_ALL_CPUS = -1
 
+VIR_DOMAIN_START_PAUSED = 1
+
 # libvirtError enums
 # (Intentionally different from what's in libvirt. We do this to check,
 #  that consumers of the library are using the symbolic names rather than
@@ -122,6 +129,7 @@ VIR_FROM_DOMAIN = 200
 VIR_FROM_NWFILTER = 330
 VIR_FROM_REMOTE = 340
 VIR_FROM_RPC = 345
+VIR_ERR_NO_SUPPORT = 3
 VIR_ERR_XML_DETAIL = 350
 VIR_ERR_NO_DOMAIN = 420
 VIR_ERR_OPERATION_INVALID = 55
@@ -133,11 +141,21 @@ VIR_ERR_INTERNAL_ERROR = 950
 # Readonly
 VIR_CONNECT_RO = 1
 
+# virConnectBaselineCPU flags
+VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES = 1
+
 # snapshotCreateXML flags
 VIR_DOMAIN_SNAPSHOT_CREATE_NO_METADATA = 4
 VIR_DOMAIN_SNAPSHOT_CREATE_DISK_ONLY = 16
 VIR_DOMAIN_SNAPSHOT_CREATE_REUSE_EXT = 32
 VIR_DOMAIN_SNAPSHOT_CREATE_QUIESCE = 64
+
+# blockCommit flags
+VIR_DOMAIN_BLOCK_COMMIT_RELATIVE = 4
+
+
+VIR_CONNECT_LIST_DOMAINS_ACTIVE = 1
+VIR_CONNECT_LIST_DOMAINS_INACTIVE = 2
 
 
 def _parse_disk_info(element):
@@ -168,18 +186,76 @@ def _parse_disk_info(element):
 
 
 class libvirtError(Exception):
-    def __init__(self, msg,
-                 error_code=VIR_ERR_INTERNAL_ERROR,
-                 error_domain=VIR_FROM_QEMU):
-        self.error_code = error_code
-        self.error_domain = error_domain
-        Exception(self, msg)
+    """This class was copied and slightly modified from
+    `libvirt-python:libvirt-override.py`.
+
+    Since a test environment will use the real `libvirt-python` version of
+    `libvirtError` if it's installed and not this fake, we need to maintain
+    strict compatibility with the original class, including `__init__` args
+    and instance-attributes.
+
+    To create a libvirtError instance you should:
+
+        # Create an unsupported error exception
+        exc = libvirtError('my message')
+        exc.err = (libvirt.VIR_ERR_NO_SUPPORT,)
+
+    self.err is a tuple of form:
+        (error_code, error_domain, error_message, error_level, str1, str2,
+         str3, int1, int2)
+
+    Alternatively, you can use the `make_libvirtError` convenience function to
+    allow you to specify these attributes in one shot.
+    """
+    def __init__(self, defmsg, conn=None, dom=None, net=None, pool=None,
+                 vol=None):
+        Exception.__init__(self, defmsg)
+        self.err = None
 
     def get_error_code(self):
-        return self.error_code
+        if self.err is None:
+            return None
+        return self.err[0]
 
     def get_error_domain(self):
-        return self.error_domain
+        if self.err is None:
+            return None
+        return self.err[1]
+
+    def get_error_message(self):
+        if self.err is None:
+            return None
+        return self.err[2]
+
+    def get_error_level(self):
+        if self.err is None:
+            return None
+        return self.err[3]
+
+    def get_str1(self):
+        if self.err is None:
+            return None
+        return self.err[4]
+
+    def get_str2(self):
+        if self.err is None:
+            return None
+        return self.err[5]
+
+    def get_str3(self):
+        if self.err is None:
+            return None
+        return self.err[6]
+
+    def get_int1(self):
+        if self.err is None:
+            return None
+        return self.err[7]
+
+    def get_int2(self):
+        if self.err is None:
+            return None
+        return self.err[8]
 
 
 class NWFilter(object):
@@ -215,8 +291,10 @@ class Domain(object):
         try:
             tree = etree.fromstring(xml)
         except etree.ParseError:
-            raise libvirtError("Invalid XML.",
-                               VIR_ERR_XML_DETAIL, VIR_FROM_DOMAIN)
+            raise make_libvirtError(
+                    libvirtError, "Invalid XML.",
+                    error_code=VIR_ERR_XML_DETAIL,
+                    error_domain=VIR_FROM_DOMAIN)
 
         definition = {}
 
@@ -365,7 +443,18 @@ class Domain(object):
                 123456789L]
 
     def migrateToURI(self, desturi, flags, dname, bandwidth):
-        raise libvirtError("Migration always fails for fake libvirt!")
+        raise make_libvirtError(
+                libvirtError,
+                "Migration always fails for fake libvirt!",
+                error_code=VIR_ERR_INTERNAL_ERROR,
+                error_domain=VIR_FROM_QEMU)
+
+    def migrateToURI2(self, dconnuri, miguri, dxml, flags, dname, bandwidth):
+        raise make_libvirtError(
+                libvirtError,
+                "Migration always fails for fake libvirt!",
+                error_code=VIR_ERR_INTERNAL_ERROR,
+                error_domain=VIR_FROM_QEMU)
 
     def attachDevice(self, xml):
         disk_info = _parse_disk_info(etree.fromstring(xml))
@@ -376,7 +465,11 @@ class Domain(object):
     def attachDeviceFlags(self, xml, flags):
         if (flags & VIR_DOMAIN_AFFECT_LIVE and
                 self._state != VIR_DOMAIN_RUNNING):
-            raise libvirtError("AFFECT_LIVE only allowed for running domains!")
+            raise make_libvirtError(
+                libvirtError,
+                "AFFECT_LIVE only allowed for running domains!",
+                error_code=VIR_ERR_INTERNAL_ERROR,
+                error_domain=VIR_FROM_QEMU)
         self.attachDevice(xml)
 
     def detachDevice(self, xml):
@@ -500,6 +593,9 @@ class Domain(object):
     def maxMemory(self):
         return self._def['memory']
 
+    def blockJobInfo(self, disk, flags):
+        return {}
+
 
 class DomainSnapshot(object):
     def __init__(self, name, domain):
@@ -511,7 +607,7 @@ class DomainSnapshot(object):
 
 
 class Connection(object):
-    def __init__(self, uri=None, readonly=False, version=9007):
+    def __init__(self, uri=None, readonly=False, version=9011):
         if not uri or uri == '':
             if allow_default_uri_connection:
                 uri = 'qemu:///session'
@@ -526,9 +622,11 @@ class Connection(object):
                          'test:///default']
 
         if uri not in uri_whitelist:
-            raise libvirtError("libvirt error: no connection driver "
-                               "available for No connection for URI %s" % uri,
-                               5, 0)
+            raise make_libvirtError(
+                    libvirtError,
+                   "libvirt error: no connection driver "
+                   "available for No connection for URI %s" % uri,
+                   error_code=5, error_domain=0)
 
         self.readonly = readonly
         self._uri = uri
@@ -587,16 +685,31 @@ class Connection(object):
     def lookupByID(self, id):
         if id in self._running_vms:
             return self._running_vms[id]
-        raise libvirtError('Domain not found: no domain with matching '
-                           'id %d' % id,
-                           VIR_ERR_NO_DOMAIN, VIR_FROM_QEMU)
+        raise make_libvirtError(
+                libvirtError,
+                'Domain not found: no domain with matching id %d' % id,
+                error_code=VIR_ERR_NO_DOMAIN,
+                error_domain=VIR_FROM_QEMU)
 
     def lookupByName(self, name):
         if name in self._vms:
             return self._vms[name]
-        raise libvirtError('Domain not found: no domain with matching '
-                           'name "%s"' % name,
-                           VIR_ERR_NO_DOMAIN, VIR_FROM_QEMU)
+        raise make_libvirtError(
+                libvirtError,
+                'Domain not found: no domain with matching name "%s"' % name,
+                error_code=VIR_ERR_NO_DOMAIN,
+                error_domain=VIR_FROM_QEMU)
+
+    def listAllDomains(self, flags):
+        vms = []
+        for vm in self._vms:
+            if flags & VIR_CONNECT_LIST_DOMAINS_ACTIVE:
+                if vm.state != VIR_DOMAIN_SHUTOFF:
+                    vms.append(vm)
+            if flags & VIR_CONNECT_LIST_DOMAINS_INACTIVE:
+                if vm.state == VIR_DOMAIN_SHUTOFF:
+                    vms.append(vm)
+        return vms
 
     def _emit_lifecycle(self, dom, event, detail):
         if VIR_DOMAIN_EVENT_ID_LIFECYCLE not in self._event_callbacks:
@@ -634,6 +747,9 @@ class Connection(object):
 
     def domainEventRegisterAny(self, dom, eventid, callback, opaque):
         self._event_callbacks[eventid] = [callback, opaque]
+
+    def registerCloseCallback(self, cb, opaque):
+        pass
 
     def getCapabilities(self):
         """Return spoofed capabilities."""
@@ -894,14 +1010,21 @@ class Connection(object):
                     'user': 26728850000000L,
                     'iowait': 6121490000000L}
         else:
-            raise libvirtError("invalid argument: Invalid cpu number")
+            raise make_libvirtError(
+                    libvirtError,
+                    "invalid argument: Invalid cpu number",
+                    error_code=VIR_ERR_INTERNAL_ERROR,
+                    error_domain=VIR_FROM_QEMU)
 
     def nwfilterLookupByName(self, name):
         try:
             return self._nwfilters[name]
         except KeyError:
-            raise libvirtError("no nwfilter with matching name %s" % name,
-                               VIR_ERR_NO_NWFILTER, VIR_FROM_NWFILTER)
+            raise make_libvirtError(
+                    libvirtError,
+                    "no nwfilter with matching name %s" % name,
+                    error_code=VIR_ERR_NO_NWFILTER,
+                    error_domain=VIR_FROM_NWFILTER)
 
     def nwfilterDefineXML(self, xml):
         nwfilter = NWFilter(self, xml)
@@ -912,6 +1035,14 @@ class Connection(object):
 
     def listDevices(self, cap, flags):
         return []
+
+    def baselineCPU(self, cpu, flag):
+        """Add new libvirt API."""
+        return """<cpu mode='custom' match='exact'>
+                    <model fallback='allow'>Westmere</model>
+                    <vendor>Intel</vendor>
+                    <feature policy='require' name='aes'/>
+                  </cpu>"""
 
 
 def openAuth(uri, auth, flags):
@@ -926,8 +1057,6 @@ def openAuth(uri, auth, flags):
     if not callable(auth[1]):
         raise Exception(
             _("Expected a function in 'auth[1]' parameter"))
-
-    connection_used = True
 
     return Connection(uri, (flags == VIR_CONNECT_RO))
 
@@ -944,6 +1073,24 @@ def virEventRegisterDefaultImpl():
 
 def registerErrorHandler(handler, ctxt):
     pass
+
+
+def make_libvirtError(error_class, msg, error_code=None,
+                       error_domain=None, error_message=None,
+                       error_level=None, str1=None, str2=None, str3=None,
+                       int1=None, int2=None):
+    """Convenience function for creating `libvirtError` exceptions which
+    allow you to specify arguments in constructor without having to manipulate
+    the `err` tuple directly.
+
+    We need to pass in `error_class` to this function because it may be
+    `libvirt.libvirtError` or `fakelibvirt.libvirtError` depending on whether
+    `libvirt-python` is installed.
+    """
+    exc = error_class(msg)
+    exc.err = (error_code, error_domain, error_message, error_level,
+               str1, str2, str3, int1, int2)
+    return exc
 
 
 virDomain = Domain

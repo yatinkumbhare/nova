@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,8 +14,10 @@
 
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
+from nova.openstack.common import uuidutils
 
 
 class InstanceGroup(base.NovaPersistentObject, base.NovaObject):
@@ -25,7 +25,11 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject):
     # Version 1.1: String attributes updated to support unicode
     # Version 1.2: Use list/dict helpers for policies, metadetails, members
     # Version 1.3: Make uuid a non-None real string
-    VERSION = '1.3'
+    # Version 1.4: Add add_members()
+    # Version 1.5: Add get_hosts()
+    # Version 1.6: Add get_by_name()
+    # Version 1.7: Deprecate metadetails
+    VERSION = '1.7'
 
     fields = {
         'id': fields.IntegerField(),
@@ -37,9 +41,14 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject):
         'name': fields.StringField(nullable=True),
 
         'policies': fields.ListOfStringsField(nullable=True),
-        'metadetails': fields.DictOfStringsField(nullable=True),
         'members': fields.ListOfStringsField(nullable=True),
         }
+
+    def obj_make_compatible(self, primitive, target_version):
+        if target_version < (1, 7):
+            # NOTE(danms): Before 1.7, we had an always-empty
+            # metadetails property
+            primitive['metadetails'] = {}
 
     @staticmethod
     def _from_db_object(context, instance_group, db_inst):
@@ -63,6 +72,27 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject):
         db_inst = db.instance_group_get(context, uuid)
         return cls._from_db_object(context, cls(), db_inst)
 
+    @base.remotable_classmethod
+    def get_by_name(cls, context, name):
+        # TODO(russellb) We need to get the group by name here.  There's no
+        # db.api method for this yet.  Come back and optimize this by
+        # adding a new query by name.  This is unnecessarily expensive if a
+        # tenant has lots of groups.
+        igs = objects.InstanceGroupList.get_by_project_id(context,
+                                                          context.project_id)
+        for ig in igs:
+            if ig.name == name:
+                return ig
+
+        raise exception.InstanceGroupNotFound(group_uuid=name)
+
+    @classmethod
+    def get_by_hint(cls, context, hint):
+        if uuidutils.is_uuid_like(hint):
+            return cls.get_by_uuid(context, hint)
+        else:
+            return cls.get_by_name(context, hint)
+
     @base.remotable
     def save(self, context):
         """Save updates to this instance group."""
@@ -70,11 +100,6 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject):
         updates = self.obj_get_changes()
         if not updates:
             return
-
-        metadata = None
-        if 'metadetails' in updates:
-            metadata = updates.pop('metadetails')
-            updates.update({'metadata': metadata})
 
         db.instance_group_update(context, self.uuid, updates)
         db_inst = db.instance_group_get(context, self.uuid)
@@ -98,11 +123,9 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject):
         updates.pop('id', None)
         policies = updates.pop('policies', None)
         members = updates.pop('members', None)
-        metadetails = updates.pop('metadetails', None)
 
         db_inst = db.instance_group_create(context, updates,
                                            policies=policies,
-                                           metadata=metadetails,
                                            members=members)
         self._from_db_object(context, self, db_inst)
 
@@ -111,28 +134,60 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject):
         db.instance_group_delete(context, self.uuid)
         self.obj_reset_changes()
 
+    @base.remotable_classmethod
+    def add_members(cls, context, group_uuid, instance_uuids):
+        members = db.instance_group_members_add(context, group_uuid,
+                instance_uuids)
+        return list(members)
 
-def _make_instance_group_list(context, inst_list, db_list):
-    inst_list.objects = []
-    for group in db_list:
-        inst_obj = InstanceGroup._from_db_object(context, InstanceGroup(),
-                                                 group)
-        inst_list.objects.append(inst_obj)
-    inst_list.obj_reset_changes()
-    return inst_list
+    @base.remotable
+    def get_hosts(self, context, exclude=None):
+        """Get a list of hosts for non-deleted instances in the group
+
+        This method allows you to get a list of the hosts where instances in
+        this group are currently running.  There's also an option to exclude
+        certain instance UUIDs from this calculation.
+
+        """
+        filter_uuids = self.members
+        if exclude:
+            filter_uuids = set(filter_uuids) - set(exclude)
+        filters = {'uuid': filter_uuids, 'deleted': False}
+        instances = objects.InstanceList.get_by_filters(context,
+                                                        filters=filters)
+        return list(set([instance.host for instance in instances
+                         if instance.host]))
 
 
 class InstanceGroupList(base.ObjectListBase, base.NovaObject):
+    # Version 1.0: Initial version
+    #              InstanceGroup <= version 1.3
+    # Version 1.1: InstanceGroup <= version 1.4
+    # Version 1.2: InstanceGroup <= version 1.5
+    # Version 1.3: InstanceGroup <= version 1.6
+    # Version 1.4: InstanceGroup <= version 1.7
+    VERSION = '1.2'
+
     fields = {
         'objects': fields.ListOfObjectsField('InstanceGroup'),
+        }
+    child_versions = {
+        '1.0': '1.3',
+        # NOTE(danms): InstanceGroup was at 1.3 before we added this
+        '1.1': '1.4',
+        '1.2': '1.5',
+        '1.3': '1.6',
+        '1.4': '1.7',
         }
 
     @base.remotable_classmethod
     def get_by_project_id(cls, context, project_id):
         groups = db.instance_group_get_all_by_project_id(context, project_id)
-        return _make_instance_group_list(context, cls(), groups)
+        return base.obj_make_list(context, cls(context), objects.InstanceGroup,
+                                  groups)
 
     @base.remotable_classmethod
     def get_all(cls, context):
         groups = db.instance_group_get_all(context)
-        return _make_instance_group_list(context, cls(), groups)
+        return base.obj_make_list(context, cls(context), objects.InstanceGroup,
+                                  groups)

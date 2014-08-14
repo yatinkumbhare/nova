@@ -15,19 +15,23 @@
 #    under the License.
 
 import copy
+import datetime
 import math
 import uuid
 
+import mock
 import netaddr
 from oslo.config import cfg
 import webob
 
 from nova.api.openstack.compute.contrib import networks_associate
 from nova.api.openstack.compute.contrib import os_networks as networks
+from nova.api.openstack.compute.contrib import os_tenant_networks as tnet
 import nova.context
 from nova import exception
 from nova import test
 from nova.tests.api.openstack import fakes
+import nova.utils
 
 CONF = cfg.CONF
 
@@ -35,7 +39,7 @@ FAKE_NETWORKS = [
     {
         'bridge': 'br100', 'vpn_public_port': 1000,
         'dhcp_start': '10.0.0.3', 'bridge_interface': 'eth0',
-        'updated_at': '2011-08-16 09:26:13.048257',
+        'updated_at': datetime.datetime(2011, 8, 16, 9, 26, 13, 48257),
         'id': 1, 'uuid': '20c8acc0-f747-4d71-a389-46d078ebf047',
         'cidr_v6': None, 'deleted_at': None,
         'gateway': '10.0.0.1', 'label': 'mynet_0',
@@ -47,7 +51,7 @@ FAKE_NETWORKS = [
         'vpn_public_address': '127.0.0.1', 'multi_host': False,
         'dns1': None, 'dns2': None, 'host': 'nsokolov-desktop',
         'gateway_v6': None, 'netmask_v6': None, 'priority': None,
-        'created_at': '2011-08-15 06:19:19.387525',
+        'created_at': datetime.datetime(2011, 8, 15, 6, 19, 19, 387525),
     },
     {
         'bridge': 'br101', 'vpn_public_port': 1001,
@@ -62,7 +66,7 @@ FAKE_NETWORKS = [
         'cidr': '10.0.0.10/29', 'vpn_public_address': None,
         'multi_host': False, 'dns1': None, 'dns2': None, 'host': None,
         'gateway_v6': None, 'netmask_v6': None, 'priority': None,
-        'created_at': '2011-08-15 06:19:19.885495',
+        'created_at': datetime.datetime(2011, 8, 15, 6, 19, 19, 885495),
     },
 ]
 
@@ -104,6 +108,8 @@ class FakeNetworkAPI(object):
         self._vlan_is_disabled = True
 
     def delete(self, context, network_id):
+        if network_id == -1:
+            raise exception.NetworkInUse(network_id=network_id)
         for i, network in enumerate(self.networks):
             if network['id'] == network_id:
                 del self.networks[0]
@@ -302,6 +308,11 @@ class NetworksTest(test.NoDBTestCase):
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.delete, req, 100)
 
+    def test_network_delete_in_use(self):
+        req = fakes.HTTPRequest.blank('/v2/1234/os-networks/-1')
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self.controller.delete, req, -1)
+
     def test_network_add_vlan_disabled(self):
         self.fake_network_api.disable_vlan()
         uuid = FAKE_NETWORKS[1]['uuid']
@@ -347,3 +358,80 @@ class NetworksTest(test.NoDBTestCase):
         res_dict = self.controller.create(req, large_network)
         self.assertEqual(res_dict['network']['cidr'],
                          large_network['network']['cidr'])
+
+    def test_network_neutron_associate_not_implemented(self):
+        uuid = FAKE_NETWORKS[1]['uuid']
+        self.flags(network_api_class='nova.network.neutronv2.api.API')
+        assoc_ctrl = networks_associate.NetworkAssociateActionController()
+
+        req = fakes.HTTPRequest.blank('/v2/1234/os-networks/%s/action' % uuid)
+        self.assertRaises(webob.exc.HTTPNotImplemented,
+                          assoc_ctrl._associate_host,
+                          req, uuid, {'associate_host': "TestHost"})
+
+    def test_network_neutron_disassociate_project_not_implemented(self):
+        uuid = FAKE_NETWORKS[1]['uuid']
+        self.flags(network_api_class='nova.network.neutronv2.api.API')
+        assoc_ctrl = networks_associate.NetworkAssociateActionController()
+
+        req = fakes.HTTPRequest.blank('/v2/1234/os-networks/%s/action' % uuid)
+        self.assertRaises(webob.exc.HTTPNotImplemented,
+                          assoc_ctrl._disassociate_project_only,
+                          req, uuid, {'disassociate_project': None})
+
+    def test_network_neutron_disassociate_host_not_implemented(self):
+        uuid = FAKE_NETWORKS[1]['uuid']
+        self.flags(network_api_class='nova.network.neutronv2.api.API')
+        assoc_ctrl = networks_associate.NetworkAssociateActionController()
+        req = fakes.HTTPRequest.blank('/v2/1234/os-networks/%s/action' % uuid)
+        self.assertRaises(webob.exc.HTTPNotImplemented,
+                          assoc_ctrl._disassociate_host_only,
+                          req, uuid, {'disassociate_host': None})
+
+    def test_network_neutron_disassociate_not_implemented(self):
+        uuid = FAKE_NETWORKS[1]['uuid']
+        self.flags(network_api_class='nova.network.neutronv2.api.API')
+        controller = networks.NetworkController()
+        req = fakes.HTTPRequest.blank('/v2/1234/os-networks/%s/action' % uuid)
+        self.assertRaises(webob.exc.HTTPNotImplemented,
+                          controller._disassociate_host_and_project,
+                          req, uuid, {'disassociate': None})
+
+
+class TenantNetworksTest(test.NoDBTestCase):
+    def setUp(self):
+        super(TenantNetworksTest, self).setUp()
+        self.controller = tnet.NetworkController()
+        self.flags(enable_network_quota=True)
+
+    @mock.patch('nova.quota.QUOTAS.reserve')
+    @mock.patch('nova.quota.QUOTAS.rollback')
+    @mock.patch('nova.network.api.API.delete')
+    def _test_network_delete_exception(self, ex, expex, delete_mock,
+                                       rollback_mock, reserve_mock):
+        req = fakes.HTTPRequest.blank('/v2/1234/os-tenant-networks')
+        ctxt = req.environ['nova.context']
+
+        reserve_mock.return_value = 'rv'
+        delete_mock.side_effect = ex
+
+        self.assertRaises(expex, self.controller.delete, req, 1)
+
+        delete_mock.assert_called_once_with(ctxt, 1)
+        rollback_mock.assert_called_once_with(ctxt, 'rv')
+        reserve_mock.assert_called_once_with(ctxt, networks=-1)
+
+    def test_network_delete_exception_network_not_found(self):
+        ex = exception.NetworkNotFound(network_id=1)
+        expex = webob.exc.HTTPNotFound
+        self._test_network_delete_exception(ex, expex)
+
+    def test_network_delete_exception_policy_failed(self):
+        ex = exception.PolicyNotAuthorized(action='dummy')
+        expex = webob.exc.HTTPForbidden
+        self._test_network_delete_exception(ex, expex)
+
+    def test_network_delete_exception_network_in_use(self):
+        ex = exception.NetworkInUse(network_id=1)
+        expex = webob.exc.HTTPConflict
+        self._test_network_delete_exception(ex, expex)

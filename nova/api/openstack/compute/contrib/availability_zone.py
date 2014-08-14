@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,7 +19,7 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import availability_zones
-from nova import db
+from nova import objects
 from nova import servicegroup
 
 CONF = cfg.CONF
@@ -105,7 +103,7 @@ class AvailabilityZoneController(wsgi.Controller):
             availability_zones.get_availability_zones(ctxt)
 
         # Available services
-        enabled_services = db.service_get_all(context, False)
+        enabled_services = objects.ServiceList.get_all(context, disabled=False)
         enabled_services = availability_zones.set_availability_zones(context,
                 enabled_services)
         zone_hosts = {}
@@ -167,7 +165,7 @@ class Availability_zone(extensions.ExtensionDescriptor):
     alias = "os-availability-zone"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "availabilityzone/api/v1.1")
-    updated = "2012-12-21T00:00:00+00:00"
+    updated = "2012-12-21T00:00:00Z"
 
     def get_resources(self):
         resources = []

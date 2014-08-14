@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 Cloud.com, Inc
 # Copyright 2012 Cloudbase Solutions Srl
 # All Rights Reserved.
@@ -26,18 +24,17 @@ from oslo.config import cfg
 
 from nova.api.metadata import base as instance_metadata
 from nova import exception
+from nova.i18n import _
 from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
-from nova import unit
+from nova.openstack.common import units
 from nova import utils
 from nova.virt import configdrive
 from nova.virt.hyperv import constants
 from nova.virt.hyperv import imagecache
 from nova.virt.hyperv import utilsfactory
-from nova.virt.hyperv import vhdutilsv2
 from nova.virt.hyperv import vmutils
 from nova.virt.hyperv import volumeops
 
@@ -53,8 +50,8 @@ hyperv_opts = [
                 help='Sets the admin password in the config drive image'),
     cfg.StrOpt('qemu_img_cmd',
                default="qemu-img.exe",
-               help='qemu-img is used to convert between '
-                    'different image types'),
+               help='Path of qemu-img command which is used to convert '
+                    'between different image types'),
     cfg.BoolOpt('config_drive_cdrom',
                 default=False,
                 help='Attaches the Config Drive image as a cdrom drive '
@@ -122,7 +119,7 @@ class VMOps(object):
 
     def get_info(self, instance):
         """Get information about the VM."""
-        LOG.debug(_("get_info called for instance"), instance=instance)
+        LOG.debug("get_info called for instance", instance=instance)
 
         instance_name = instance['name']
         if not self._vmutils.vm_exists(instance_name):
@@ -139,51 +136,56 @@ class VMOps(object):
 
     def _create_root_vhd(self, context, instance):
         base_vhd_path = self._imagecache.get_cached_image(context, instance)
+        base_vhd_info = self._vhdutils.get_vhd_info(base_vhd_path)
+        base_vhd_size = base_vhd_info['MaxInternalSize']
         format_ext = base_vhd_path.split('.')[-1]
         root_vhd_path = self._pathutils.get_root_vhd_path(instance['name'],
                                                           format_ext)
+        root_vhd_size = instance['root_gb'] * units.Gi
 
         try:
             if CONF.use_cow_images:
-                LOG.debug(_("Creating differencing VHD. Parent: "
-                            "%(base_vhd_path)s, Target: %(root_vhd_path)s"),
+                LOG.debug("Creating differencing VHD. Parent: "
+                          "%(base_vhd_path)s, Target: %(root_vhd_path)s",
                           {'base_vhd_path': base_vhd_path,
-                           'root_vhd_path': root_vhd_path})
-                self._vhdutils.create_differencing_vhd(root_vhd_path,
-                                                       base_vhd_path)
-            else:
-                LOG.debug(_("Copying VHD image %(base_vhd_path)s to target: "
-                            "%(root_vhd_path)s"),
-                          {'base_vhd_path': base_vhd_path,
-                           'root_vhd_path': root_vhd_path})
-                self._pathutils.copyfile(base_vhd_path, root_vhd_path)
-
-                base_vhd_info = self._vhdutils.get_vhd_info(base_vhd_path)
-                base_vhd_size = base_vhd_info['MaxInternalSize']
-                root_vhd_size = instance['root_gb'] * unit.Gi
-
-                # NOTE(lpetrut): Checking the namespace is needed as the
-                # following method is not yet implemented in vhdutilsv2.
-                if not isinstance(self._vhdutils, vhdutilsv2.VHDUtilsV2):
+                           'root_vhd_path': root_vhd_path},
+                          instance=instance)
+                vhd_type = self._vhdutils.get_vhd_format(base_vhd_path)
+                if vhd_type == constants.DISK_FORMAT_VHDX:
+                    # Differencing vhdx images can be resized, so we use
+                    # the flavor size when creating the root image
                     root_vhd_internal_size = (
                         self._vhdutils.get_internal_vhd_size_by_file_size(
-                            root_vhd_path, root_vhd_size))
-                else:
-                    root_vhd_internal_size = root_vhd_size
+                            base_vhd_path, root_vhd_size))
+                    if not self._is_resize_needed(root_vhd_path, base_vhd_size,
+                                                  root_vhd_internal_size,
+                                                  instance):
+                        root_vhd_internal_size = None
 
-                if root_vhd_internal_size < base_vhd_size:
-                    error_msg = _("Cannot resize a VHD to a smaller size, the"
-                                  " original size is %(base_vhd_size)s, the"
-                                  " newer size is %(root_vhd_size)s"
-                                  ) % {'base_vhd_size': base_vhd_size,
-                                       'root_vhd_size': root_vhd_size}
-                    raise vmutils.HyperVException(error_msg)
-                elif root_vhd_internal_size > base_vhd_size:
-                    LOG.debug(_("Resizing VHD %(root_vhd_path)s to new "
-                                "size %(root_vhd_size)s"),
-                              {'base_vhd_path': base_vhd_path,
-                               'root_vhd_path': root_vhd_path})
-                    self._vhdutils.resize_vhd(root_vhd_path, root_vhd_size)
+                    self._vhdutils.create_differencing_vhd(
+                        root_vhd_path, base_vhd_path, root_vhd_internal_size)
+                else:
+                    # The base image had already been resized
+                    self._vhdutils.create_differencing_vhd(root_vhd_path,
+                                                           base_vhd_path)
+            else:
+                LOG.debug("Copying VHD image %(base_vhd_path)s to target: "
+                          "%(root_vhd_path)s",
+                          {'base_vhd_path': base_vhd_path,
+                           'root_vhd_path': root_vhd_path},
+                          instance=instance)
+                self._pathutils.copyfile(base_vhd_path, root_vhd_path)
+
+                root_vhd_internal_size = (
+                        self._vhdutils.get_internal_vhd_size_by_file_size(
+                            root_vhd_path, root_vhd_size))
+
+                if self._is_resize_needed(root_vhd_path, base_vhd_size,
+                                          root_vhd_internal_size,
+                                          instance):
+                    self._vhdutils.resize_vhd(root_vhd_path,
+                                              root_vhd_internal_size,
+                                              is_file_max_size=False)
         except Exception:
             with excutils.save_and_reraise_exception():
                 if self._pathutils.exists(root_vhd_path):
@@ -191,8 +193,25 @@ class VMOps(object):
 
         return root_vhd_path
 
+    def _is_resize_needed(self, vhd_path, old_size, new_size, instance):
+        if new_size < old_size:
+            error_msg = _("Cannot resize a VHD to a smaller size, the"
+                          " original size is %(old_size)s, the"
+                          " newer size is %(new_size)s"
+                          ) % {'old_size': old_size,
+                               'new_size': new_size}
+            raise vmutils.VHDResizeException(error_msg)
+        elif new_size > old_size:
+            LOG.debug("Resizing VHD %(vhd_path)s to new "
+                      "size %(new_size)s" %
+                      {'new_size': new_size,
+                       'vhd_path': vhd_path},
+                      instance=instance)
+            return True
+        return False
+
     def create_ephemeral_vhd(self, instance):
-        eph_vhd_size = instance.get('ephemeral_gb', 0) * unit.Gi
+        eph_vhd_size = instance.get('ephemeral_gb', 0) * units.Gi
         if eph_vhd_size:
             vhd_format = self._vhdutils.get_best_supported_vhd_format()
 
@@ -227,14 +246,15 @@ class VMOps(object):
                                  root_vhd_path, eph_vhd_path)
 
             if configdrive.required_by(instance):
-                self._create_config_drive(instance, injected_files,
-                                          admin_password)
+                configdrive_path = self._create_config_drive(instance,
+                                                             injected_files,
+                                                             admin_password)
+                self.attach_config_drive(instance, configdrive_path)
 
             self.power_on(instance)
-        except Exception as ex:
-            LOG.exception(ex)
-            self.destroy(instance)
-            raise vmutils.HyperVException(_('Spawn instance failed'))
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                self.destroy(instance)
 
     def create_instance(self, instance, network_info, block_device_info,
                         root_vhd_path, eph_vhd_path):
@@ -269,7 +289,7 @@ class VMOps(object):
                                        root_vhd_path is None)
 
         for vif in network_info:
-            LOG.debug(_('Creating nic for instance: %s'), instance_name)
+            LOG.debug('Creating nic for instance', instance=instance)
             self._vmutils.create_nic(instance_name,
                                      vif['id'],
                                      vif['address'])
@@ -280,10 +300,11 @@ class VMOps(object):
 
     def _create_config_drive(self, instance, injected_files, admin_password):
         if CONF.config_drive_format != 'iso9660':
-            vmutils.HyperVException(_('Invalid config_drive_format "%s"') %
-                                    CONF.config_drive_format)
+            raise vmutils.UnsupportedConfigDriveFormatException(
+                _('Invalid config_drive_format "%s"') %
+                CONF.config_drive_format)
 
-        LOG.info(_('Using config drive for instance: %s'), instance=instance)
+        LOG.info(_('Using config drive for instance'), instance=instance)
 
         extra_md = {}
         if admin_password and CONF.hyperv.config_drive_inject_password:
@@ -308,7 +329,6 @@ class VMOps(object):
                               e, instance=instance)
 
         if not CONF.hyperv.config_drive_cdrom:
-            drive_type = constants.IDE_DISK
             configdrive_path = os.path.join(instance_path,
                                             'configdrive.vhd')
             utils.execute(CONF.hyperv.qemu_img_cmd,
@@ -322,11 +342,19 @@ class VMOps(object):
                           attempts=1)
             self._pathutils.remove(configdrive_path_iso)
         else:
-            drive_type = constants.IDE_DVD
             configdrive_path = configdrive_path_iso
 
-        self._vmutils.attach_ide_drive(instance['name'], configdrive_path,
-                                       1, 0, drive_type)
+        return configdrive_path
+
+    def attach_config_drive(self, instance, configdrive_path):
+        configdrive_ext = configdrive_path[(configdrive_path.rfind('.') + 1):]
+        # Do the attach here and if there is a certain file format that isn't
+        # supported in constants.DISK_FORMAT_MAP then bomb out.
+        try:
+            self._vmutils.attach_ide_drive(instance.name, configdrive_path,
+                    1, 0, constants.DISK_FORMAT_MAP[configdrive_ext])
+        except KeyError:
+            raise exception.InvalidDiskFormat(disk_format=configdrive_ext)
 
     def _disconnect_volumes(self, volume_drives):
         for volume_drive in volume_drives:
@@ -340,11 +368,11 @@ class VMOps(object):
     def destroy(self, instance, network_info=None, block_device_info=None,
                 destroy_disks=True):
         instance_name = instance['name']
-        LOG.info(_("Got request to destroy instance: %s"), instance_name)
+        LOG.info(_("Got request to destroy instance"), instance=instance)
         try:
             if self._vmutils.vm_exists(instance_name):
 
-                #Stop the VM first.
+                # Stop the VM first.
                 self.power_off(instance)
 
                 storage = self._vmutils.get_vm_storage_paths(instance_name)
@@ -353,66 +381,65 @@ class VMOps(object):
                 self._vmutils.destroy_vm(instance_name)
                 self._disconnect_volumes(volume_drives)
             else:
-                LOG.debug(_("Instance not found: %s"), instance_name)
+                LOG.debug("Instance not found", instance=instance)
 
             if destroy_disks:
                 self._delete_disk_files(instance_name)
-        except Exception as ex:
-            LOG.exception(ex)
-            raise vmutils.HyperVException(_('Failed to destroy instance: %s') %
-                                          instance_name)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_('Failed to destroy instance: %s'),
+                              instance_name)
 
     def reboot(self, instance, network_info, reboot_type):
         """Reboot the specified instance."""
-        LOG.debug(_("reboot instance"), instance=instance)
+        LOG.debug("Rebooting instance", instance=instance)
         self._set_vm_state(instance['name'],
                            constants.HYPERV_VM_STATE_REBOOT)
 
     def pause(self, instance):
         """Pause VM instance."""
-        LOG.debug(_("Pause instance"), instance=instance)
+        LOG.debug("Pause instance", instance=instance)
         self._set_vm_state(instance["name"],
                            constants.HYPERV_VM_STATE_PAUSED)
 
     def unpause(self, instance):
         """Unpause paused VM instance."""
-        LOG.debug(_("Unpause instance"), instance=instance)
+        LOG.debug("Unpause instance", instance=instance)
         self._set_vm_state(instance["name"],
                            constants.HYPERV_VM_STATE_ENABLED)
 
     def suspend(self, instance):
         """Suspend the specified instance."""
-        LOG.debug(_("Suspend instance"), instance=instance)
+        LOG.debug("Suspend instance", instance=instance)
         self._set_vm_state(instance["name"],
                            constants.HYPERV_VM_STATE_SUSPENDED)
 
     def resume(self, instance):
         """Resume the suspended VM instance."""
-        LOG.debug(_("Resume instance"), instance=instance)
+        LOG.debug("Resume instance", instance=instance)
         self._set_vm_state(instance["name"],
                            constants.HYPERV_VM_STATE_ENABLED)
 
     def power_off(self, instance):
         """Power off the specified instance."""
-        LOG.debug(_("Power off instance"), instance=instance)
+        LOG.debug("Power off instance", instance=instance)
         self._set_vm_state(instance["name"],
                            constants.HYPERV_VM_STATE_DISABLED)
 
     def power_on(self, instance):
         """Power on the specified instance."""
-        LOG.debug(_("Power on instance"), instance=instance)
+        LOG.debug("Power on instance", instance=instance)
         self._set_vm_state(instance["name"],
                            constants.HYPERV_VM_STATE_ENABLED)
 
     def _set_vm_state(self, vm_name, req_state):
         try:
             self._vmutils.set_vm_state(vm_name, req_state)
-            LOG.debug(_("Successfully changed state of VM %(vm_name)s"
-                        " to: %(req_state)s"),
+            LOG.debug("Successfully changed state of VM %(vm_name)s"
+                      " to: %(req_state)s",
                       {'vm_name': vm_name, 'req_state': req_state})
-        except Exception as ex:
-            LOG.exception(ex)
-            msg = (_("Failed to change vm state of %(vm_name)s"
-                     " to %(req_state)s") %
-                   {'vm_name': vm_name, 'req_state': req_state})
-            raise vmutils.HyperVException(msg)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_("Failed to change vm state of %(vm_name)s"
+                            " to %(req_state)s"),
+                          {'vm_name': vm_name, 'req_state': req_state})

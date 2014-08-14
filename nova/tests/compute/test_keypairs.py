@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -22,7 +20,7 @@ from nova.compute import api as compute_api
 from nova import context
 from nova import db
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import quota
 from nova.tests.compute import test_compute
 from nova.tests import fake_notifier
@@ -126,11 +124,13 @@ class CreateImportSharedTestMixIn(object):
         self.assertKeyNameRaises(exception.InvalidKeypair, msg, name)
 
     def test_name_too_short(self):
-        msg = _('Keypair name must be between 1 and 255 characters long')
+        msg = _('Keypair name must be string and between 1 '
+                'and 255 characters long')
         self.assertInvalidKeypair(msg, '')
 
     def test_name_too_long(self):
-        msg = _('Keypair name must be between 1 and 255 characters long')
+        msg = _('Keypair name must be string and between 1 '
+                'and 255 characters long')
         self.assertInvalidKeypair(msg, 'x' * 256)
 
     def test_invalid_chars(self):
@@ -208,8 +208,8 @@ class GetKeypairsTestCase(KeypairAPITestCase):
 
 class DeleteKeypairTestCase(KeypairAPITestCase):
     def test_success(self):
-        keypair = self.keypair_api.get_key_pair(self.ctxt, self.ctxt.user_id,
-                                                self.existing_key_name)
+        self.keypair_api.get_key_pair(self.ctxt, self.ctxt.user_id,
+                                      self.existing_key_name)
         self.keypair_api.delete_key_pair(self.ctxt, self.ctxt.user_id,
                 self.existing_key_name)
         self.assertRaises(exception.KeypairNotFound,

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -21,7 +19,7 @@ from nova.api.openstack import common
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 class Controller(object):
@@ -113,7 +111,8 @@ class Controller(object):
     def _update_instance_metadata(self, context, server_id, metadata,
                                   delete=False):
         try:
-            server = self.compute_api.get(context, server_id)
+            server = self.compute_api.get(context, server_id,
+                                          want_objects=True)
             return self.compute_api.update_instance_metadata(context,
                                                              server,
                                                              metadata,
@@ -138,6 +137,9 @@ class Controller(object):
             raise exc.HTTPRequestEntityTooLarge(
                 explanation=error.format_message(),
                 headers={'Retry-After': 0})
+
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
 
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
@@ -167,12 +169,16 @@ class Controller(object):
             raise exc.HTTPNotFound(explanation=msg)
 
         try:
-            server = self.compute_api.get(context, server_id)
+            server = self.compute_api.get(context, server_id,
+                                          want_objects=True)
             self.compute_api.delete_instance_metadata(context, server, id)
 
         except exception.InstanceNotFound:
             msg = _('Server does not exist')
             raise exc.HTTPNotFound(explanation=msg)
+
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
 
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,

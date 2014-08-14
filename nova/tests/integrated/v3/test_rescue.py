@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright 2012 Nebula, Inc.
 # Copyright 2013 IBM Corp.
 #
@@ -47,6 +46,26 @@ class RescueJsonTest(test_servers.ServersSampleBase):
 
         self._verify_response('server-get-resp-rescue', subs, response, 200)
 
+    def test_server_rescue_with_image_ref_specified(self):
+        uuid = self._post_server()
+
+        req_subs = {
+            'password': 'MySecretPass',
+            'image_ref': '2341-Abc'
+        }
+        response = self._do_post('servers/%s/action' % uuid,
+                                 'server-rescue-req-with-image-ref', req_subs)
+        self._verify_response('server-rescue', req_subs, response, 202)
+
+        # Do a server get to make sure that the 'RESCUE' state is set
+        response = self._do_get('servers/%s' % uuid)
+        subs = self._get_regexes()
+        subs['hostid'] = '[a-f0-9]+'
+        subs['id'] = uuid
+        subs['status'] = 'RESCUE'
+
+        self._verify_response('server-get-resp-rescue', subs, response, 200)
+
     def test_server_unrescue(self):
         uuid = self._post_server()
 
@@ -61,7 +80,3 @@ class RescueJsonTest(test_servers.ServersSampleBase):
         subs['status'] = 'ACTIVE'
 
         self._verify_response('server-get-resp-unrescue', subs, response, 200)
-
-
-class RescueXmlTest(RescueJsonTest):
-    ctype = 'xml'

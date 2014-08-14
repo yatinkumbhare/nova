@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -25,16 +23,19 @@ semantics of real hypervisor connections.
 
 """
 
+import contextlib
+
 from oslo.config import cfg
 
-from nova import block_device
 from nova.compute import power_state
 from nova.compute import task_states
 from nova import db
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova import utils
+from nova.virt import diagnostics
 from nova.virt import driver
 from nova.virt import virtapi
 
@@ -72,9 +73,10 @@ def restore_nodes():
 
 class FakeInstance(object):
 
-    def __init__(self, name, state):
+    def __init__(self, name, state, uuid):
         self.name = name
         self.state = state
+        self.uuid = uuid
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -103,6 +105,7 @@ class FakeDriver(driver.ComputeDriver):
           'hypervisor_hostname': CONF.host,
           'cpu_info': {},
           'disk_available_least': 500000000000,
+          'supported_instances': [(None, 'fake', None)],
           }
         self._mounts = {}
         self._interfaces = {}
@@ -114,6 +117,9 @@ class FakeDriver(driver.ComputeDriver):
 
     def list_instances(self):
         return self.instances.keys()
+
+    def list_instance_uuids(self):
+        return [self.instances[name].uuid for name in self.instances.keys()]
 
     def plug_vifs(self, instance, network_info):
         """Plug VIFs into networks."""
@@ -127,7 +133,7 @@ class FakeDriver(driver.ComputeDriver):
               admin_password, network_info=None, block_device_info=None):
         name = instance['name']
         state = power_state.RUNNING
-        fake_instance = FakeInstance(name, state)
+        fake_instance = FakeInstance(name, state, instance['uuid'])
         self.instances[name] = fake_instance
 
     def snapshot(self, context, instance, name, update_task_state):
@@ -203,7 +209,7 @@ class FakeDriver(driver.ComputeDriver):
         pass
 
     def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True):
+                destroy_disks=True, migrate_data=None):
         key = instance['name']
         if key in self.instances:
             del self.instances[key]
@@ -212,14 +218,17 @@ class FakeDriver(driver.ComputeDriver):
                         {'key': key,
                          'inst': self.instances}, instance=instance)
 
+    def cleanup(self, context, instance, network_info, block_device_info=None,
+                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+        pass
+
     def attach_volume(self, context, connection_info, instance, mountpoint,
-                      encryption=None):
+                      disk_bus=None, device_type=None, encryption=None):
         """Attach the disk to the instance at mountpoint using info."""
         instance_name = instance['name']
         if instance_name not in self._mounts:
             self._mounts[instance_name] = {}
         self._mounts[instance_name][mountpoint] = connection_info
-        return True
 
     def detach_volume(self, connection_info, instance, mountpoint,
                       encryption=None):
@@ -228,27 +237,27 @@ class FakeDriver(driver.ComputeDriver):
             del self._mounts[instance['name']][mountpoint]
         except KeyError:
             pass
-        return True
 
     def swap_volume(self, old_connection_info, new_connection_info,
-                    instance, mountpoint):
+                    instance, mountpoint, resize_to):
         """Replace the disk attached to the instance."""
         instance_name = instance['name']
         if instance_name not in self._mounts:
             self._mounts[instance_name] = {}
         self._mounts[instance_name][mountpoint] = new_connection_info
-        return True
 
     def attach_interface(self, instance, image_meta, vif):
         if vif['id'] in self._interfaces:
-            raise exception.InterfaceAttachFailed('duplicate')
+            raise exception.InterfaceAttachFailed(
+                    instance_uuid=instance['uuid'])
         self._interfaces[vif['id']] = vif
 
     def detach_interface(self, instance, vif):
         try:
             del self._interfaces[vif['id']]
         except KeyError:
-            raise exception.InterfaceDetachFailed('not attached')
+            raise exception.InterfaceDetachFailed(
+                    instance_uuid=instance['uuid'])
 
     def get_info(self, instance):
         if instance['name'] not in self.instances:
@@ -278,6 +287,23 @@ class FakeDriver(driver.ComputeDriver):
                 'vnet1_tx_packets': 662,
         }
 
+    def get_instance_diagnostics(self, instance_name):
+        diags = diagnostics.Diagnostics(state='running', driver='fake',
+                hypervisor_os='fake-os', uptime=46664, config_drive=True)
+        diags.add_cpu(time=17300000000)
+        diags.add_nic(mac_address='01:23:45:67:89:ab',
+                      rx_packets=26701,
+                      rx_octets=2070139,
+                      tx_octets=140208,
+                      tx_packets = 662)
+        diags.add_disk(id='fake-disk-id',
+                       read_bytes=262144,
+                       read_requests=112,
+                       write_bytes=5778432,
+                       write_requests=488)
+        diags.memory_details.maximum = 524288
+        return diags
+
     def get_all_bw_counters(self, instances):
         """Return bandwidth usage counters for each interface on each
            running VM.
@@ -306,10 +332,10 @@ class FakeDriver(driver.ComputeDriver):
     def interface_stats(self, instance_name, iface_id):
         return [0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L]
 
-    def get_console_output(self, instance):
+    def get_console_output(self, context, instance):
         return 'FAKE CONSOLE OUTPUT\nANOTHER\nLAST LINE'
 
-    def get_vnc_console(self, instance):
+    def get_vnc_console(self, context, instance):
         return {'internal_access_path': 'FAKE',
                 'host': 'fakevncconsole.com',
                 'port': 6969}
@@ -319,6 +345,11 @@ class FakeDriver(driver.ComputeDriver):
                 'host': 'fakespiceconsole.com',
                 'port': 6969,
                 'tlsPort': 6970}
+
+    def get_rdp_console(self, context, instance):
+        return {'internal_access_path': 'FAKE',
+                'host': 'fakerdpconsole.com',
+                'port': 6969}
 
     def get_console_pool_info(self, console_type):
         return {'address': '127.0.0.1',
@@ -353,10 +384,12 @@ class FakeDriver(driver.ComputeDriver):
                'memory_mb_used': 0,
                'local_gb_used': 0,
                'hypervisor_type': 'fake',
-               'hypervisor_version': '1.0',
+               'hypervisor_version': utils.convert_version_to_int('1.0'),
                'hypervisor_hostname': nodename,
                'disk_available_least': 0,
-               'cpu_info': '?'}
+               'cpu_info': '?',
+               'supported_instances': jsonutils.dumps([(None, 'fake', None)])
+              }
         return dic
 
     def ensure_filtering_rules_for_instance(self, instance_ref, network_info):
@@ -439,9 +472,6 @@ class FakeDriver(driver.ComputeDriver):
             return 'enabled'
         return 'disabled'
 
-    def get_disk_available_least(self):
-        pass
-
     def get_volume_connector(self, instance):
         return {'ip': '127.0.0.1', 'initiator': 'fake', 'host': 'fakehost'}
 
@@ -451,33 +481,14 @@ class FakeDriver(driver.ComputeDriver):
     def instance_on_disk(self, instance):
         return False
 
-    def list_instance_uuids(self):
-        return []
-
 
 class FakeVirtAPI(virtapi.VirtAPI):
-    def instance_update(self, context, instance_uuid, updates):
-        return db.instance_update_and_get_original(context,
-                                                   instance_uuid,
-                                                   updates)
-
     def provider_fw_rule_get_all(self, context):
         return db.provider_fw_rule_get_all(context)
 
-    def agent_build_get_by_triple(self, context, hypervisor, os, architecture):
-        return db.agent_build_get_by_triple(context,
-                                            hypervisor, os, architecture)
-
-    def flavor_get(self, context, flavor_id):
-        return db.flavor_get(context, flavor_id)
-
-    def block_device_mapping_get_all_by_instance(self, context, instance,
-                                                 legacy=True):
-        bdms = db.block_device_mapping_get_all_by_instance(context,
-                                                           instance['uuid'])
-        if legacy:
-            bdms = block_device.legacy_mapping(bdms)
-        return bdms
-
-    def block_device_mapping_update(self, context, bdm_id, values):
-        return db.block_device_mapping_update(context, bdm_id, values)
+    @contextlib.contextmanager
+    def wait_for_instance_event(self, instance, event_names, deadline=300,
+                                error_callback=None):
+        # NOTE(danms): Don't actually wait for any events, just
+        # fall through
+        yield

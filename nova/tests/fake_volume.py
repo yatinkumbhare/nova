@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -19,7 +17,7 @@ import uuid
 from oslo.config import cfg
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 
@@ -164,7 +162,7 @@ class API(object):
         return v.vol
 
     def get(self, context, volume_id):
-        if volume_id == 87654321:
+        if str(volume_id) == '87654321':
             return {'id': volume_id,
                     'attach_time': '13:56:24',
                     'attach_status': 'attached',
@@ -202,7 +200,7 @@ class API(object):
             msg = _("already detached")
             raise exception.InvalidVolume(reason=msg)
 
-    def attach(self, context, volume_id, instance_uuid, mountpoint):
+    def attach(self, context, volume_id, instance_uuid, mountpoint, mode='rw'):
         LOG.info('attaching volume %s', volume_id)
         volume = self.get(context, volume_id)
         volume['status'] = 'in-use'

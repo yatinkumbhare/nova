@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -20,10 +18,11 @@ Management class for migration / resize operations.
 """
 import os
 
+from nova.i18n import _
 from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
-from nova import unit
+from nova.openstack.common import units
+from nova.virt import configdrive
 from nova.virt.hyperv import imagecache
 from nova.virt.hyperv import utilsfactory
 from nova.virt.hyperv import vmops
@@ -44,12 +43,14 @@ class MigrationOps(object):
         self._imagecache = imagecache.ImageCache()
 
     def _migrate_disk_files(self, instance_name, disk_files, dest):
+        # TODO(mikal): it would be nice if this method took a full instance,
+        # because it could then be passed to the log messages below.
         same_host = False
         if dest in self._hostutils.get_local_ips():
             same_host = True
-            LOG.debug(_("Migration target is the source host"))
+            LOG.debug("Migration target is the source host")
         else:
-            LOG.debug(_("Migration target host: %s") % dest)
+            LOG.debug("Migration target host: %s", dest)
 
         instance_path = self._pathutils.get_instance_dir(instance_name)
         revert_path = self._pathutils.get_instance_migr_revert_dir(
@@ -70,8 +71,8 @@ class MigrationOps(object):
             for disk_file in disk_files:
                 # Skip the config drive as the instance is already configured
                 if os.path.basename(disk_file).lower() != 'configdrive.vhd':
-                    LOG.debug(_('Copying disk "%(disk_file)s" to '
-                                '"%(dest_path)s"'),
+                    LOG.debug('Copying disk "%(disk_file)s" to '
+                              '"%(dest_path)s"',
                               {'disk_file': disk_file, 'dest_path': dest_path})
                     self._pathutils.copy(disk_file, dest_path)
 
@@ -110,7 +111,7 @@ class MigrationOps(object):
     def migrate_disk_and_power_off(self, context, instance, dest,
                                    flavor, network_info,
                                    block_device_info=None):
-        LOG.debug(_("migrate_disk_and_power_off called"), instance=instance)
+        LOG.debug("migrate_disk_and_power_off called", instance=instance)
 
         self._check_target_flavor(instance, flavor)
 
@@ -130,7 +131,7 @@ class MigrationOps(object):
         return ""
 
     def confirm_migration(self, migration, instance, network_info):
-        LOG.debug(_("confirm_migration called"), instance=instance)
+        LOG.debug("confirm_migration called", instance=instance)
 
         self._pathutils.get_instance_migr_revert_dir(instance['name'],
                                                      remove_dir=True)
@@ -143,9 +144,20 @@ class MigrationOps(object):
             instance_name)
         self._pathutils.rename(revert_path, instance_path)
 
+    def _check_and_attach_config_drive(self, instance):
+        if configdrive.required_by(instance):
+            configdrive_path = self._pathutils.lookup_configdrive_path(
+                instance.name)
+            if configdrive_path:
+                self._vmops.attach_config_drive(instance, configdrive_path)
+            else:
+                raise vmutils.HyperVException(
+                    _("Config drive is required by instance: %s, "
+                      "but it does not exist.") % instance.name)
+
     def finish_revert_migration(self, context, instance, network_info,
                                 block_device_info=None, power_on=True):
-        LOG.debug(_("finish_revert_migration called"), instance=instance)
+        LOG.debug("finish_revert_migration called", instance=instance)
 
         instance_name = instance['name']
         self._revert_migration_files(instance_name)
@@ -160,6 +172,8 @@ class MigrationOps(object):
         self._vmops.create_instance(instance, network_info, block_device_info,
                                     root_vhd_path, eph_vhd_path)
 
+        self._check_and_attach_config_drive(instance)
+
         if power_on:
             self._vmops.power_on(instance)
 
@@ -167,22 +181,22 @@ class MigrationOps(object):
         base_vhd_copy_path = os.path.join(os.path.dirname(diff_vhd_path),
                                           os.path.basename(base_vhd_path))
         try:
-            LOG.debug(_('Copying base disk %(base_vhd_path)s to '
-                        '%(base_vhd_copy_path)s'),
+            LOG.debug('Copying base disk %(base_vhd_path)s to '
+                      '%(base_vhd_copy_path)s',
                       {'base_vhd_path': base_vhd_path,
                        'base_vhd_copy_path': base_vhd_copy_path})
             self._pathutils.copyfile(base_vhd_path, base_vhd_copy_path)
 
-            LOG.debug(_("Reconnecting copied base VHD "
-                        "%(base_vhd_copy_path)s and diff "
-                        "VHD %(diff_vhd_path)s"),
+            LOG.debug("Reconnecting copied base VHD "
+                      "%(base_vhd_copy_path)s and diff "
+                      "VHD %(diff_vhd_path)s",
                       {'base_vhd_copy_path': base_vhd_copy_path,
                        'diff_vhd_path': diff_vhd_path})
             self._vhdutils.reconnect_parent_vhd(diff_vhd_path,
                                                 base_vhd_copy_path)
 
-            LOG.debug(_("Merging base disk %(base_vhd_copy_path)s and "
-                        "diff disk %(diff_vhd_path)s"),
+            LOG.debug("Merging base disk %(base_vhd_copy_path)s and "
+                      "diff disk %(diff_vhd_path)s",
                       {'base_vhd_copy_path': base_vhd_copy_path,
                        'diff_vhd_path': diff_vhd_path})
             self._vhdutils.merge_vhd(diff_vhd_path, base_vhd_copy_path)
@@ -204,14 +218,14 @@ class MigrationOps(object):
 
     def _resize_vhd(self, vhd_path, new_size):
         if vhd_path.split('.')[-1].lower() == "vhd":
-            LOG.debug(_("Getting parent disk info for disk: %s"), vhd_path)
+            LOG.debug("Getting parent disk info for disk: %s", vhd_path)
             base_disk_path = self._vhdutils.get_vhd_parent_path(vhd_path)
             if base_disk_path:
                 # A differential VHD cannot be resized. This limitation
                 # does not apply to the VHDX format.
                 self._merge_base_vhd(vhd_path, base_disk_path)
-        LOG.debug(_("Resizing disk \"%(vhd_path)s\" to new max "
-                    "size %(new_size)s"),
+        LOG.debug("Resizing disk \"%(vhd_path)s\" to new max "
+                  "size %(new_size)s",
                   {'vhd_path': vhd_path, 'new_size': new_size})
         self._vhdutils.resize_vhd(vhd_path, new_size)
 
@@ -222,9 +236,9 @@ class MigrationOps(object):
         # If the location of the base host differs between source
         # and target hosts we need to reconnect the base disk
         if src_base_disk_path.lower() != base_vhd_path.lower():
-            LOG.debug(_("Reconnecting copied base VHD "
-                        "%(base_vhd_path)s and diff "
-                        "VHD %(diff_vhd_path)s"),
+            LOG.debug("Reconnecting copied base VHD "
+                      "%(base_vhd_path)s and diff "
+                      "VHD %(diff_vhd_path)s",
                       {'base_vhd_path': base_vhd_path,
                        'diff_vhd_path': diff_vhd_path})
             self._vhdutils.reconnect_parent_vhd(diff_vhd_path,
@@ -233,7 +247,7 @@ class MigrationOps(object):
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance=False,
                          block_device_info=None, power_on=True):
-        LOG.debug(_("finish_migration called"), instance=instance)
+        LOG.debug("finish_migration called", instance=instance)
 
         instance_name = instance['name']
 
@@ -253,12 +267,12 @@ class MigrationOps(object):
                                       src_base_disk_path)
 
             if resize_instance:
-                new_size = instance['root_gb'] * unit.Gi
+                new_size = instance['root_gb'] * units.Gi
                 self._check_resize_vhd(root_vhd_path, root_vhd_info, new_size)
 
         eph_vhd_path = self._pathutils.lookup_ephemeral_vhd_path(instance_name)
         if resize_instance:
-            new_size = instance.get('ephemeral_gb', 0) * unit.Gi
+            new_size = instance.get('ephemeral_gb', 0) * units.Gi
             if not eph_vhd_path:
                 if new_size:
                     eph_vhd_path = self._vmops.create_ephemeral_vhd(instance)
@@ -268,5 +282,8 @@ class MigrationOps(object):
 
         self._vmops.create_instance(instance, network_info, block_device_info,
                                     root_vhd_path, eph_vhd_path)
+
+        self._check_and_attach_config_drive(instance)
+
         if power_on:
             self._vmops.power_on(instance)

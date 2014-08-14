@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright (c) 2011-2013 University of Southern California / ISI
@@ -20,6 +19,7 @@
 
 import os
 
+import mox
 from oslo.config import cfg
 
 from nova import exception
@@ -167,7 +167,7 @@ class TileraClassMethodsTestCase(BareMetalTileraTestCase):
 
     def test_swap_not_zero(self):
         # override swap to 0
-        flavor = utils.get_test_instance_type(self.context)
+        flavor = utils.get_test_flavor(self.context)
         flavor['swap'] = 0
         self.instance = utils.get_test_instance(self.context, flavor)
 
@@ -217,9 +217,13 @@ class TileraPrivateMethodsTestCase(BareMetalTileraTestCase):
 
     def test_cache_image(self):
         self.mox.StubOutWithMock(os, 'makedirs')
+        self.mox.StubOutWithMock(os, 'unlink')
         self.mox.StubOutWithMock(os.path, 'exists')
-        os.makedirs(tilera.get_image_dir_path(self.instance)).\
-                AndReturn(True)
+        os.makedirs(tilera.get_image_dir_path(self.instance)).AndReturn(True)
+        disk_path = os.path.join(
+            tilera.get_image_dir_path(self.instance), 'disk')
+        os.path.exists(disk_path).AndReturn(True)
+        os.unlink(disk_path).AndReturn(None)
         os.path.exists(tilera.get_image_file_path(self.instance)).\
                 AndReturn(True)
         self.mox.ReplayAll()
@@ -239,6 +243,9 @@ class TileraPrivateMethodsTestCase(BareMetalTileraTestCase):
         net_info = utils.get_test_network_info(1)
         net = tilera.build_network_config(net_info)
         admin_password = 'fake password'
+
+        self.mox.StubOutWithMock(os.path, 'exists')
+        os.path.exists(mox.IgnoreArg()).AndReturn(True)
 
         self.mox.StubOutWithMock(disk_api, 'inject_data')
         disk_api.inject_data(
@@ -304,11 +311,8 @@ class TileraPublicMethodsTestCase(BareMetalTileraTestCase):
                 'kernel': [None, 'cccc'],
             }
         self.instance['uuid'] = 'fake-uuid'
-        iqn = "iqn-%s" % self.instance['uuid']
-        tilera_config = 'this is a fake tilera config'
-        self.instance['uuid'] = 'fake-uuid'
-        tilera_path = tilera.get_tilera_nfs_path(self.instance)
-        image_path = tilera.get_image_file_path(self.instance)
+        tilera.get_tilera_nfs_path(self.instance)
+        tilera.get_image_file_path(self.instance)
 
         self.mox.StubOutWithMock(tilera, 'get_tftp_image_info')
         self.mox.StubOutWithMock(tilera, 'get_partition_sizes')
@@ -326,8 +330,8 @@ class TileraPublicMethodsTestCase(BareMetalTileraTestCase):
     def test_activate_and_deactivate_bootloader(self):
         self._create_node()
         self.instance['uuid'] = 'fake-uuid'
-        tilera_path = tilera.get_tilera_nfs_path(self.instance)
-        image_path = tilera.get_image_file_path(self.instance)
+        tilera.get_tilera_nfs_path(self.instance)
+        tilera.get_image_file_path(self.instance)
 
         self.mox.ReplayAll()
 
@@ -357,7 +361,7 @@ class TileraPublicMethodsTestCase(BareMetalTileraTestCase):
         self.mox.StubOutWithMock(tilera, 'get_tftp_image_info')
         self.mox.StubOutWithMock(self.driver, '_collect_mac_addresses')
 
-        tilera_path = tilera.get_tilera_nfs_path(self.node['id'])
+        tilera.get_tilera_nfs_path(self.node['id'])
 
         tilera.get_tftp_image_info(self.instance).\
                 AndRaise(exception.NovaException)

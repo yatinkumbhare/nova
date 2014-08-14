@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -47,7 +45,7 @@ class FoxInSocksServerControllerExtension(wsgi.Controller):
 class FoxInSocksFlavorGooseControllerExtension(wsgi.Controller):
     @wsgi.extends
     def show(self, req, resp_obj, id):
-        #NOTE: This only handles JSON responses.
+        # NOTE: This only handles JSON responses.
         # You can use content type header to test for XML.
         resp_obj.obj['flavor']['googoose'] = req.GET.get('chewing')
 
@@ -55,7 +53,7 @@ class FoxInSocksFlavorGooseControllerExtension(wsgi.Controller):
 class FoxInSocksFlavorBandsControllerExtension(wsgi.Controller):
     @wsgi.extends
     def show(self, req, resp_obj, id):
-        #NOTE: This only handles JSON responses.
+        # NOTE: This only handles JSON responses.
         # You can use content type header to test for XML.
         resp_obj.obj['big_bands'] = 'Pig Bands!'
 

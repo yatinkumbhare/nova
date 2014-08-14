@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -20,11 +18,10 @@ Starting point for routing EC2 requests.
 
 """
 
-import urlparse
-
 from eventlet.green import httplib
 from oslo.config import cfg
 import six
+import six.moves.urllib.parse as urlparse
 import webob
 import webob.dec
 import webob.exc
@@ -35,7 +32,9 @@ from nova.api.ec2 import faults
 from nova.api import validator
 from nova import context
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova.i18n import _LE
+from nova.i18n import _LW
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
@@ -78,7 +77,7 @@ CONF.register_opts(ec2_opts)
 CONF.import_opt('use_forwarded_for', 'nova.api.auth')
 
 
-## Fault Wrapper around all EC2 requests ##
+# Fault Wrapper around all EC2 requests
 class FaultWrapper(wsgi.Middleware):
     """Calls the middleware stack, captures any exceptions into faults."""
 
@@ -126,7 +125,7 @@ class RequestLogging(wsgi.Middleware):
             request.user_agent,
             request.content_type,
             response.content_type,
-            context=ctxt)
+            context=ctxt)    # noqa
 
 
 class Lockout(wsgi.Middleware):
@@ -159,7 +158,7 @@ class Lockout(wsgi.Middleware):
         failures = int(self.mc.get(failures_key) or 0)
         if failures >= CONF.lockout_attempts:
             detail = _("Too many failed authentications.")
-            raise webob.exc.HTTPForbidden(detail=detail)
+            raise webob.exc.HTTPForbidden(explanation=detail)
         res = req.get_response(self.application)
         if res.status_int == 403:
             failures = self.mc.incr(failures_key)
@@ -167,9 +166,9 @@ class Lockout(wsgi.Middleware):
                 # NOTE(vish): To use incr, failures has to be a string.
                 self.mc.set(failures_key, '1', time=CONF.lockout_window * 60)
             elif failures >= CONF.lockout_attempts:
-                LOG.warn(_('Access key %(access_key)s has had %(failures)d '
-                           'failed authentications and will be locked out '
-                           'for %(lock_mins)d minutes.'),
+                LOG.warn(_LW('Access key %(access_key)s has had %(failures)d '
+                             'failed authentications and will be locked out '
+                             'for %(lock_mins)d minutes.'),
                          {'access_key': access_key,
                           'failures': failures,
                           'lock_mins': CONF.lockout_minutes})
@@ -242,7 +241,7 @@ class EC2KeystoneAuth(wsgi.Middleware):
             roles = [role['name'] for role
                      in result['access']['user']['roles']]
         except (AttributeError, KeyError) as e:
-            LOG.exception(_("Keystone failure: %s") % e)
+            LOG.error(_LE("Keystone failure: %s"), e)
             msg = _("Failure communicating with keystone")
             return faults.ec2_error_response(request_id, "AuthFailure", msg,
                                              status=400)
@@ -304,8 +303,8 @@ class Requestify(wsgi.Middleware):
                             expires=CONF.ec2_timestamp_expiry)
             if expired:
                 msg = _("Timestamp failed validation.")
-                LOG.exception(msg)
-                raise webob.exc.HTTPForbidden(detail=msg)
+                LOG.debug("Timestamp failed validation")
+                raise webob.exc.HTTPForbidden(explanation=msg)
 
             # Raise KeyError if omitted
             action = req.params['Action']
@@ -323,9 +322,9 @@ class Requestify(wsgi.Middleware):
         except exception.InvalidRequest as err:
             raise webob.exc.HTTPBadRequest(explanation=unicode(err))
 
-        LOG.debug(_('action: %s'), action)
+        LOG.debug('action: %s', action)
         for key, value in args.items():
-            LOG.debug(_('arg: %(key)s\t\tval: %(value)s'),
+            LOG.debug('arg: %(key)s\t\tval: %(value)s',
                       {'key': key, 'value': value})
 
         # Success!
@@ -471,8 +470,7 @@ def exception_to_ec2code(ex):
 
 
 def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
-    """
-    Return an EC2 error response based on passed exception and log
+    """Return an EC2 error response based on passed exception and log
     the exception on an appropriate log level:
 
         * DEBUG: expected errors
@@ -482,7 +480,7 @@ def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
     status codes are always returned for them.
 
     Unexpected 5xx errors may contain sensitive information,
-    supress their messages for security.
+    suppress their messages for security.
     """
     if not code:
         code = exception_to_ec2code(ex)
@@ -492,22 +490,17 @@ def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
 
     if unexpected:
         log_fun = LOG.error
-        if ex.args and status < 500:
-            log_msg = _("Unexpected %(ex_name)s raised: %(ex_str)s")
-        else:
-            log_msg = _("Unexpected %(ex_name)s raised")
+        log_msg = _LE("Unexpected %(ex_name)s raised: %(ex_str)s")
     else:
         log_fun = LOG.debug
-        if ex.args:
-            log_msg = _("%(ex_name)s raised: %(ex_str)s")
-        else:
-            log_msg = _("%(ex_name)s raised")
+        log_msg = "%(ex_name)s raised: %(ex_str)s"
         # NOTE(jruzicka): For compatibility with EC2 API, treat expected
         # exceptions as client (4xx) errors. The exception error code is 500
         # by default and most exceptions inherit this from NovaException even
         # though they are actually client errors in most cases.
         if status >= 500:
             status = 400
+
     context = req.environ['nova.context']
     request_id = context.request_id
     log_msg_args = {
@@ -524,7 +517,7 @@ def ec2_error_ex(ex, req, code=None, message=None, unexpected=False):
         for k in env.keys():
             if not isinstance(env[k], six.string_types):
                 env.pop(k)
-        log_fun(_('Environment: %s') % jsonutils.dumps(env))
+        log_fun(_LE('Environment: %s'), jsonutils.dumps(env))
     if not message:
         message = _('Unknown error occurred.')
     return faults.ec2_error_response(request_id, code, message, status=status)
@@ -543,7 +536,6 @@ class Executor(wsgi.Application):
     def __call__(self, req):
         context = req.environ['nova.context']
         api_request = req.environ['ec2.request']
-        result = None
         try:
             result = api_request.invoke(context)
         except exception.InstanceNotFound as ex:
@@ -572,7 +564,7 @@ class Executor(wsgi.Application):
                 exception.MissingParameter,
                 exception.NoFloatingIpInterface,
                 exception.NoMoreFixedIps,
-                exception.NotAuthorized,
+                exception.Forbidden,
                 exception.QuotaError,
                 exception.SecurityGroupExists,
                 exception.SecurityGroupLimitExceeded,

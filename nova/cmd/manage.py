@@ -1,9 +1,8 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
+# Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -55,30 +54,34 @@
 
 from __future__ import print_function
 
+import argparse
 import os
 import sys
 
+import decorator
 import netaddr
 from oslo.config import cfg
+from oslo import messaging
 import six
 
 from nova.api.ec2 import ec2utils
 from nova import availability_zones
-from nova.cells import rpc_driver
 from nova.compute import flavors
 from nova import config
 from nova import context
 from nova import db
 from nova.db import migration
 from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova.openstack.common import cliutils
 from nova.openstack.common.db import exception as db_exc
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
-from nova.openstack.common import rpc
 from nova import quota
+from nova import rpc
 from nova import servicegroup
+from nova import utils
 from nova import version
 
 CONF = cfg.CONF
@@ -224,8 +227,7 @@ class ProjectCommands(object):
     @args('--key', metavar='<key>', help='Key')
     @args('--value', metavar='<value>', help='Value')
     def quota(self, project_id, user_id=None, key=None, value=None):
-        """
-        Create, update or display quotas for project/user
+        """Create, update or display quotas for project/user
 
         If no quota key is provided, the quota will be displayed.
         If a valid quota key is provided and it does not exist,
@@ -254,10 +256,10 @@ class ProjectCommands(object):
                     return(2)
                 if ((int(value) < minimum) and
                    (maximum != -1 or (maximum == -1 and int(value) != -1))):
-                    print(_('Quota limit must greater than %s.') % minimum)
+                    print(_('Quota limit must be greater than %s.') % minimum)
                     return(2)
                 if maximum != -1 and int(value) > maximum:
-                    print(_('Quota limit must less than %s.') % maximum)
+                    print(_('Quota limit must be less than %s.') % maximum)
                     return(2)
                 try:
                     db.quota_create(ctxt, project_id, key, value,
@@ -402,8 +404,7 @@ class FloatingIpCommands(object):
 
     @staticmethod
     def address_to_hosts(addresses):
-        """
-        Iterate over hosts within an address range.
+        """Iterate over hosts within an address range.
 
         If an explicit range specifier is missing, the parameter is
         interpreted as a specific individual address.
@@ -486,9 +487,20 @@ class FloatingIpCommands(object):
                                           floating_ip['interface']))
 
 
+@decorator.decorator
+def validate_network_plugin(f, *args, **kwargs):
+    """Decorator to validate the network plugin."""
+    if utils.is_neutron():
+        print(_("ERROR: Network commands are not supported when using the "
+                "Neutron API.  Use python-neutronclient instead."))
+        return(2)
+    return f(*args, **kwargs)
+
+
 class NetworkCommands(object):
     """Class for managing networks."""
 
+    @validate_network_plugin
     @args('--label', metavar='<label>', help='Label for network (ex: public)')
     @args('--fixed_range_v4', dest='cidr', metavar='<x.x.x.x/yy>',
             help='IPv4 subnet (ex: 10.0.0.0/8)')
@@ -496,7 +508,9 @@ class NetworkCommands(object):
             help='Number of networks to create')
     @args('--network_size', metavar='<number>',
             help='Number of IPs per network')
-    @args('--vlan', dest='vlan_start', metavar='<vlan id>', help='vlan id')
+    @args('--vlan', metavar='<vlan id>', help='vlan id')
+    @args('--vlan_start', dest='vlan_start', metavar='<vlan start id>',
+          help='vlan start id')
     @args('--vpn', dest='vpn_start', help='vpn start')
     @args('--fixed_range_v6', dest='cidr_v6',
           help='IPv6 subnet (ex: fe80::/64')
@@ -517,8 +531,8 @@ class NetworkCommands(object):
           help='Project id')
     @args('--priority', metavar="<number>", help='Network interface priority')
     def create(self, label=None, cidr=None, num_networks=None,
-               network_size=None, multi_host=None, vlan_start=None,
-               vpn_start=None, cidr_v6=None, gateway=None,
+               network_size=None, multi_host=None, vlan=None,
+               vlan_start=None, vpn_start=None, cidr_v6=None, gateway=None,
                gateway_v6=None, bridge=None, bridge_interface=None,
                dns1=None, dns2=None, project_id=None, priority=None,
                uuid=None, fixed_cidr=None):
@@ -530,6 +544,7 @@ class NetworkCommands(object):
         net_manager = importutils.import_object(CONF.network_manager)
         net_manager.create_networks(context.get_admin_context(), **kwargs)
 
+    @validate_network_plugin
     def list(self):
         """List all created networks."""
         _fmt = "%-5s\t%-18s\t%-15s\t%-15s\t%-15s\t%-15s\t%-15s\t%-15s\t%-15s"
@@ -561,11 +576,11 @@ class NetworkCommands(object):
                               network.project_id,
                               network.uuid))
 
+    @validate_network_plugin
     @args('--fixed_range', metavar='<x.x.x.x/yy>', help='Network to delete')
     @args('--uuid', metavar='<uuid>', help='UUID of network to delete')
     def delete(self, fixed_range=None, uuid=None):
         """Deletes a network."""
-
         if fixed_range is None and uuid is None:
             raise Exception(_("Please specify either fixed_range or uuid"))
 
@@ -581,6 +596,7 @@ class NetworkCommands(object):
         net_manager.delete_network(context.get_admin_context(),
             fixed_range, uuid)
 
+    @validate_network_plugin
     @args('--fixed_range', metavar='<x.x.x.x/yy>', help='Network to modify')
     @args('--project', metavar='<project name>',
             help='Project name to associate')
@@ -598,10 +614,10 @@ class NetworkCommands(object):
         admin_context = context.get_admin_context()
         network = db.network_get_by_cidr(admin_context, fixed_range)
         net = {}
-        #User can choose the following actions each for project and host.
-        #1) Associate (set not None value given by project/host parameter)
-        #2) Disassociate (set None by disassociate parameter)
-        #3) Keep unchanged (project/host key is not added to 'net')
+        # User can choose the following actions each for project and host.
+        # 1) Associate (set not None value given by project/host parameter)
+        # 2) Disassociate (set None by disassociate parameter)
+        # 3) Keep unchanged (project/host key is not added to 'net')
         if dis_project:
             net['project_id'] = None
         if dis_host:
@@ -680,8 +696,8 @@ class ServiceCommands(object):
     @args('--host', metavar='<host>', help='Host')
     @args('--service', metavar='<service>', help='Nova service')
     def list(self, host=None, service=None):
-        """
-        Show a list of all running services. Filter by host & service name.
+        """Show a list of all running services. Filter by host & service
+        name
         """
         servicegroup_api = servicegroup.API()
         ctxt = context.get_admin_context()
@@ -802,7 +818,7 @@ class ServiceCommands(object):
             result = self._show_host_resources(context.get_admin_context(),
                                                host=host)
         except exception.NovaException as ex:
-            print (_("error: %s") % ex)
+            print(_("error: %s") % ex)
             return 2
 
         if not isinstance(result, dict):
@@ -909,6 +925,10 @@ class FlavorCommands(object):
 
     Note instance type is a deprecated synonym for flavor.
     """
+
+    description = ('DEPRECATED: Use the nova flavor-* commands from '
+                   'python-novaclient instead. The flavor subcommand will be '
+                   'removed in the 2015.1 release')
 
     def _print_flavors(self, val):
         is_public = ('private', 'public')[val["is_public"] == 1]
@@ -1200,19 +1220,19 @@ class CellCommands(object):
             return(2)
 
         # Set up the transport URL
-        transport = {
-            'username': username,
-            'password': password,
-            'hostname': hostname,
-            'port': int(port),
-            'virtual_host': virtual_host,
-        }
-        transport_url = rpc_driver.unparse_transport_url(transport)
+        transport_host = messaging.TransportHost(hostname=hostname,
+                                                 port=int(port),
+                                                 username=username,
+                                                 password=password)
+
+        transport_url = rpc.get_transport_url()
+        transport_url.hosts.append(transport_host)
+        transport_url.virtual_host = virtual_host
 
         is_parent = cell_type == 'parent'
         values = {'name': name,
                   'is_parent': is_parent,
-                  'transport_url': transport_url,
+                  'transport_url': str(transport_url),
                   'weight_offset': float(woffset),
                   'weight_scale': float(wscale)}
         ctxt = context.get_admin_context()
@@ -1233,11 +1253,12 @@ class CellCommands(object):
         print(fmt % ('-' * 3, '-' * 10, '-' * 6, '-' * 10, '-' * 15,
                 '-' * 5, '-' * 10))
         for cell in cells:
-            transport = rpc_driver.parse_transport_url(cell.transport_url)
+            url = rpc.get_transport_url(cell.transport_url)
+            host = url.hosts[0] if url.hosts else messaging.TransportHost()
             print(fmt % (cell.id, cell.name,
                     'parent' if cell.is_parent else 'child',
-                    transport['username'], transport['hostname'],
-                    transport['port'], transport['virtual_host']))
+                    host.username, host.hostname,
+                    host.port, url.virtual_host))
         print(fmt % ('-' * 3, '-' * 10, '-' * 6, '-' * 10, '-' * 15,
                 '-' * 5, '-' * 10))
 
@@ -1251,8 +1272,6 @@ CATEGORIES = {
     'flavor': FlavorCommands,
     'floating': FloatingIpCommands,
     'host': HostCommands,
-    # Deprecated, remove in Icehouse
-    'instance_type': FlavorCommands,
     'logs': GetLogCommands,
     'network': NetworkCommands,
     'project': ProjectCommands,
@@ -1284,13 +1303,14 @@ def add_command_parsers(subparsers):
     for category in CATEGORIES:
         command_object = CATEGORIES[category]()
 
-        parser = subparsers.add_parser(category)
+        desc = getattr(command_object, 'description', None)
+        parser = subparsers.add_parser(category, description=desc)
         parser.set_defaults(command_object=command_object)
 
         category_subparsers = parser.add_subparsers(dest='action')
 
         for (action, action_fn) in methods_of(command_object):
-            parser = category_subparsers.add_parser(action)
+            parser = category_subparsers.add_parser(action, description=desc)
 
             action_kwargs = []
             for args, kwargs in getattr(action_fn, 'args', []):
@@ -1309,7 +1329,8 @@ def add_command_parsers(subparsers):
             parser.set_defaults(action_fn=action_fn)
             parser.set_defaults(action_kwargs=action_kwargs)
 
-            parser.add_argument('action_args', nargs='*')
+            parser.add_argument('action_args', nargs='*',
+                                help=argparse.SUPPRESS)
 
 
 category_opt = cfg.SubCommandOpt('category',
@@ -1336,6 +1357,8 @@ def main():
 
         print(_('Please re-run nova-manage as root.'))
         return(2)
+
+    objects.register_all()
 
     if CONF.category.name == "version":
         print(version.version_string_with_package())

@@ -59,8 +59,9 @@ class ServerVirtualInterfaceController(object):
     def _items(self, req, server_id, entity_maker):
         """Returns a list of VIFs, transformed through entity_maker."""
         context = req.environ['nova.context']
+        instance = common.get_instance(self.compute_api, context, server_id,
+                                       want_objects=True)
 
-        instance = self.compute_api.get(context, server_id)
         vifs = self.network_api.get_vifs_by_instance(context, instance)
         limited_list = common.limited(vifs, req)
         res = [entity_maker(context, vif) for vif in limited_list]
@@ -81,7 +82,7 @@ class Virtual_interfaces(extensions.ExtensionDescriptor):
     alias = "os-virtual-interfaces"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "virtual_interfaces/api/v1.1")
-    updated = "2011-08-17T00:00:00+00:00"
+    updated = "2011-08-17T00:00:00Z"
 
     def get_resources(self):
         resources = []

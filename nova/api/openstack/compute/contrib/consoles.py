@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -20,7 +18,7 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 
 authorize = extensions.extension_authorizer('compute', 'consoles')
@@ -41,7 +39,7 @@ class ConsolesController(wsgi.Controller):
         console_type = body['os-getVNCConsole'].get('type')
 
         try:
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id, want_objects=True)
             output = self.compute_api.get_vnc_console(context,
                                                       instance,
                                                       console_type)
@@ -50,6 +48,9 @@ class ConsolesController(wsgi.Controller):
         except exception.InstanceNotReady as e:
             raise webob.exc.HTTPConflict(
                     explanation=_('Instance not yet ready'))
+        except NotImplementedError:
+            msg = _("Unable to get vnc console, functionality not implemented")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
 
         return {'console': {'type': console_type, 'url': output['url']}}
 
@@ -71,16 +72,36 @@ class ConsolesController(wsgi.Controller):
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
         except exception.InstanceNotReady as e:
             raise webob.exc.HTTPConflict(explanation=e.format_message())
+        except NotImplementedError:
+            msg = _("Unable to get spice console, "
+                    "functionality not implemented")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
 
         return {'console': {'type': console_type, 'url': output['url']}}
 
-    def get_actions(self):
-        """Return the actions the extension adds, as required by contract."""
-        actions = [extensions.ActionExtension("servers", "os-getVNCConsole",
-                                              self.get_vnc_console),
-                   extensions.ActionExtension("servers", "os-getSPICEConsole",
-                                              self.get_spice_console)]
-        return actions
+    @wsgi.action('os-getRDPConsole')
+    def get_rdp_console(self, req, id, body):
+        """Get text console output."""
+        context = req.environ['nova.context']
+        authorize(context)
+
+        # If type is not supplied or unknown, get_rdp_console below will cope
+        console_type = body['os-getRDPConsole'].get('type')
+
+        try:
+            instance = self.compute_api.get(context, id, want_objects=True)
+            output = self.compute_api.get_rdp_console(context,
+                                                      instance,
+                                                      console_type)
+        except exception.InstanceNotFound as e:
+            raise webob.exc.HTTPNotFound(explanation=e.format_message())
+        except exception.InstanceNotReady as e:
+            raise webob.exc.HTTPConflict(explanation=e.format_message())
+        except NotImplementedError:
+            msg = _("Unable to get rdp console, functionality not implemented")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
+
+        return {'console': {'type': console_type, 'url': output['url']}}
 
 
 class Consoles(extensions.ExtensionDescriptor):
@@ -88,7 +109,7 @@ class Consoles(extensions.ExtensionDescriptor):
     name = "Consoles"
     alias = "os-consoles"
     namespace = "http://docs.openstack.org/compute/ext/os-consoles/api/v2"
-    updated = "2011-12-23T00:00:00+00:00"
+    updated = "2011-12-23T00:00:00Z"
 
     def get_controller_extensions(self):
         controller = ConsolesController()

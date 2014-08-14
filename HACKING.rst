@@ -13,6 +13,29 @@ Nova Specific Commandments
   This enforces a guideline defined in ``nova.openstack.common.db.sqlalchemy.session``
 - [N310] timeutils.utcnow() wrapper must be used instead of direct calls to
   datetime.datetime.utcnow() to make it easy to override its return value in tests
+- [N311] importing code from other virt drivers forbidden
+  Code that needs to be shared between virt drivers should be moved
+  into a common module
+- [N312] using config vars from other virt drivers forbidden
+  Config parameters that need to be shared between virt drivers
+  should be moved into a common module
+- [N313] capitalize help string
+  Config parameter help strings should have a capitalized first letter
+- [N314] vim configuration should not be kept in source files.
+- [N315] We do not use @authors tags in source files. We have git to track
+  authorship.
+- [N316] Change assertTrue(isinstance(A, B)) by optimal assert like
+  assertIsInstance(A, B).
+- [N317] Change assertEqual(type(A), B) by optimal assert like
+  assertIsInstance(A, B)
+- [N318] Change assertEqual(A, None) or assertEqual(None, A) by optimal assert like
+  assertIsNone(A)
+- [N319] Validate that debug level logs are not translated.
+- [N320] Setting CONF.* attributes directly in tests is forbidden. Use
+  self.flags(option=value) instead.
+- [N321] Validate that LOG messages, except debug ones, have translations
+- [N322] Method's default argument shouldn't be mutable
+- [N323] Ensure that the _() function is explicitly imported to ensure proper translations.
 
 Creating Unit Tests
 -------------------
@@ -36,6 +59,10 @@ the tests that OpenStack CI systems run. Behind the scenes, tox is running
 testr arguments that are needed to tox. For example, you can run:
 ``tox -- --analyze-isolation`` to cause tox to tell testr to add
 --analyze-isolation to its argument list.
+
+Python packages may also have dependencies that are outside of tox's ability
+to install. Please refer to doc/source/devref/development.environment.rst for
+a list of those packages on Ubuntu, Fedora and Mac OS X.
 
 It is also possible to run the tests inside of a virtual environment
 you have created, or it is possible that you have all of the dependencies

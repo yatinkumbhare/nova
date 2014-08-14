@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -30,8 +28,8 @@ import sys
 from oslo.config import cfg
 import webob.exc
 
+from nova.i18n import _
 from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import safe_utils
 
@@ -40,7 +38,7 @@ LOG = logging.getLogger(__name__)
 exc_log_opts = [
     cfg.BoolOpt('fatal_exception_format_errors',
                 default=False,
-                help='make exception message format errors fatal'),
+                help='Make exception message format errors fatal'),
 ]
 
 CONF = cfg.CONF
@@ -57,7 +55,7 @@ class ConvertedException(webob.exc.WSGIHTTPException):
 
 def _cleanse_dict(original):
     """Strip all admin_password, new_pass, rescue_pass keys from a dict."""
-    return dict((k, v) for k, v in original.iteritems() if not "_pass" in k)
+    return dict((k, v) for k, v in original.iteritems() if "_pass" not in k)
 
 
 def wrap_exception(notifier=None, get_notifier=None):
@@ -125,7 +123,7 @@ class NovaException(Exception):
                 # log the issue and the kwargs
                 LOG.exception(_('Exception in string format operation'))
                 for name, value in kwargs.iteritems():
-                    LOG.error("%s: %s" % (name, value))
+                    LOG.error("%s: %s" % (name, value))    # noqa
 
                 if CONF.fatal_exception_format_errors:
                     raise exc_info[0], exc_info[1], exc_info[2]
@@ -149,13 +147,17 @@ class DecryptionFailure(NovaException):
     msg_fmt = _("Failed to decrypt text: %(reason)s")
 
 
+class RevokeCertFailure(NovaException):
+    msg_fmt = _("Failed to revoke certificate for %(project_id)s")
+
+
 class VirtualInterfaceCreateException(NovaException):
     msg_fmt = _("Virtual Interface creation failed")
 
 
 class VirtualInterfaceMacAddressException(NovaException):
-    msg_fmt = _("5 attempts to create virtual interface"
-                "with unique mac address failed")
+    msg_fmt = _("Creation of virtual interface with "
+                "unique mac address failed")
 
 
 class GlanceConnectionFailed(NovaException):
@@ -163,17 +165,21 @@ class GlanceConnectionFailed(NovaException):
         "%(reason)s")
 
 
-class NotAuthorized(NovaException):
+class CinderConnectionFailed(NovaException):
+    msg_fmt = _("Connection to cinder host failed: %(reason)s")
+
+
+class Forbidden(NovaException):
     ec2_code = 'AuthFailure'
     msg_fmt = _("Not authorized.")
     code = 403
 
 
-class AdminRequired(NotAuthorized):
+class AdminRequired(Forbidden):
     msg_fmt = _("User does not have admin privileges")
 
 
-class PolicyNotAuthorized(NotAuthorized):
+class PolicyNotAuthorized(Forbidden):
     msg_fmt = _("Policy doesn't allow %(action)s to be performed.")
 
 
@@ -244,6 +250,10 @@ class InvalidBDMForLegacy(InvalidBDM):
                 "be converted to legacy format. ")
 
 
+class InvalidBDMVolumeNotBootable(InvalidBDM):
+    msg_fmt = _("Block Device %(id)s is not bootable.")
+
+
 class InvalidAttribute(Invalid):
     msg_fmt = _("Attribute not supported: %(attr)s")
 
@@ -265,7 +275,7 @@ class VolumeNotCreated(NovaException):
 
 class InvalidKeypair(Invalid):
     ec2_code = 'InvalidKeyPair.Format'
-    msg_fmt = _("Keypair data is invalid") + ": %(reason)s"
+    msg_fmt = _("Keypair data is invalid: %(reason)s")
 
 
 class InvalidRequest(Invalid):
@@ -273,12 +283,12 @@ class InvalidRequest(Invalid):
 
 
 class InvalidInput(Invalid):
-    msg_fmt = _("Invalid input received") + ": %(reason)s"
+    msg_fmt = _("Invalid input received: %(reason)s")
 
 
 class InvalidVolume(Invalid):
     ec2_code = 'UnsupportedOperation'
-    msg_fmt = _("Invalid volume") + ": %(reason)s"
+    msg_fmt = _("Invalid volume: %(reason)s")
 
 
 class InvalidVolumeAccessMode(Invalid):
@@ -286,11 +296,11 @@ class InvalidVolumeAccessMode(Invalid):
 
 
 class InvalidMetadata(Invalid):
-    msg_fmt = _("Invalid metadata") + ": %(reason)s"
+    msg_fmt = _("Invalid metadata: %(reason)s")
 
 
 class InvalidMetadataSize(Invalid):
-    msg_fmt = _("Invalid metadata size") + ": %(reason)s"
+    msg_fmt = _("Invalid metadata size: %(reason)s")
 
 
 class InvalidPortRange(Invalid):
@@ -335,6 +345,10 @@ class InvalidSortKey(Invalid):
     msg_fmt = _("Sort key supplied was not valid.")
 
 
+class InvalidStrTime(Invalid):
+    msg_fmt = _("Invalid datetime string: %(reason)s")
+
+
 class InstanceInvalidState(Invalid):
     msg_fmt = _("Instance %(instance_uuid)s in %(attr)s %(state)s. Cannot "
                 "%(method)s while the instance is in this state.")
@@ -357,35 +371,39 @@ class InstanceNotReady(Invalid):
 
 
 class InstanceSuspendFailure(Invalid):
-    msg_fmt = _("Failed to suspend instance") + ": %(reason)s"
+    msg_fmt = _("Failed to suspend instance: %(reason)s")
 
 
 class InstanceResumeFailure(Invalid):
-    msg_fmt = _("Failed to resume instance: %(reason)s.")
+    msg_fmt = _("Failed to resume instance: %(reason)s")
 
 
 class InstancePowerOnFailure(Invalid):
-    msg_fmt = _("Failed to power on instance: %(reason)s.")
+    msg_fmt = _("Failed to power on instance: %(reason)s")
 
 
 class InstancePowerOffFailure(Invalid):
-    msg_fmt = _("Failed to power off instance: %(reason)s.")
+    msg_fmt = _("Failed to power off instance: %(reason)s")
 
 
 class InstanceRebootFailure(Invalid):
-    msg_fmt = _("Failed to reboot instance") + ": %(reason)s"
+    msg_fmt = _("Failed to reboot instance: %(reason)s")
 
 
 class InstanceTerminationFailure(Invalid):
-    msg_fmt = _("Failed to terminate instance") + ": %(reason)s"
+    msg_fmt = _("Failed to terminate instance: %(reason)s")
 
 
 class InstanceDeployFailure(Invalid):
-    msg_fmt = _("Failed to deploy instance") + ": %(reason)s"
+    msg_fmt = _("Failed to deploy instance: %(reason)s")
 
 
 class MultiplePortsNotApplicable(Invalid):
-    msg_fmt = _("Failed to launch instances") + ": %(reason)s"
+    msg_fmt = _("Failed to launch instances: %(reason)s")
+
+
+class InvalidFixedIpAndMaxCountRequest(Invalid):
+    msg_fmt = _("Failed to launch instances: %(reason)s")
 
 
 class ServiceUnavailable(Invalid):
@@ -393,7 +411,7 @@ class ServiceUnavailable(Invalid):
 
 
 class ComputeResourcesUnavailable(ServiceUnavailable):
-    msg_fmt = _("Insufficient compute resources.")
+    msg_fmt = _("Insufficient compute resources: %(reason)s.")
 
 
 class HypervisorUnavailable(NovaException):
@@ -441,7 +459,7 @@ class DeviceIsBusy(Invalid):
 
 
 class InvalidCPUInfo(Invalid):
-    msg_fmt = _("Unacceptable CPU info") + ": %(reason)s"
+    msg_fmt = _("Unacceptable CPU info: %(reason)s")
 
 
 class InvalidIpAddressError(Invalid):
@@ -463,6 +481,14 @@ class InvalidVLANPortGroup(Invalid):
 
 class InvalidDiskFormat(Invalid):
     msg_fmt = _("Disk format %(disk_format)s is not acceptable")
+
+
+class InvalidDiskInfo(Invalid):
+    msg_fmt = _("Disk info file is invalid: %(reason)s")
+
+
+class DiskInfoReadWriteFail(Invalid):
+    msg_fmt = _("Failed to read or write disk info file: %(reason)s")
 
 
 class ImageUnacceptable(Invalid):
@@ -505,12 +531,16 @@ class AgentBuildExists(NovaException):
 
 
 class VolumeNotFound(NotFound):
-    ec2_code = 'InvalidVolumeID.NotFound'
+    ec2_code = 'InvalidVolume.NotFound'
     msg_fmt = _("Volume %(volume_id)s could not be found.")
 
 
+class VolumeBDMNotFound(NotFound):
+    msg_fmt = _("No volume Block Device Mapping with id %(volume_id)s.")
+
+
 class SnapshotNotFound(NotFound):
-    ec2_code = 'InvalidSnapshotID.NotFound'
+    ec2_code = 'InvalidSnapshot.NotFound'
     msg_fmt = _("Snapshot %(snapshot_id)s could not be found.")
 
 
@@ -533,6 +563,11 @@ class AutoDiskConfigDisabledByImage(Invalid):
 
 class ImageNotFound(NotFound):
     msg_fmt = _("Image %(image_id)s could not be found.")
+
+
+class PreserveEphemeralNotSupported(Invalid):
+    msg_fmt = _("The current driver does not support "
+                "preserving ephemeral partitions.")
 
 
 # NOTE(jruzicka): ImageNotFound is not a valid EC2 error code.
@@ -605,12 +640,30 @@ class NetworkAmbiguous(Invalid):
                 "network ID(s) to select which one(s) to connect to,")
 
 
+class NetworkRequiresSubnet(Invalid):
+    msg_fmt = _("Network %(network_uuid)s requires a subnet in order to boot"
+                " instances on.")
+
+
+class ExternalNetworkAttachForbidden(Forbidden):
+    msg_fmt = _("It is not allowed to create an interface on "
+                "external network %(network_uuid)s")
+
+
+class NetworkMissingPhysicalNetwork(NovaException):
+    msg_fmt = _("Physical network is missing for network %(network_uuid)s")
+
+
 class DatastoreNotFound(NotFound):
     msg_fmt = _("Could not find the datastore reference(s) which the VM uses.")
 
 
 class PortInUse(Invalid):
     msg_fmt = _("Port %(port_id)s is still in use.")
+
+
+class PortRequiresFixedIP(Invalid):
+    msg_fmt = _("Port %(port_id)s requires a FixedIP in order to be used.")
 
 
 class PortNotUsable(Invalid):
@@ -770,6 +823,10 @@ class InvalidQuotaValue(Invalid):
                 "resources: %(unders)s")
 
 
+class InvalidQuotaMethodUsage(Invalid):
+    msg_fmt = _("Wrong quota method %(method)s used on resource %(res)s")
+
+
 class QuotaNotFound(NotFound):
     msg_fmt = _("Quota could not be found")
 
@@ -902,6 +959,11 @@ class ConsoleTypeUnavailable(Invalid):
     msg_fmt = _("Unavailable console type %(console_type)s.")
 
 
+class ConsolePortRangeExhausted(NovaException):
+    msg_fmt = _("The console port range %(min_port)d-%(max_port)d is "
+                "exhausted.")
+
+
 class FlavorNotFound(NotFound):
     msg_fmt = _("Flavor %(flavor_id)s could not be found.")
 
@@ -913,6 +975,11 @@ class FlavorNotFoundByName(FlavorNotFound):
 class FlavorAccessNotFound(NotFound):
     msg_fmt = _("Flavor access not found for %(flavor_id)s / "
                 "%(project_id)s combination.")
+
+
+class FlavorExtraSpecUpdateCreateFailed(NovaException):
+    msg_fmt = _("Flavor %(id)d extra spec cannot be updated or created "
+                "after %(retries)d retries.")
 
 
 class CellNotFound(NotFound):
@@ -1028,12 +1095,16 @@ class InvalidLocalStorage(NovaException):
     msg_fmt = _("%(path)s is not on local storage: %(reason)s")
 
 
+class StorageError(NovaException):
+    msg_fmt = _("Storage error: %(reason)s")
+
+
 class MigrationError(NovaException):
-    msg_fmt = _("Migration error") + ": %(reason)s"
+    msg_fmt = _("Migration error: %(reason)s")
 
 
 class MigrationPreCheckError(MigrationError):
-    msg_fmt = _("Migration pre-check error") + ": %(reason)s"
+    msg_fmt = _("Migration pre-check error: %(reason)s")
 
 
 class MalformedRequestBody(NovaException):
@@ -1080,7 +1151,7 @@ class NoValidHost(NovaException):
 
 class QuotaError(NovaException):
     ec2_code = 'ResourceLimitExceeded'
-    msg_fmt = _("Quota exceeded") + ": code=%(code)s"
+    msg_fmt = _("Quota exceeded: code=%(code)s")
     code = 413
     headers = {'Retry-After': 0}
     safe = True
@@ -1235,11 +1306,13 @@ class ConfigDriveUnknownFormat(NovaException):
 
 
 class InterfaceAttachFailed(Invalid):
-    msg_fmt = _("Failed to attach network adapter device to %(instance)s")
+    msg_fmt = _("Failed to attach network adapter device to "
+                "%(instance_uuid)s")
 
 
 class InterfaceDetachFailed(Invalid):
-    msg_fmt = _("Failed to detach network adapter device from  %(instance)s")
+    msg_fmt = _("Failed to detach network adapter device from "
+                "%(instance_uuid)s")
 
 
 class InstanceUserDataTooLarge(NovaException):
@@ -1284,7 +1357,7 @@ class CryptoCRLFileNotFound(FileNotFound):
 
 
 class InstanceRecreateNotSupported(Invalid):
-    msg_fmt = _('Instance recreate is not implemented by this virt driver.')
+    msg_fmt = _('Instance recreate is not supported.')
 
 
 class ServiceGroupUnavailable(NovaException):
@@ -1343,8 +1416,16 @@ class IncompatibleObjectVersion(NovaException):
     msg_fmt = _('Version %(objver)s of %(objname)s is not supported')
 
 
+class ReadOnlyFieldError(NovaException):
+    msg_fmt = _('Cannot modify readonly field %(field)s')
+
+
 class ObjectActionError(NovaException):
     msg_fmt = _('Object action %(action)s failed because: %(reason)s')
+
+
+class ObjectFieldInvalid(NovaException):
+    msg_fmt = _('Field %(field)s of %(objname)s is not an instance of Field')
 
 
 class CoreAPIMissing(NovaException):
@@ -1414,6 +1495,17 @@ class ResourceMonitorError(NovaException):
 
 class PciDeviceWrongAddressFormat(NovaException):
     msg_fmt = _("The PCI address %(address)s has an incorrect format.")
+
+
+class PciDeviceInvalidAddressField(NovaException):
+    msg_fmt = _("Invalid PCI Whitelist: "
+                "The PCI address %(address)s has an invalid %(field)s.")
+
+
+class PciDeviceInvalidDeviceName(NovaException):
+    msg_fmt = _("Invalid PCI Whitelist: "
+                "The PCI whitelist can specify devname or address,"
+                " but not both")
 
 
 class PciDeviceNotFoundById(NotFound):
@@ -1492,5 +1584,58 @@ class KeyManagerError(NovaException):
     msg_fmt = _("Key manager error: %(reason)s")
 
 
+class VolumesNotRemoved(Invalid):
+    msg_fmt = _("Failed to remove volume(s): (%(reason)s)")
+
+
 class InvalidVideoMode(Invalid):
     msg_fmt = _("Provided video model (%(model)s) is not supported.")
+
+
+class RngDeviceNotExist(Invalid):
+    msg_fmt = _("The provided RNG device path: (%(path)s) is not "
+                "present on the host.")
+
+
+class RequestedVRamTooHigh(NovaException):
+    msg_fmt = _("The requested amount of video memory %(req_vram)d is higher "
+                "than the maximum allowed by flavor %(max_vram)d.")
+
+
+class InvalidWatchdogAction(Invalid):
+    msg_fmt = _("Provided watchdog action (%(action)s) is not supported.")
+
+
+class NoLiveMigrationForConfigDriveInLibVirt(NovaException):
+    msg_fmt = _("Live migration of instances with config drives is not "
+                "supported in libvirt unless libvirt instance path and "
+                "drive data is shared across compute nodes.")
+
+
+class LiveMigrationWithOldNovaNotSafe(NovaException):
+    msg_fmt = _("Host %(server)s is running an old version of Nova, "
+                "live migrations involving that version may cause data loss. "
+                "Upgrade Nova on %(server)s and try again.")
+
+
+class UnshelveException(NovaException):
+    msg_fmt = _("Error during unshelve instance %(instance_id)s: %(reason)s")
+
+
+class ImageVCPULimitsRangeExceeded(Invalid):
+    msg_fmt = _("Image vCPU limits %(sockets)d:%(cores)d:%(threads)d "
+                "exceeds permitted %(maxsockets)d:%(maxcores)d:%(maxthreads)d")
+
+
+class ImageVCPUTopologyRangeExceeded(Invalid):
+    msg_fmt = _("Image vCPU topology %(sockets)d:%(cores)d:%(threads)d "
+                "exceeds permitted %(maxsockets)d:%(maxcores)d:%(maxthreads)d")
+
+
+class ImageVCPULimitsRangeImpossible(Invalid):
+    msg_fmt = _("Requested vCPU limits %(sockets)d:%(cores)d:%(threads)d "
+                "are impossible to satisfy for vcpus count %(vcpus)d")
+
+
+class InvalidArchitectureName(Invalid):
+    msg_fmt = _("Architecture name '%(arch)s' is not recognised")

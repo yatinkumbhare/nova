@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Red Hat, Inc.
 # All Rights Reserved.
 #
@@ -21,7 +19,7 @@ from oslo.config import cfg
 import stevedore.driver
 import stevedore.extension
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)

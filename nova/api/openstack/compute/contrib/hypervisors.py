@@ -22,7 +22,8 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova import servicegroup
 
 
 authorize = extensions.extension_authorizer('compute', 'hypervisors')
@@ -31,6 +32,8 @@ authorize = extensions.extension_authorizer('compute', 'hypervisors')
 def make_hypervisor(elem, detail):
     elem.set('hypervisor_hostname')
     elem.set('id')
+    elem.set('state')
+    elem.set('status')
     if detail:
         elem.set('vcpus')
         elem.set('memory_mb')
@@ -46,11 +49,13 @@ def make_hypervisor(elem, detail):
         elem.set('running_vms')
         elem.set('cpu_info')
         elem.set('disk_available_least')
+        elem.set('host_ip')
 
         service = xmlutil.SubTemplateElement(elem, 'service',
                                              selector='service')
         service.set('id')
         service.set('host')
+        service.set('disabled_reason')
 
 
 class HypervisorIndexTemplate(xmlutil.TemplateBuilder):
@@ -125,9 +130,11 @@ class HypervisorStatisticsTemplate(xmlutil.TemplateBuilder):
 class HypervisorsController(object):
     """The Hypervisors API controller for the OpenStack API."""
 
-    def __init__(self):
+    def __init__(self, ext_mgr):
         self.host_api = compute.HostAPI()
+        self.servicegroup_api = servicegroup.API()
         super(HypervisorsController, self).__init__()
+        self.ext_mgr = ext_mgr
 
     def _view_hypervisor(self, hypervisor, detail, servers=None, **kwargs):
         hyp_dict = {
@@ -135,18 +142,32 @@ class HypervisorsController(object):
             'hypervisor_hostname': hypervisor['hypervisor_hostname'],
             }
 
+        ext_status_loaded = self.ext_mgr.is_loaded('os-hypervisor-status')
+        if ext_status_loaded:
+            alive = self.servicegroup_api.service_is_up(hypervisor['service'])
+            hyp_dict['state'] = 'up' if alive else "down"
+            hyp_dict['status'] = (
+                'disabled' if hypervisor['service']['disabled'] else 'enabled')
+
         if detail and not servers:
-            for field in ('vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
-                          'memory_mb_used', 'local_gb_used',
-                          'hypervisor_type', 'hypervisor_version',
-                          'free_ram_mb', 'free_disk_gb', 'current_workload',
-                          'running_vms', 'cpu_info', 'disk_available_least'):
+            fields = ('vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
+                      'memory_mb_used', 'local_gb_used',
+                      'hypervisor_type', 'hypervisor_version',
+                      'free_ram_mb', 'free_disk_gb', 'current_workload',
+                      'running_vms', 'cpu_info', 'disk_available_least')
+            ext_loaded = self.ext_mgr.is_loaded('os-extended-hypervisors')
+            if ext_loaded:
+                fields += ('host_ip',)
+            for field in fields:
                 hyp_dict[field] = hypervisor[field]
 
             hyp_dict['service'] = {
                 'id': hypervisor['service_id'],
                 'host': hypervisor['service']['host'],
                 }
+            if ext_status_loaded:
+                hyp_dict['service'].update(
+                    disabled_reason=hypervisor['service']['disabled_reason'])
 
         if servers:
             hyp_dict['servers'] = [dict(name=serv['name'], uuid=serv['uuid'])
@@ -254,11 +275,11 @@ class Hypervisors(extensions.ExtensionDescriptor):
     name = "Hypervisors"
     alias = "os-hypervisors"
     namespace = "http://docs.openstack.org/compute/ext/hypervisors/api/v1.1"
-    updated = "2012-06-21T00:00:00+00:00"
+    updated = "2012-06-21T00:00:00Z"
 
     def get_resources(self):
         resources = [extensions.ResourceExtension('os-hypervisors',
-                HypervisorsController(),
+                HypervisorsController(self.ext_mgr),
                 collection_actions={'detail': 'GET',
                                     'statistics': 'GET'},
                 member_actions={'uptime': 'GET',

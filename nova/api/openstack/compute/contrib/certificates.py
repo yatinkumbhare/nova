@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -20,7 +18,7 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 import nova.cert.rpcapi
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 
 authorize = extensions.extension_authorizer('compute', 'certificates')
 
@@ -71,7 +69,6 @@ class CertificatesController(object):
         authorize(context)
         pk, cert = self.cert_rpcapi.generate_x509_cert(context,
                 user_id=context.user_id, project_id=context.project_id)
-        context = req.environ['nova.context']
         return {'certificate': _translate_certificate_view(cert, pk)}
 
 
@@ -82,7 +79,7 @@ class Certificates(extensions.ExtensionDescriptor):
     alias = "os-certificates"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "certificates/api/v1.1")
-    updated = "2012-01-19T00:00:00+00:00"
+    updated = "2012-01-19T00:00:00Z"
 
     def get_resources(self):
         resources = []

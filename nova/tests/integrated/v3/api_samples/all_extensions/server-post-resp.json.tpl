@@ -12,8 +12,7 @@
                 "rel": "bookmark"
             }
         ],
-        "os-disk-config:disk_config": "AUTO",
-        "security_groups": [
+        "os-security-groups:security_groups": [
             {
                 "name": "default"
             }

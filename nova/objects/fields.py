@@ -14,13 +14,13 @@
 
 import abc
 import datetime
-import iso8601
 
+import iso8601
 import netaddr
 import six
 
+from nova.i18n import _
 from nova.network import model as network_model
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import timeutils
 
 
@@ -94,6 +94,11 @@ class AbstractFieldType(six.with_metaclass(abc.ABCMeta, object)):
         """Returns a string describing the type of the field."""
         pass
 
+    @abc.abstractmethod
+    def stringify(self, value):
+        """Returns a short stringified version of a value."""
+        pass
+
 
 class FieldType(AbstractFieldType):
     @staticmethod
@@ -111,16 +116,30 @@ class FieldType(AbstractFieldType):
     def describe(self):
         return self.__class__.__name__
 
+    def stringify(self, value):
+        return str(value)
+
 
 class UnspecifiedDefault(object):
     pass
 
 
 class Field(object):
-    def __init__(self, field_type, nullable=False, default=UnspecifiedDefault):
+    def __init__(self, field_type, nullable=False,
+                 default=UnspecifiedDefault, read_only=False):
         self._type = field_type
         self._nullable = nullable
         self._default = default
+        self._read_only = read_only
+
+    def __repr__(self):
+        args = {
+            'nullable': self._nullable,
+            'default': self._default,
+            }
+        return '%s(%s)' % (self._type.__class__.__name__,
+                           ','.join(['%s=%s' % (k, v)
+                                     for k, v in args.items()]))
 
     @property
     def nullable(self):
@@ -129,6 +148,10 @@ class Field(object):
     @property
     def default(self):
         return self._default
+
+    @property
+    def read_only(self):
+        return self._read_only
 
     def _null(self, obj, attr):
         if self.nullable:
@@ -205,6 +228,12 @@ class Field(object):
         prefix = self.nullable and 'Nullable' or ''
         return prefix + name
 
+    def stringify(self, value):
+        if value is None:
+            return 'None'
+        else:
+            return self._type.stringify(value)
+
 
 class String(FieldType):
     @staticmethod
@@ -214,8 +243,12 @@ class String(FieldType):
                               datetime.datetime)):
             return unicode(value)
         else:
-            raise ValueError(_('A string is required here, not %s'),
+            raise ValueError(_('A string is required here, not %s') %
                              value.__class__.__name__)
+
+    @staticmethod
+    def stringify(value):
+        return '\'%s\'' % value
 
 
 class UUID(FieldType):
@@ -246,11 +279,16 @@ class DateTime(FieldType):
     @staticmethod
     def coerce(obj, attr, value):
         if isinstance(value, six.string_types):
+            # NOTE(danms): Being tolerant of isotime strings here will help us
+            # during our objects transition
             value = timeutils.parse_isotime(value)
         elif not isinstance(value, datetime.datetime):
             raise ValueError(_('A datetime.datetime is required here'))
 
         if value.utcoffset() is None:
+            # NOTE(danms): Legacy objects from sqlalchemy are stored in UTC,
+            # but are returned without a timezone attached.
+            # As a transitional aid, assume a tz-naive object is in UTC.
             value = value.replace(tzinfo=iso8601.iso8601.Utc())
         return value
 
@@ -261,12 +299,16 @@ class DateTime(FieldType):
     def to_primitive(obj, attr, value):
         return timeutils.isotime(value)
 
+    @staticmethod
+    def stringify(value):
+        return timeutils.isotime(value)
 
-class IPV4Address(FieldType):
+
+class IPAddress(FieldType):
     @staticmethod
     def coerce(obj, attr, value):
         try:
-            return netaddr.IPAddress(value, version=4)
+            return netaddr.IPAddress(value)
         except netaddr.AddrFormatError as e:
             raise ValueError(str(e))
 
@@ -278,20 +320,58 @@ class IPV4Address(FieldType):
         return str(value)
 
 
-class IPV6Address(FieldType):
+class IPV4Address(IPAddress):
+    @staticmethod
+    def coerce(obj, attr, value):
+        result = IPAddress.coerce(obj, attr, value)
+        if result.version != 4:
+            raise ValueError(_('Network "%s" is not valid') % value)
+        return result
+
+
+class IPV6Address(IPAddress):
+    @staticmethod
+    def coerce(obj, attr, value):
+        result = IPAddress.coerce(obj, attr, value)
+        if result.version != 6:
+            raise ValueError(_('Network "%s" is not valid') % value)
+        return result
+
+
+class IPV4AndV6Address(IPAddress):
+    @staticmethod
+    def coerce(obj, attr, value):
+        result = IPAddress.coerce(obj, attr, value)
+        if result.version != 4 and result.version != 6:
+            raise ValueError(_('Network "%s" is not valid') % value)
+        return result
+
+
+class IPNetwork(IPAddress):
     @staticmethod
     def coerce(obj, attr, value):
         try:
-            return netaddr.IPAddress(value, version=6)
+            return netaddr.IPNetwork(value)
         except netaddr.AddrFormatError as e:
             raise ValueError(str(e))
 
-    def from_primitive(self, obj, attr, value):
-        return self.coerce(obj, attr, value)
 
+class IPV4Network(IPNetwork):
     @staticmethod
-    def to_primitive(obj, attr, value):
-        return str(value)
+    def coerce(obj, attr, value):
+        try:
+            return netaddr.IPNetwork(value, version=4)
+        except netaddr.AddrFormatError as e:
+            raise ValueError(str(e))
+
+
+class IPV6Network(IPNetwork):
+    @staticmethod
+    def coerce(obj, attr, value):
+        try:
+            return netaddr.IPNetwork(value, version=6)
+        except netaddr.AddrFormatError as e:
+            raise ValueError(str(e))
 
 
 class CompoundFieldType(FieldType):
@@ -314,6 +394,10 @@ class List(CompoundFieldType):
     def from_primitive(self, obj, attr, value):
         return [self._element_type.from_primitive(obj, attr, x) for x in value]
 
+    def stringify(self, value):
+        return '[%s]' % (
+            ','.join([self._element_type.stringify(x) for x in value]))
+
 
 class Dict(CompoundFieldType):
     def coerce(self, obj, attr, value):
@@ -321,10 +405,10 @@ class Dict(CompoundFieldType):
             raise ValueError(_('A dict is required here'))
         for key, element in value.items():
             if not isinstance(key, six.string_types):
-                #NOTE(guohliu) In order to keep compatibility with python3
-                #we need to use six.string_types rather than basestring here,
-                #since six.string_types is a tuple, so we need to pass the
-                #real type in.
+                # NOTE(guohliu) In order to keep compatibility with python3
+                # we need to use six.string_types rather than basestring here,
+                # since six.string_types is a tuple, so we need to pass the
+                # real type in.
                 raise KeyTypeError(six.string_types[0], key)
             value[key] = self._element_type.coerce(
                 obj, '%s["%s"]' % (attr, key), element)
@@ -343,6 +427,11 @@ class Dict(CompoundFieldType):
             concrete[key] = self._element_type.from_primitive(
                 obj, '%s["%s"]' % (attr, key), element)
         return concrete
+
+    def stringify(self, value):
+        return '{%s}' % (
+            ','.join(['%s=%s' % (key, self._element_type.stringify(val))
+                      for key, val in sorted(value.items())]))
 
 
 class Object(FieldType):
@@ -374,6 +463,18 @@ class Object(FieldType):
     def describe(self):
         return "Object<%s>" % self._obj_name
 
+    def stringify(self, value):
+        if 'uuid' in value.fields:
+            ident = '(%s)' % (value.obj_attr_is_set('uuid') and value.uuid or
+                              'UNKNOWN')
+        elif 'id' in value.fields:
+            ident = '(%s)' % (value.obj_attr_is_set('id') and value.id or
+                              'UNKNOWN')
+        else:
+            ident = ''
+
+        return '%s%s' % (self._obj_name, ident)
+
 
 class NetworkModel(FieldType):
     @staticmethod
@@ -394,29 +495,9 @@ class NetworkModel(FieldType):
     def from_primitive(obj, attr, value):
         return network_model.NetworkInfo.hydrate(value)
 
-
-class CIDR(FieldType):
-    @staticmethod
-    def coerce(obj, attr, value):
-        try:
-            network, length = value.split('/')
-        except (ValueError, AttributeError):
-            raise ValueError(_('CIDR "%s" is not in proper form') % value)
-        try:
-            network = netaddr.IPAddress(network)
-        except netaddr.AddrFormatError:
-            raise ValueError(_('Network "%s" is not valid') % network)
-        try:
-            length = int(length)
-            assert (length >= 0)
-        except (ValueError, AssertionError):
-            raise ValueError(_('Netmask length "%s" is not valid') % length)
-        if ((network.version == 4 and length > 32) or
-                (network.version == 6 and length > 128)):
-            raise ValueError(_('Netmask length "%(length)s" is not valid '
-                               'for IPv%(version)i address') %
-                             {'length': length, 'version': network.version})
-        return value
+    def stringify(self, value):
+        return 'NetworkModel(%s)' % (
+            ','.join([str(vif['id']) for vif in value]))
 
 
 class AutoTypedField(Field):
@@ -450,12 +531,32 @@ class DateTimeField(AutoTypedField):
     AUTO_TYPE = DateTime()
 
 
+class IPAddressField(AutoTypedField):
+    AUTO_TYPE = IPAddress()
+
+
 class IPV4AddressField(AutoTypedField):
     AUTO_TYPE = IPV4Address()
 
 
 class IPV6AddressField(AutoTypedField):
     AUTO_TYPE = IPV6Address()
+
+
+class IPV4AndV6AddressField(AutoTypedField):
+    AUTO_TYPE = IPV4AndV6Address()
+
+
+class IPNetworkField(AutoTypedField):
+    AUTO_TYPE = IPNetwork()
+
+
+class IPV4NetworkField(AutoTypedField):
+    AUTO_TYPE = IPV4Network()
+
+
+class IPV6NetworkField(AutoTypedField):
+    AUTO_TYPE = IPV6Network()
 
 
 class DictOfStringsField(AutoTypedField):
@@ -468,6 +569,10 @@ class DictOfNullableStringsField(AutoTypedField):
 
 class ListOfStringsField(AutoTypedField):
     AUTO_TYPE = List(String())
+
+
+class ListOfDictOfNullableStringsField(AutoTypedField):
+    AUTO_TYPE = List(Dict(String(), nullable=True))
 
 
 class ObjectField(AutoTypedField):

@@ -18,16 +18,16 @@ Tests For CellsManager
 import copy
 import datetime
 
+import mock
 from oslo.config import cfg
 
 from nova.cells import messaging
 from nova.cells import utils as cells_utils
 from nova import context
-from nova.openstack.common import rpc
 from nova.openstack.common import timeutils
 from nova import test
 from nova.tests.cells import fakes
-from nova.tests import fake_instance_actions
+from nova.tests import fake_server_actions
 
 CONF = cfg.CONF
 CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
@@ -73,11 +73,11 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         self.cells_manager.get_cell_info_for_neighbors(self.ctxt)
 
     def test_post_start_hook_child_cell(self):
-        self.mox.StubOutWithMock(self.driver, 'start_consumers')
+        self.mox.StubOutWithMock(self.driver, 'start_servers')
         self.mox.StubOutWithMock(context, 'get_admin_context')
         self.mox.StubOutWithMock(self.cells_manager, '_update_our_parents')
 
-        self.driver.start_consumers(self.msg_runner)
+        self.driver.start_servers(self.msg_runner)
         context.get_admin_context().AndReturn(self.ctxt)
         self.cells_manager._update_our_parents(self.ctxt)
         self.mox.ReplayAll()
@@ -88,14 +88,14 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         msg_runner = cells_manager.msg_runner
         driver = cells_manager.driver
 
-        self.mox.StubOutWithMock(driver, 'start_consumers')
+        self.mox.StubOutWithMock(driver, 'start_servers')
         self.mox.StubOutWithMock(context, 'get_admin_context')
         self.mox.StubOutWithMock(msg_runner,
                                  'ask_children_for_capabilities')
         self.mox.StubOutWithMock(msg_runner,
                                  'ask_children_for_capacities')
 
-        driver.start_consumers(msg_runner)
+        driver.start_servers(msg_runner)
         context.get_admin_context().AndReturn(self.ctxt)
         msg_runner.ask_children_for_capabilities(self.ctxt)
         msg_runner.ask_children_for_capacities(self.ctxt)
@@ -112,16 +112,6 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         self.msg_runner.tell_parents_our_capacities(self.ctxt)
         self.mox.ReplayAll()
         self.cells_manager._update_our_parents(self.ctxt)
-
-    def test_schedule_run_instance(self):
-        host_sched_kwargs = 'fake_host_sched_kwargs_silently_passed'
-        self.mox.StubOutWithMock(self.msg_runner, 'schedule_run_instance')
-        our_cell = self.msg_runner.state_manager.get_my_state()
-        self.msg_runner.schedule_run_instance(self.ctxt, our_cell,
-                                              host_sched_kwargs)
-        self.mox.ReplayAll()
-        self.cells_manager.schedule_run_instance(self.ctxt,
-                host_sched_kwargs=host_sched_kwargs)
 
     def test_build_instances(self):
         build_inst_kwargs = {'instances': [1, 2]}
@@ -342,13 +332,23 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
             params_to_update=params_to_update)
         self.assertEqual(expected_response, response)
 
+    def test_service_delete(self):
+        fake_cell = 'fake-cell'
+        service_id = '1'
+        cell_service_id = cells_utils.cell_with_item(fake_cell, service_id)
+
+        with mock.patch.object(self.msg_runner,
+                               'service_delete') as service_delete:
+            self.cells_manager.service_delete(self.ctxt, cell_service_id)
+            service_delete.assert_called_once_with(
+                self.ctxt, fake_cell, service_id)
+
     def test_proxy_rpc_to_manager(self):
         self.mox.StubOutWithMock(self.msg_runner,
                                  'proxy_rpc_to_manager')
         fake_response = self._get_fake_response()
         cell_and_host = cells_utils.cell_with_item('fake-cell', 'fake-host')
-        topic = rpc.queue_get_for(self.ctxt, CONF.compute_topic,
-                                  cell_and_host)
+        topic = "%s.%s" % (CONF.compute_topic, cell_and_host)
         self.msg_runner.proxy_rpc_to_manager(self.ctxt, 'fake-cell',
                 'fake-host', topic, 'fake-rpc-msg',
                 True, -1).AndReturn(fake_response)
@@ -480,9 +480,9 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         self.assertEqual(expected_response, response)
 
     def test_actions_get(self):
-        fake_uuid = fake_instance_actions.FAKE_UUID
-        fake_req_id = fake_instance_actions.FAKE_REQUEST_ID1
-        fake_act = fake_instance_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
+        fake_uuid = fake_server_actions.FAKE_UUID
+        fake_req_id = fake_server_actions.FAKE_REQUEST_ID1
+        fake_act = fake_server_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
         fake_response = messaging.Response('fake-cell', [fake_act], False)
         expected_response = [fake_act]
         self.mox.StubOutWithMock(self.msg_runner, 'actions_get')
@@ -494,9 +494,9 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         self.assertEqual(expected_response, response)
 
     def test_action_get_by_request_id(self):
-        fake_uuid = fake_instance_actions.FAKE_UUID
-        fake_req_id = fake_instance_actions.FAKE_REQUEST_ID1
-        fake_act = fake_instance_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
+        fake_uuid = fake_server_actions.FAKE_UUID
+        fake_req_id = fake_server_actions.FAKE_REQUEST_ID1
+        fake_act = fake_server_actions.FAKE_ACTIONS[fake_uuid][fake_req_id]
         fake_response = messaging.Response('fake-cell', fake_act, False)
         expected_response = fake_act
         self.mox.StubOutWithMock(self.msg_runner, 'action_get_by_request_id')
@@ -510,8 +510,8 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
         self.assertEqual(expected_response, response)
 
     def test_action_events_get(self):
-        fake_action_id = fake_instance_actions.FAKE_ACTION_ID1
-        fake_events = fake_instance_actions.FAKE_EVENTS[fake_action_id]
+        fake_action_id = fake_server_actions.FAKE_ACTION_ID1
+        fake_events = fake_server_actions.FAKE_EVENTS[fake_action_id]
         fake_response = messaging.Response('fake-cell', fake_events, False)
         expected_response = fake_events
         self.mox.StubOutWithMock(self.msg_runner, 'action_events_get')

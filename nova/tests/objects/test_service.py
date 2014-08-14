@@ -12,8 +12,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
+
 from nova import db
 from nova import exception
+from nova.objects import aggregate
 from nova.objects import service
 from nova.openstack.common import timeutils
 from nova.tests.objects import test_compute_node
@@ -73,7 +76,9 @@ class _TestServiceObject(object):
         self.assertTrue(service_obj.obj_attr_is_set('compute_node'))
         self.compare_obj(service_obj.compute_node,
                          test_compute_node.fake_compute_node,
-                         allow_missing=OPTIONAL)
+                         allow_missing=OPTIONAL,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
 
     def test_create(self):
         self.mox.StubOutWithMock(db, 'service_create')
@@ -85,6 +90,17 @@ class _TestServiceObject(object):
         service_obj.create(self.context)
         self.assertEqual(fake_service['id'], service_obj.id)
 
+    def test_recreate_fails(self):
+        self.mox.StubOutWithMock(db, 'service_create')
+        db.service_create(self.context, {'host': 'fake-host'}).AndReturn(
+            fake_service)
+        self.mox.ReplayAll()
+        service_obj = service.Service()
+        service_obj.host = 'fake-host'
+        service_obj.create(self.context)
+        self.assertRaises(exception.ObjectActionError, service_obj.create,
+                          self.context)
+
     def test_save(self):
         self.mox.StubOutWithMock(db, 'service_update')
         db.service_update(self.context, 123, {'host': 'fake-host'}).AndReturn(
@@ -94,6 +110,14 @@ class _TestServiceObject(object):
         service_obj.id = 123
         service_obj.host = 'fake-host'
         service_obj.save(self.context)
+
+    @mock.patch.object(db, 'service_create',
+                       return_value=fake_service)
+    def test_set_id_failure(self, db_mock):
+        service_obj = service.Service()
+        service_obj.create(self.context)
+        self.assertRaises(exception.ReadOnlyFieldError, setattr,
+                          service_obj, 'id', 124)
 
     def _test_destroy(self):
         self.mox.StubOutWithMock(db, 'service_destroy')
@@ -141,12 +165,17 @@ class _TestServiceObject(object):
 
     def test_get_all_with_az(self):
         self.mox.StubOutWithMock(db, 'service_get_all')
-        self.mox.StubOutWithMock(db, 'aggregate_host_get_by_metadata_key')
+        self.mox.StubOutWithMock(aggregate.AggregateList,
+                                 'get_by_metadata_key')
         db.service_get_all(self.context, disabled=None).AndReturn(
             [dict(fake_service, topic='compute')])
-        db.aggregate_host_get_by_metadata_key(
-            self.context, key='availability_zone').AndReturn(
-                {fake_service['host']: ['test-az']})
+        agg = aggregate.Aggregate()
+        agg.name = 'foo'
+        agg.metadata = {'availability_zone': 'test-az'}
+        agg.create(self.context)
+        agg.hosts = [fake_service['host']]
+        aggregate.AggregateList.get_by_metadata_key(self.context,
+            'availability_zone', hosts=set(agg.hosts)).AndReturn([agg])
         self.mox.ReplayAll()
         services = service.ServiceList.get_all(self.context, set_zones=True)
         self.assertEqual(1, len(services))
@@ -162,7 +191,9 @@ class _TestServiceObject(object):
         service_obj.id = 123
         self.compare_obj(service_obj.compute_node,
                          test_compute_node.fake_compute_node,
-                         allow_missing=OPTIONAL)
+                         allow_missing=OPTIONAL,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
         # Make sure it doesn't re-fetch this
         service_obj.compute_node
 

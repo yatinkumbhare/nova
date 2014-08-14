@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Piston Cloud Computing, Inc.
@@ -21,18 +19,20 @@
 
 import base64
 import contextlib
-import copy
 import datetime
 import operator
 import sys
-import testtools
 import time
 import traceback
 import uuid
 
+from eventlet import greenthread
 import mock
 import mox
 from oslo.config import cfg
+from oslo import messaging
+import six
+import testtools
 from testtools import matchers as testtools_matchers
 
 import nova
@@ -51,20 +51,18 @@ from nova.conductor import manager as conductor_manager
 from nova import context
 from nova import db
 from nova import exception
+from nova.i18n import _
 from nova.image import glance
 from nova.network import api as network_api
 from nova.network import model as network_model
 from nova.network.security_group import openstack_driver
+from nova import objects
 from nova.objects import base as obj_base
+from nova.objects import block_device as block_device_obj
 from nova.objects import instance as instance_obj
-from nova.objects import migration as migration_obj
-from nova.objects import quotas as quotas_obj
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
-from nova.openstack.common import rpc
-from nova.openstack.common.rpc import common as rpc_common
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
 from nova import policy
@@ -72,15 +70,19 @@ from nova import quota
 from nova import test
 from nova.tests.compute import fake_resource_tracker
 from nova.tests.db import fakes as db_fakes
+from nova.tests import fake_block_device
 from nova.tests import fake_instance
-from nova.tests import fake_instance_actions
 from nova.tests import fake_network
 from nova.tests import fake_network_cache_model
 from nova.tests import fake_notifier
+from nova.tests import fake_server_actions
 from nova.tests.image import fake as fake_image
 from nova.tests import matchers
+from nova.tests.objects import test_flavor
 from nova.tests.objects import test_migration
+from nova.tests.objects import test_network
 from nova import utils
+from nova.virt import block_device as driver_block_device
 from nova.virt import event
 from nova.virt import fake
 from nova.volume import cinder
@@ -99,9 +101,12 @@ FAKE_IMAGE_REF = 'fake-image-ref'
 NODENAME = 'fakenode1'
 
 
+def fake_not_implemented(*args, **kwargs):
+    raise NotImplementedError()
+
+
 def get_primitive_instance_by_uuid(context, instance_uuid):
-    """
-    Helper method to get an instance and then convert it to
+    """Helper method to get an instance and then convert it to
     a primitive form using jsonutils.
     """
     instance = db.instance_get_by_uuid(context, instance_uuid)
@@ -145,6 +150,13 @@ class FakeSchedulerAPI(object):
         pass
 
 
+class FakeComputeTaskAPI(object):
+
+    def resize_instance(self, context, instance, extra_instance_updates,
+                        scheduler_hint, flavor, reservations):
+        pass
+
+
 class BaseTestCase(test.TestCase):
 
     def setUp(self):
@@ -185,16 +197,20 @@ class BaseTestCase(test.TestCase):
                                    'disk_available_least': 265856,
                                    'deleted_at': None,
                                    'free_ram_mb': 130560,
-                                   'id': 2}]
-            return fake_compute_nodes
+                                   'metrics': '',
+                                   'stats': '',
+                                   'id': 2,
+                                   'host_ip': '127.0.0.1'}]
+            return [objects.ComputeNode._from_db_object(
+                        context, objects.ComputeNode(), cn)
+                    for cn in fake_compute_nodes]
 
-        def fake_compute_node_delete(context, compute_node):
-            self.assertEqual(compute_node.get('hypervisor_hostname'),
-                             'fake_phyp1')
+        def fake_compute_node_delete(context, compute_node_id):
+            self.assertEqual(2, compute_node_id)
 
         self.stubs.Set(self.compute, '_get_compute_nodes_in_db',
                 fake_get_compute_nodes_in_db)
-        self.stubs.Set(self.compute.conductor_api, 'compute_node_delete',
+        self.stubs.Set(db, 'compute_node_delete',
                 fake_compute_node_delete)
 
         self.compute.update_available_resource(
@@ -204,8 +220,10 @@ class BaseTestCase(test.TestCase):
         self.project_id = 'fake'
         self.context = context.RequestContext(self.user_id,
                                               self.project_id)
+        self.none_quotas = objects.Quotas.from_reservations(
+                self.context, None)
 
-        def fake_show(meh, context, id):
+        def fake_show(meh, context, id, **kwargs):
             if id:
                 return {'id': id, 'min_disk': None, 'min_ram': None,
                         'name': 'fake_name',
@@ -220,9 +238,12 @@ class BaseTestCase(test.TestCase):
         self.stubs.Set(fake_image._FakeImageService, 'show', fake_show)
 
         fake_rpcapi = FakeSchedulerAPI()
+        fake_taskapi = FakeComputeTaskAPI()
         self.stubs.Set(self.compute, 'scheduler_rpcapi', fake_rpcapi)
+        self.stubs.Set(self.compute, 'compute_task_api', fake_taskapi)
+
         fake_network.set_stub_network_methods(self.stubs)
-        fake_instance_actions.stub_out_action_events(self.stubs)
+        fake_server_actions.stub_out_action_events(self.stubs)
 
         def fake_get_nw_info(cls, ctxt, instance, *args, **kwargs):
             self.assertTrue(ctxt.is_admin)
@@ -230,8 +251,13 @@ class BaseTestCase(test.TestCase):
 
         self.stubs.Set(network_api.API, 'get_instance_nw_info',
                        fake_get_nw_info)
+
+        def fake_allocate_for_instance(cls, ctxt, instance, *args, **kwargs):
+            self.assertFalse(ctxt.is_admin)
+            return fake_network.fake_get_instance_nw_info(self.stubs, 1, 1)
+
         self.stubs.Set(network_api.API, 'allocate_for_instance',
-                       fake_get_nw_info)
+                       fake_allocate_for_instance)
         self.compute_api = compute.API()
 
         # Just to make long lines short
@@ -291,12 +317,14 @@ class BaseTestCase(test.TestCase):
         return db.instance_create(self.context, inst)
 
     def _objectify(self, db_inst):
-        return instance_obj.Instance._from_db_object(
-            self.context, instance_obj.Instance(), db_inst,
+        return objects.Instance._from_db_object(
+            self.context, objects.Instance(), db_inst,
             expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
 
-    def _create_fake_instance_obj(self, params=None, type_name='m1.tiny'):
-        db_inst = self._create_fake_instance(params, type_name=type_name)
+    def _create_fake_instance_obj(self, params=None, type_name='m1.tiny',
+                                  services=False):
+        db_inst = self._create_fake_instance(params, type_name=type_name,
+                                             services=services)
         return self._objectify(db_inst)
 
     def _create_instance_type(self, params=None):
@@ -331,6 +359,12 @@ class BaseTestCase(test.TestCase):
         self.stubs.Set(conductor_manager.ComputeTaskManager,
                        'migrate_server', _fake_migrate_server)
 
+    def _init_aggregate_with_host(self, aggr, aggr_name, zone, host):
+        if not aggr:
+            aggr = self.api.create_aggregate(self.context, aggr_name, zone)
+        aggr = self.api.add_host_to_aggregate(self.context, aggr['id'], host)
+        return aggr
+
 
 class ComputeVolumeTestCase(BaseTestCase):
 
@@ -344,8 +378,15 @@ class ComputeVolumeTestCase(BaseTestCase):
             'name': 'fake',
             'root_device_name': '/dev/vda',
         }
+        self.fake_volume = fake_block_device.FakeDbBlockDeviceDict(
+                {'source_type': 'volume', 'destination_type': 'volume',
+                 'volume_id': self.volume_id, 'device_name': '/dev/vdb'})
+        self.instance_object = objects.Instance._from_db_object(
+                self.context, objects.Instance(),
+                fake_instance.fake_db_instance())
         self.stubs.Set(self.compute.volume_api, 'get', lambda *a, **kw:
-                       {'id': self.volume_id})
+                       {'id': self.volume_id,
+                        'attach_status': 'detached'})
         self.stubs.Set(self.compute.driver, 'get_volume_connector',
                        lambda *a, **kw: None)
         self.stubs.Set(self.compute.volume_api, 'initialize_connection',
@@ -358,9 +399,12 @@ class ComputeVolumeTestCase(BaseTestCase):
                        lambda *a, **kw: None)
         self.stubs.Set(self.compute.volume_api, 'check_attach',
                        lambda *a, **kw: None)
+        self.stubs.Set(greenthread, 'sleep',
+                       lambda *a, **kw: None)
 
-        def store_cinfo(context, *args):
+        def store_cinfo(context, *args, **kwargs):
             self.cinfo = jsonutils.loads(args[-1].get('connection_info'))
+            return self.fake_volume
 
         self.stubs.Set(self.compute.conductor_api,
                        'block_device_mapping_update',
@@ -368,19 +412,78 @@ class ComputeVolumeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.conductor_api,
                        'block_device_mapping_update_or_create',
                        store_cinfo)
+        self.stubs.Set(db, 'block_device_mapping_create', store_cinfo)
+        self.stubs.Set(db, 'block_device_mapping_update', store_cinfo)
 
     def test_attach_volume_serial(self):
-        def fake_get_volume_encryption_metadata(self, context, volume_id):
-            return {}
-        self.stubs.Set(cinder.API, 'get_volume_encryption_metadata',
-                       fake_get_volume_encryption_metadata)
+        fake_bdm = objects.BlockDeviceMapping(**self.fake_volume)
+        with (mock.patch.object(cinder.API, 'get_volume_encryption_metadata',
+                                return_value={})):
+            instance = self._create_fake_instance()
+            self.compute.attach_volume(self.context, self.volume_id,
+                                       '/dev/vdb', instance, bdm=fake_bdm)
+            self.assertEqual(self.cinfo.get('serial'), self.volume_id)
 
+    def test_attach_volume_raises(self):
+        fake_bdm = objects.BlockDeviceMapping(**self.fake_volume)
         instance = self._create_fake_instance()
-        self.compute.attach_volume(self.context, self.volume_id,
-                                   '/dev/vdb', instance)
-        self.assertEqual(self.cinfo.get('serial'), self.volume_id)
 
-    def test_await_block_device_created_to_slow(self):
+        def fake_attach(*args, **kwargs):
+            raise test.TestingException
+
+        with contextlib.nested(
+            mock.patch.object(driver_block_device.DriverVolumeBlockDevice,
+                              'attach'),
+            mock.patch.object(cinder.API, 'unreserve_volume'),
+            mock.patch.object(objects.BlockDeviceMapping,
+                              'destroy')
+        ) as (mock_attach, mock_unreserve, mock_destroy):
+            mock_attach.side_effect = fake_attach
+            self.assertRaises(
+                    test.TestingException, self.compute.attach_volume,
+                    self.context, 'fake', '/dev/vdb',
+                    instance, bdm=fake_bdm)
+            self.assertTrue(mock_unreserve.called)
+            self.assertTrue(mock_destroy.called)
+
+    def test_detach_volume_api_raises(self):
+        fake_bdm = objects.BlockDeviceMapping(**self.fake_volume)
+        instance = self._create_fake_instance()
+
+        with contextlib.nested(
+            mock.patch.object(self.compute, '_detach_volume'),
+            mock.patch.object(self.compute.volume_api, 'detach'),
+            mock.patch.object(objects.BlockDeviceMapping,
+                              'get_by_volume_id'),
+            mock.patch.object(fake_bdm, 'destroy')
+        ) as (mock_internal_detach, mock_detach, mock_get, mock_destroy):
+            mock_detach.side_effect = test.TestingException
+            mock_get.return_value = fake_bdm
+            self.assertRaises(
+                    test.TestingException, self.compute.detach_volume,
+                    self.context, 'fake', instance)
+            mock_internal_detach.assert_called_once_with(self.context,
+                                                         instance,
+                                                         fake_bdm)
+            self.assertTrue(mock_destroy.called)
+
+    def test_attach_volume_no_bdm(self):
+        fake_bdm = objects.BlockDeviceMapping(**self.fake_volume)
+        instance = self._create_fake_instance()
+
+        with contextlib.nested(
+            mock.patch.object(objects.BlockDeviceMapping,
+                'get_by_volume_id', return_value=fake_bdm),
+            mock.patch.object(self.compute, '_attach_volume')
+        ) as (mock_get_by_id, mock_attach):
+            self.compute.attach_volume(self.context, 'fake', '/dev/vdb',
+                    instance, bdm=None)
+            mock_get_by_id.assert_called_once_with(self.context, 'fake')
+            self.assertTrue(mock_attach.called)
+
+    def test_await_block_device_created_too_slow(self):
+        self.flags(block_device_allocate_retries=2)
+        self.flags(block_device_allocate_retries_interval=0.1)
 
         def never_get(context, vol_id):
             return {
@@ -391,13 +494,15 @@ class ComputeVolumeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.volume_api, 'get', never_get)
         self.assertRaises(exception.VolumeNotCreated,
                           self.compute._await_block_device_map_created,
-                          self.context, '1', max_tries=2, wait_between=0.1)
+                          self.context, '1')
 
     def test_await_block_device_created_slow(self):
         c = self.compute
+        self.flags(block_device_allocate_retries=4)
+        self.flags(block_device_allocate_retries_interval=0.1)
 
         def slow_get(context, vol_id):
-            while self.fetched_attempts < 2:
+            if self.fetched_attempts < 2:
                 self.fetched_attempts += 1
                 return {
                     'status': 'creating',
@@ -409,26 +514,30 @@ class ComputeVolumeTestCase(BaseTestCase):
             }
 
         self.stubs.Set(c.volume_api, 'get', slow_get)
-        attempts = c._await_block_device_map_created(self.context, '1',
-                                                     max_tries=4,
-                                                     wait_between=0.1)
+        attempts = c._await_block_device_map_created(self.context, '1')
         self.assertEqual(attempts, 3)
 
     def test_boot_volume_serial(self):
-        block_device_mapping = [
-        block_device.BlockDeviceDict({
-            'id': 1,
-            'no_device': None,
-            'source_type': 'volume',
-            'destination_type': 'volume',
-            'snapshot_id': None,
-            'volume_id': self.volume_id,
-            'device_name': '/dev/vdb',
-            'delete_on_termination': False,
-        })]
-        self.compute._prep_block_device(self.context, self.instance,
-                                        block_device_mapping)
-        self.assertEqual(self.cinfo.get('serial'), self.volume_id)
+        with (
+            mock.patch.object(objects.BlockDeviceMapping, 'save')
+        ) as mock_save:
+            block_device_mapping = [
+            block_device.BlockDeviceDict({
+                'id': 1,
+                'no_device': None,
+                'source_type': 'volume',
+                'destination_type': 'volume',
+                'snapshot_id': None,
+                'volume_id': self.volume_id,
+                'device_name': '/dev/vdb',
+                'delete_on_termination': False,
+            })]
+            prepped_bdm = self.compute._prep_block_device(
+                    self.context, self.instance, block_device_mapping)
+            mock_save.assert_called_once_with(self.context)
+            volume_driver_bdm = prepped_bdm['block_device_mapping'][0]
+            self.assertEqual(volume_driver_bdm['connection_info']['serial'],
+                             self.volume_id)
 
     def test_boot_volume_metadata(self, metadata=True):
         def volume_api_get(*args, **kwargs):
@@ -478,7 +587,7 @@ class ComputeVolumeTestCase(BaseTestCase):
         self.test_boot_volume_metadata(metadata=False)
 
     def test_boot_image_metadata(self, metadata=True):
-        def image_api_show(*args, **kwargs):
+        def image_api_get(*args, **kwargs):
             if metadata:
                 return {
                     'properties': {'img_test_key': 'img_test_value'}
@@ -486,7 +595,7 @@ class ComputeVolumeTestCase(BaseTestCase):
             else:
                 return {}
 
-        self.stubs.Set(self.compute_api.image_service, 'show', image_api_show)
+        self.stubs.Set(self.compute_api.image_api, 'get', image_api_get)
 
         block_device_mapping = [{
             'boot_index': 0,
@@ -507,6 +616,63 @@ class ComputeVolumeTestCase(BaseTestCase):
     def test_boot_image_no_metadata(self):
         self.test_boot_image_metadata(metadata=False)
 
+    def test_poll_bandwidth_usage_disabled(self):
+        ctxt = 'MockContext'
+        self.mox.StubOutWithMock(utils, 'last_completed_audit_period')
+        # None of the mocks should be called.
+        self.mox.ReplayAll()
+
+        self.flags(bandwidth_poll_interval=0)
+        self.compute._poll_bandwidth_usage(ctxt)
+        self.mox.UnsetStubs()
+
+    def test_poll_bandwidth_usage_not_implemented(self):
+        ctxt = context.get_admin_context()
+
+        self.mox.StubOutWithMock(self.compute.driver, 'get_all_bw_counters')
+        self.mox.StubOutWithMock(utils, 'last_completed_audit_period')
+        self.mox.StubOutWithMock(time, 'time')
+        self.mox.StubOutWithMock(objects.InstanceList, 'get_by_host')
+        # Following methods will be called
+        utils.last_completed_audit_period().AndReturn((0, 0))
+        time.time().AndReturn(10)
+        # Note - time called two more times from Log
+        time.time().AndReturn(20)
+        time.time().AndReturn(21)
+        objects.InstanceList.get_by_host(ctxt, 'fake-mini',
+                                         use_slave=True).AndReturn([])
+        self.compute.driver.get_all_bw_counters([]).AndRaise(
+            NotImplementedError)
+        self.mox.ReplayAll()
+
+        self.flags(bandwidth_poll_interval=1)
+        self.compute._poll_bandwidth_usage(ctxt)
+        # A second call won't call the stubs again as the bandwidth
+        # poll is now disabled
+        self.compute._poll_bandwidth_usage(ctxt)
+        self.mox.UnsetStubs()
+
+    @mock.patch.object(objects.InstanceList, 'get_by_host')
+    @mock.patch.object(objects.BlockDeviceMappingList,
+                       'get_by_instance_uuid')
+    def test_get_host_volume_bdms(self, mock_get_by_inst, mock_get_by_host):
+        fake_instance = mock.Mock(uuid='fake-instance-uuid')
+        mock_get_by_host.return_value = [fake_instance]
+
+        volume_bdm = mock.Mock(id=1, is_volume=True)
+        not_volume_bdm = mock.Mock(id=2, is_volume=False)
+        mock_get_by_inst.return_value = [volume_bdm, not_volume_bdm]
+
+        expected_host_bdms = [{'instance': fake_instance,
+                               'instance_bdms': [volume_bdm]}]
+
+        got_host_bdms = self.compute._get_host_volume_bdms('fake-context')
+        mock_get_by_host.assert_called_once_with('fake-context',
+                                                 self.compute.host)
+        mock_get_by_inst.assert_called_once_with('fake-context',
+                                                 'fake-instance-uuid')
+        self.assertEqual(expected_host_bdms, got_host_bdms)
+
     def test_poll_volume_usage_disabled(self):
         ctxt = 'MockContext'
         self.mox.StubOutWithMock(self.compute, '_get_host_volume_bdms')
@@ -514,46 +680,26 @@ class ComputeVolumeTestCase(BaseTestCase):
         # None of the mocks should be called.
         self.mox.ReplayAll()
 
-        CONF.volume_usage_poll_interval = 0
-        self.compute._poll_volume_usage(ctxt)
-        self.mox.UnsetStubs()
-
-    def test_poll_volume_usage_interval_not_elapsed(self):
-        ctxt = 'MockContext'
-        self.mox.StubOutWithMock(self.compute, '_get_host_volume_bdms')
-        self.mox.StubOutWithMock(utils, 'last_completed_audit_period')
-        self.mox.StubOutWithMock(self.compute.driver, 'get_all_volume_usage')
-        self.mox.StubOutWithMock(time, 'time')
-        # Following methods will be called.
-        utils.last_completed_audit_period().AndReturn((0, 0))
-        time.time().AndReturn(10)
-        self.mox.ReplayAll()
-
-        CONF.volume_usage_poll_interval = 2
-        self.compute._last_vol_usage_poll = 9
+        self.flags(volume_usage_poll_interval=0)
         self.compute._poll_volume_usage(ctxt)
         self.mox.UnsetStubs()
 
     def test_poll_volume_usage_returns_no_vols(self):
         ctxt = 'MockContext'
-        self.compute.host = 'MockHost'
         self.mox.StubOutWithMock(self.compute, '_get_host_volume_bdms')
         self.mox.StubOutWithMock(utils, 'last_completed_audit_period')
         self.mox.StubOutWithMock(self.compute.driver, 'get_all_volume_usage')
         # Following methods are called.
         utils.last_completed_audit_period().AndReturn((0, 0))
-        self.compute._get_host_volume_bdms(ctxt, 'MockHost').AndReturn([])
+        self.compute._get_host_volume_bdms(ctxt).AndReturn([])
         self.mox.ReplayAll()
 
-        CONF.volume_usage_poll_interval = 10
-        self.compute._last_vol_usage_poll = 0
+        self.flags(volume_usage_poll_interval=10)
         self.compute._poll_volume_usage(ctxt)
         self.mox.UnsetStubs()
 
     def test_poll_volume_usage_with_data(self):
         ctxt = 'MockContext'
-        self.compute.host = 'MockHost'
-        curr_time = time.time()
         self.mox.StubOutWithMock(utils, 'last_completed_audit_period')
         self.mox.StubOutWithMock(self.compute, '_get_host_volume_bdms')
         self.mox.StubOutWithMock(self.compute, '_update_volume_usage_cache')
@@ -561,45 +707,47 @@ class ComputeVolumeTestCase(BaseTestCase):
                        lambda x, y: [3, 4])
         # All the mocks are called
         utils.last_completed_audit_period().AndReturn((10, 20))
-        self.compute._get_host_volume_bdms(ctxt, 'MockHost').AndReturn([1, 2])
+        self.compute._get_host_volume_bdms(ctxt).AndReturn([1, 2])
         self.compute._update_volume_usage_cache(ctxt, [3, 4])
         self.mox.ReplayAll()
-        CONF.volume_usage_poll_interval = 10
-        self.compute._last_vol_usage_poll = 0
+        self.flags(volume_usage_poll_interval=10)
         self.compute._poll_volume_usage(ctxt)
-        self.assertTrue((curr_time < self.compute._last_vol_usage_poll),
-                        "_last_vol_usage_poll was not properly updated <%s>" %
-                        self.compute._last_vol_usage_poll)
         self.mox.UnsetStubs()
 
     def test_detach_volume_usage(self):
         # Test that detach volume update the volume usage cache table correctly
         instance = self._create_fake_instance()
-        bdm = {'id': 1,
-               'device_name': '/dev/vdb',
-               'connection_info': '{}',
-               'instance_uuid': instance['uuid'],
+        bdm = fake_block_device.FakeDbBlockDeviceDict(
+                {'id': 1, 'device_name': '/dev/vdb',
+                 'connection_info': '{}', 'instance_uuid': instance['uuid'],
+                 'source_type': 'volume', 'destination_type': 'volume',
+                 'volume_id': 1})
+        host_volume_bdms = {'id': 1, 'device_name': '/dev/vdb',
+               'connection_info': '{}', 'instance_uuid': instance['uuid'],
                'volume_id': 1}
 
-        self.mox.StubOutWithMock(self.compute, '_get_instance_volume_bdm')
+        self.mox.StubOutWithMock(db, 'block_device_mapping_get_by_volume_id')
         self.mox.StubOutWithMock(self.compute.driver, 'block_stats')
         self.mox.StubOutWithMock(self.compute, '_get_host_volume_bdms')
         self.mox.StubOutWithMock(self.compute.driver, 'get_all_volume_usage')
 
         # The following methods will be called
-        self.compute._get_instance_volume_bdm(self.context, instance, 1).\
+        db.block_device_mapping_get_by_volume_id(self.context, 1, []).\
             AndReturn(bdm)
         self.compute.driver.block_stats(instance['name'], 'vdb').\
             AndReturn([1L, 30L, 1L, 20L, None])
-        self.compute._get_host_volume_bdms(self.context, 'fake-mini').\
+        self.compute._get_host_volume_bdms(self.context).AndReturn(
+                host_volume_bdms)
+        self.compute.driver.get_all_volume_usage(
+                self.context, host_volume_bdms).AndReturn(
+                        [{'volume': 1,
+                          'rd_req': 1,
+                          'rd_bytes': 10,
+                          'wr_req': 1,
+                          'wr_bytes': 5,
+                          'instance': instance}])
+        db.block_device_mapping_get_by_volume_id(self.context, 1, []).\
             AndReturn(bdm)
-        self.compute.driver.get_all_volume_usage(self.context, bdm).\
-            AndReturn([{'volume': 1,
-                        'rd_req': 1,
-                        'rd_bytes': 10,
-                        'wr_req': 1,
-                        'wr_bytes': 5,
-                        'instance': instance}])
 
         self.mox.ReplayAll()
 
@@ -612,7 +760,7 @@ class ComputeVolumeTestCase(BaseTestCase):
 
         # Poll volume usage & then detach the volume. This will update the
         # total fields in the volume usage cache.
-        CONF.volume_usage_poll_interval = 10
+        self.flags(volume_usage_poll_interval=10)
         self.compute._poll_volume_usage(self.context)
         # Check that a volume.usage and volume.attach notification was sent
         self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
@@ -656,7 +804,6 @@ class ComputeVolumeTestCase(BaseTestCase):
         ephemeral_size = 1
         instance_type = {'swap': swap_size,
                          'ephemeral_gb': ephemeral_size}
-        instance = self._create_fake_instance()
         mappings = [
                 {'virtual': 'ami', 'device': 'sda1'},
                 {'virtual': 'root', 'device': '/dev/sda1'},
@@ -668,7 +815,7 @@ class ComputeVolumeTestCase(BaseTestCase):
         ]
 
         preped_bdm = self.compute_api._prepare_image_mapping(
-            instance_type, instance['uuid'], mappings)
+            instance_type, mappings)
 
         expected_result = [
             {
@@ -717,6 +864,7 @@ class ComputeVolumeTestCase(BaseTestCase):
 
         volume_id = '55555555-aaaa-bbbb-cccc-555555555555'
         snapshot_id = '66666666-aaaa-bbbb-cccc-555555555555'
+        image_id = '77777777-aaaa-bbbb-cccc-555555555555'
 
         instance = self._create_fake_instance()
         instance_type = {'swap': 1, 'ephemeral_gb': 2}
@@ -842,6 +990,20 @@ class ComputeVolumeTestCase(BaseTestCase):
                           self.context, instance, instance_type,
                           mappings + additional_swap)
 
+        image_no_size = [
+            {
+                'device_name': '/dev/sda4',
+                'source_type': 'image',
+                'image_id': image_id,
+                'destination_type': 'volume',
+                'boot_index': -1,
+                'volume_size': None,
+            }]
+        self.assertRaises(exception.InvalidBDM,
+                          self.compute_api._validate_bdm,
+                          self.context, instance, instance_type,
+                          mappings + image_no_size)
+
     def test_validate_bdm_media_service_exceptions(self):
         instance_type = {'swap': 1, 'ephemeral_gb': 1}
         all_mappings = [{'id': 1,
@@ -890,26 +1052,121 @@ class ComputeVolumeTestCase(BaseTestCase):
                                        instance_type, all_mappings)
 
     def test_volume_snapshot_create(self):
-        self.assertRaises(rpc_common.ClientException,
+        self.assertRaises(messaging.ExpectedException,
                 self.compute.volume_snapshot_create, self.context,
-                self.instance, 'fake_id', {})
+                self.instance_object, 'fake_id', {})
 
         self.compute = utils.ExceptionHelper(self.compute)
 
         self.assertRaises(NotImplementedError,
                 self.compute.volume_snapshot_create, self.context,
-                self.instance, 'fake_id', {})
+                self.instance_object, 'fake_id', {})
 
     def test_volume_snapshot_delete(self):
-        self.assertRaises(rpc_common.ClientException,
+        self.assertRaises(messaging.ExpectedException,
                 self.compute.volume_snapshot_delete, self.context,
-                self.instance, 'fake_id', 'fake_id2', {})
+                self.instance_object, 'fake_id', 'fake_id2', {})
 
         self.compute = utils.ExceptionHelper(self.compute)
 
         self.assertRaises(NotImplementedError,
                 self.compute.volume_snapshot_delete, self.context,
-                self.instance, 'fake_id', 'fake_id2', {})
+                self.instance_object, 'fake_id', 'fake_id2', {})
+
+    @mock.patch.object(cinder.API, 'create',
+                       side_effect=exception.OverQuota(overs='volumes'))
+    def test_prep_block_device_over_quota_failure(self, mock_create):
+        instance = self._create_fake_instance()
+        bdms = [
+            block_device.BlockDeviceDict({
+                'boot_index': 0,
+                'guest_format': None,
+                'connection_info': None,
+                'device_type': u'disk',
+                'source_type': 'image',
+                'destination_type': 'volume',
+                'volume_size': 1,
+                'image_id': 1,
+                'device_name': '/dev/vdb',
+            })]
+        self.assertRaises(exception.InvalidBDM,
+                          compute_manager.ComputeManager()._prep_block_device,
+                          self.context, instance, bdms)
+        self.assertTrue(mock_create.called)
+
+    @mock.patch.object(nova.virt.block_device, 'get_swap')
+    @mock.patch.object(nova.virt.block_device, 'convert_blanks')
+    @mock.patch.object(nova.virt.block_device, 'convert_images')
+    @mock.patch.object(nova.virt.block_device, 'convert_snapshots')
+    @mock.patch.object(nova.virt.block_device, 'convert_volumes')
+    @mock.patch.object(nova.virt.block_device, 'convert_ephemerals')
+    @mock.patch.object(nova.virt.block_device, 'convert_swap')
+    @mock.patch.object(nova.virt.block_device, 'attach_block_devices')
+    def test_prep_block_device_with_blanks(self, attach_block_devices,
+                                           convert_swap, convert_ephemerals,
+                                           convert_volumes, convert_snapshots,
+                                           convert_images, convert_blanks,
+                                           get_swap):
+        instance = self._create_fake_instance()
+        instance['root_device_name'] = '/dev/vda'
+        root_volume = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'instance_uuid': 'fake-instance',
+                'source_type': 'image',
+                'destination_type': 'volume',
+                'image_id': 'fake-image-id-1',
+                'volume_size': 1,
+                'boot_index': 0}))
+        blank_volume1 = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'instance_uuid': 'fake-instance',
+                'source_type': 'blank',
+                'destination_type': 'volume',
+                'volume_size': 1,
+                'boot_index': 1}))
+        blank_volume2 = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'instance_uuid': 'fake-instance',
+                'source_type': 'blank',
+                'destination_type': 'volume',
+                'volume_size': 1,
+                'boot_index': 2}))
+        bdms = [blank_volume1, blank_volume2, root_volume]
+
+        def fake_attach_block_devices(bdm, *args, **kwargs):
+            return bdm
+
+        convert_swap.return_value = []
+        convert_ephemerals.return_value = []
+        convert_volumes.return_value = [blank_volume1, blank_volume2]
+        convert_snapshots.return_value = []
+        convert_images.return_value = [root_volume]
+        convert_blanks.return_value = []
+        attach_block_devices.side_effect = fake_attach_block_devices
+        get_swap.return_value = []
+
+        expected_block_device_info = {
+            'root_device_name': '/dev/vda',
+            'swap': [],
+            'ephemerals': [],
+            'block_device_mapping': bdms
+        }
+
+        manager = compute_manager.ComputeManager()
+        manager.use_legacy_block_device_info = False
+        block_device_info = manager._prep_block_device(self.context, instance,
+                                                       bdms)
+
+        convert_swap.assert_called_once_with(bdms)
+        convert_ephemerals.assert_called_once_with(bdms)
+        convert_volumes.assert_called_once_with(bdms)
+        convert_snapshots.assert_called_once_with(bdms)
+        convert_images.assert_called_once_with(bdms)
+        convert_blanks.assert_called_once_with(bdms)
+
+        self.assertEqual(expected_block_device_info, block_device_info)
+        self.assertEqual(4, attach_block_devices.call_count)
+        get_swap.assert_called_once_with([])
 
 
 class ComputeTestCase(BaseTestCase):
@@ -954,7 +1211,7 @@ class ComputeTestCase(BaseTestCase):
         self.assertTrue(called['fault_added'])
 
     def test_wrap_instance_fault_no_instance(self):
-        inst_uuid = "fake_uuid"
+        inst = {"uuid": "fake_uuid"}
 
         called = {'fault_added': False}
 
@@ -965,31 +1222,19 @@ class ComputeTestCase(BaseTestCase):
                        did_it_add_fault)
 
         @compute_manager.wrap_instance_fault
-        def failer(self2, context, instance_uuid):
-            raise exception.InstanceNotFound(instance_id=instance_uuid)
+        def failer(self2, context, instance):
+            raise exception.InstanceNotFound(instance_id=instance['uuid'])
 
         self.assertRaises(exception.InstanceNotFound, failer,
-                          self.compute, self.context, inst_uuid)
+                          self.compute, self.context, inst)
 
         self.assertFalse(called['fault_added'])
 
-    def test_wrap_instance_event(self):
+    @mock.patch.object(objects.InstanceActionEvent, 'event_start')
+    @mock.patch.object(objects.InstanceActionEvent,
+                       'event_finish_with_failure')
+    def test_wrap_instance_event(self, mock_finish, mock_start):
         inst = {"uuid": "fake_uuid"}
-
-        called = {'started': False,
-                  'finished': False}
-
-        def did_it_update_start(self2, context, values):
-            called['started'] = True
-
-        def did_it_update_finish(self2, context, values):
-            called['finished'] = True
-
-        self.stubs.Set(conductor_manager.ConductorManager,
-                       'action_event_start', did_it_update_start)
-
-        self.stubs.Set(conductor_manager.ConductorManager,
-                       'action_event_finish', did_it_update_finish)
 
         @compute_manager.wrap_instance_event
         def fake_event(self, context, instance):
@@ -997,28 +1242,30 @@ class ComputeTestCase(BaseTestCase):
 
         fake_event(self.compute, self.context, instance=inst)
 
-        self.assertTrue(called['started'])
-        self.assertTrue(called['finished'])
+        self.assertTrue(mock_start.called)
+        self.assertTrue(mock_finish.called)
 
-    def test_wrap_instance_event_log_exception(self):
+    @mock.patch.object(objects.InstanceActionEvent, 'event_start')
+    @mock.patch.object(objects.InstanceActionEvent,
+                       'event_finish_with_failure')
+    def test_wrap_instance_event_return(self, mock_finish, mock_start):
         inst = {"uuid": "fake_uuid"}
 
-        called = {'started': False,
-                  'finished': False,
-                  'message': ''}
+        @compute_manager.wrap_instance_event
+        def fake_event(self, context, instance):
+            return True
 
-        def did_it_update_start(self2, context, values):
-            called['started'] = True
+        retval = fake_event(self.compute, self.context, instance=inst)
 
-        def did_it_update_finish(self2, context, values):
-            called['finished'] = True
-            called['message'] = values['message']
+        self.assertTrue(retval)
+        self.assertTrue(mock_start.called)
+        self.assertTrue(mock_finish.called)
 
-        self.stubs.Set(conductor_manager.ConductorManager,
-                       'action_event_start', did_it_update_start)
-
-        self.stubs.Set(conductor_manager.ConductorManager,
-                       'action_event_finish', did_it_update_finish)
+    @mock.patch.object(objects.InstanceActionEvent, 'event_start')
+    @mock.patch.object(objects.InstanceActionEvent,
+                       'event_finish_with_failure')
+    def test_wrap_instance_event_log_exception(self, mock_finish, mock_start):
+        inst = {"uuid": "fake_uuid"}
 
         @compute_manager.wrap_instance_event
         def fake_event(self2, context, instance):
@@ -1027,16 +1274,17 @@ class ComputeTestCase(BaseTestCase):
         self.assertRaises(exception.NovaException, fake_event,
                           self.compute, self.context, instance=inst)
 
-        self.assertTrue(called['started'])
-        self.assertTrue(called['finished'])
-        self.assertEqual('An unknown exception occurred.', called['message'])
+        self.assertTrue(mock_start.called)
+        self.assertTrue(mock_finish.called)
+        args, kwargs = mock_finish.call_args
+        self.assertIsInstance(kwargs['exc_val'], exception.NovaException)
 
     def test_object_compat(self):
         db_inst = fake_instance.fake_db_instance()
 
         @compute_manager.object_compat
         def test_fn(_self, context, instance):
-            self.assertIsInstance(instance, instance_obj.Instance)
+            self.assertIsInstance(instance, objects.Instance)
             self.assertEqual(instance.uuid, db_inst['uuid'])
         test_fn(None, self.context, instance=db_inst)
 
@@ -1045,7 +1293,7 @@ class ComputeTestCase(BaseTestCase):
 
         @compute_manager.object_compat
         def test_fn(_self, context, instance, pos_arg_1, pos_arg_2):
-            self.assertIsInstance(instance, instance_obj.Instance)
+            self.assertIsInstance(instance, objects.Instance)
             self.assertEqual(instance.uuid, db_inst['uuid'])
             self.assertEqual(pos_arg_1, 'fake_pos_arg1')
             self.assertEqual(pos_arg_2, 'fake_pos_arg2')
@@ -1090,7 +1338,7 @@ class ComputeTestCase(BaseTestCase):
         self.rt.update_available_resource(self.context.elevated())
         params = {"memory_mb": 999999999999}
         filter_properties = {'limits': {'memory_mb': None}}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.compute.run_instance(self.context, instance, {},
                 filter_properties, [], None, None, True, None, False)
         self.assertEqual(999999999999, self.rt.compute_node['memory_mb_used'])
@@ -1101,7 +1349,7 @@ class ComputeTestCase(BaseTestCase):
         params = {"root_gb": 999999999999,
                   "ephemeral_gb": 99999999999}
         filter_properties = {'limits': {'disk_gb': None}}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.compute.run_instance(self.context, instance, {},
                 filter_properties, [], None, None, True, None, False)
 
@@ -1110,21 +1358,21 @@ class ComputeTestCase(BaseTestCase):
         self.rt.update_available_resource(self.context.elevated())
         filter_properties = {'limits': {'memory_mb': 4096, 'disk_gb': 1000}}
         params = {"memory_mb": 1024, "root_gb": 128, "ephemeral_gb": 128}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.compute.run_instance(self.context, instance, {},
                 filter_properties, [], None, None, True, None, False)
         self.assertEqual(1024, self.rt.compute_node['memory_mb_used'])
         self.assertEqual(256, self.rt.compute_node['local_gb_used'])
 
         params = {"memory_mb": 2048, "root_gb": 256, "ephemeral_gb": 256}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.compute.run_instance(self.context, instance, {},
                 filter_properties, [], None, None, True, None, False)
         self.assertEqual(3072, self.rt.compute_node['memory_mb_used'])
         self.assertEqual(768, self.rt.compute_node['local_gb_used'])
 
         params = {"memory_mb": 8192, "root_gb": 8192, "ephemeral_gb": 8192}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.assertRaises(exception.ComputeResourcesUnavailable,
                 self.compute.run_instance, self.context, instance,
                 {}, filter_properties, [], None, None, True, None, False)
@@ -1160,7 +1408,7 @@ class ComputeTestCase(BaseTestCase):
         # total_mem_mb, but is less than the oversubscribed limit:
         params = {"memory_mb": instance_mb, "root_gb": 128,
                   "ephemeral_gb": 128}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
 
         limits = {'memory_mb': oversub_limit_mb}
         filter_properties = {'limits': limits}
@@ -1184,7 +1432,7 @@ class ComputeTestCase(BaseTestCase):
         instance_mb = int(total_mem_mb * 1.55)
 
         # build an instance, specifying an amount of memory that exceeds
-        # total_mem_mb, but is less than the oversubscribed limit:
+        # both total_mem_mb and the oversubscribed limit:
         params = {"memory_mb": instance_mb, "root_gb": 128,
                   "ephemeral_gb": 128}
         instance = self._create_fake_instance(params)
@@ -1211,7 +1459,7 @@ class ComputeTestCase(BaseTestCase):
         # total_mem_mb, but is less than the oversubscribed limit:
         params = {"memory_mb": 10, "root_gb": 1,
                   "ephemeral_gb": 1, "vcpus": 2}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.compute.run_instance(self.context, instance, {},
                 filter_properties, [], None, None, True, None, False)
 
@@ -1220,7 +1468,7 @@ class ComputeTestCase(BaseTestCase):
         # create one more instance:
         params = {"memory_mb": 10, "root_gb": 1,
                   "ephemeral_gb": 1, "vcpus": 1}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.compute.run_instance(self.context, instance, {},
                 filter_properties, [], None, None, True, None, False)
 
@@ -1236,7 +1484,7 @@ class ComputeTestCase(BaseTestCase):
         # now oversubscribe vcpus and fail:
         params = {"memory_mb": 10, "root_gb": 1,
                   "ephemeral_gb": 1, "vcpus": 2}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
 
         limits = {'vcpu': 3}
         filter_properties = {'limits': limits}
@@ -1260,7 +1508,7 @@ class ComputeTestCase(BaseTestCase):
         # build an instance, specifying an amount of disk that exceeds
         # total_disk_gb, but is less than the oversubscribed limit:
         params = {"root_gb": instance_gb, "memory_mb": 10}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
 
         limits = {'disk_gb': oversub_limit_gb}
         filter_properties = {'limits': limits}
@@ -1295,7 +1543,7 @@ class ComputeTestCase(BaseTestCase):
                 filter_properties, [], None, None, True, None, False)
 
     def test_create_instance_without_node_param(self):
-        instance = self._create_fake_instance({'node': None})
+        instance = self._create_fake_instance_obj({'node': None})
 
         self.compute.run_instance(self.context, instance, {}, {}, [], None,
                 None, True, None, False)
@@ -1307,7 +1555,7 @@ class ComputeTestCase(BaseTestCase):
     def test_create_instance_no_image(self):
         # Create instance with no image provided.
         params = {'image_ref': ''}
-        instance = self._create_fake_instance(params)
+        instance = self._create_fake_instance_obj(params)
         self.compute.run_instance(self.context, instance, {}, {}, [], None,
                 None, True, None, False)
         self._assert_state({'vm_state': vm_states.ACTIVE,
@@ -1360,7 +1608,7 @@ class ComputeTestCase(BaseTestCase):
         params = {'vm_state': vm_states.ERROR,
                   'task_state': task_states.SCHEDULING}
         self._create_fake_instance(params=params)
-        #check state is failed even after the periodic poll
+        # check state is failed even after the periodic poll
         self.compute.periodic_tasks(context.get_admin_context())
         self._assert_state({'vm_state': vm_states.ERROR,
                             'task_state': task_states.SCHEDULING})
@@ -1372,22 +1620,46 @@ class ComputeTestCase(BaseTestCase):
         the instance goes to ERROR state, keeping the task state
         """
         def fake(*args, **kwargs):
-            raise test.TestingException()
+            raise exception.InvalidBDM()
         self.stubs.Set(nova.compute.manager.ComputeManager,
                        '_prep_block_device', fake)
         instance = self._create_fake_instance()
-        self.assertRaises(test.TestingException, self.compute.run_instance,
+        self.assertRaises(exception.InvalidBDM, self.compute.run_instance,
                           self.context, instance=instance, request_spec={},
                           filter_properties={}, requested_networks=[],
                           injected_files=None, admin_password=None,
                           is_first_time=True, node=None,
                           legacy_bdm_in_spec=False)
-        #check state is failed even after the periodic poll
+        # check state is failed even after the periodic poll
         self._assert_state({'vm_state': vm_states.ERROR,
                             'task_state': None})
         self.compute.periodic_tasks(context.get_admin_context())
         self._assert_state({'vm_state': vm_states.ERROR,
                             'task_state': None})
+
+    @mock.patch('nova.compute.manager.ComputeManager._prep_block_device',
+                side_effect=exception.OverQuota(overs='volumes'))
+    def test_setup_block_device_over_quota_fail(self, mock_prep_block_dev):
+        """block device mapping over quota failure test.
+
+        Make sure when we're over volume quota according to Cinder client, the
+        appropriate exception is raised and the instances to ERROR state, keep
+        the task state.
+        """
+        instance = self._create_fake_instance()
+        self.assertRaises(exception.OverQuota, self.compute.run_instance,
+                          self.context, instance=instance, request_spec={},
+                          filter_properties={}, requested_networks=[],
+                          injected_files=None, admin_password=None,
+                          is_first_time=True, node=None,
+                          legacy_bdm_in_spec=False)
+        # check state is failed even after the periodic poll
+        self._assert_state({'vm_state': vm_states.ERROR,
+                            'task_state': None})
+        self.compute.periodic_tasks(context.get_admin_context())
+        self._assert_state({'vm_state': vm_states.ERROR,
+                            'task_state': None})
+        self.assertTrue(mock_prep_block_dev.called)
 
     def test_run_instance_spawn_fail(self):
         """spawn failure test.
@@ -1398,14 +1670,14 @@ class ComputeTestCase(BaseTestCase):
         def fake(*args, **kwargs):
             raise test.TestingException()
         self.stubs.Set(self.compute.driver, 'spawn', fake)
-        instance = self._create_fake_instance()
+        instance = self._create_fake_instance_obj()
         self.assertRaises(test.TestingException, self.compute.run_instance,
                           self.context, instance=instance, request_spec={},
                           filter_properties={}, requested_networks=[],
                           injected_files=None, admin_password=None,
                           is_first_time=True, node=None,
                           legacy_bdm_in_spec=False)
-        #check state is failed even after the periodic poll
+        # check state is failed even after the periodic poll
         self._assert_state({'vm_state': vm_states.ERROR,
                             'task_state': None})
         self.compute.periodic_tasks(context.get_admin_context())
@@ -1418,7 +1690,7 @@ class ComputeTestCase(BaseTestCase):
         Make sure that when an instance is not found during spawn
         that the network is deallocated
         """
-        instance = self._create_fake_instance()
+        instance = self._create_fake_instance_obj()
 
         def fake(*args, **kwargs):
             raise exception.InstanceNotFound(instance_id="fake")
@@ -1477,7 +1749,7 @@ class ComputeTestCase(BaseTestCase):
 
     def test_can_terminate_on_error_state(self):
         # Make sure that the instance can be terminated in ERROR state.
-        #check failed to schedule --> terminate
+        # check failed to schedule --> terminate
         params = {'vm_state': vm_states.ERROR}
         instance = self._create_fake_instance_obj(params=params)
         self.compute.terminate_instance(self.context, instance, [], [])
@@ -1534,13 +1806,31 @@ class ComputeTestCase(BaseTestCase):
         def fake_volume_get(self, context, volume_id):
             return {'id': volume_id}
 
-        def fake_rpc_reserve_block_device_name(self, context, **kwargs):
+        def fake_terminate_connection(self, context, volume_id, connector):
             pass
+
+        def fake_detach(self, context, volume_id):
+            pass
+
+        bdms = []
+
+        def fake_rpc_reserve_block_device_name(self, context, **kwargs):
+            bdm = objects.BlockDeviceMapping(
+                        **{'source_type': 'volume',
+                           'destination_type': 'volume',
+                           'volume_id': 1,
+                           'instance_uuid': instance['uuid'],
+                           'device_name': '/dev/vdc'})
+            bdm.create(context)
+            bdms.append(bdm)
 
         self.stubs.Set(cinder.API, 'get', fake_volume_get)
         self.stubs.Set(cinder.API, 'check_attach', fake_check_attach)
         self.stubs.Set(cinder.API, 'reserve_volume',
                        fake_reserve_volume)
+        self.stubs.Set(cinder.API, 'terminate_connection',
+                       fake_terminate_connection)
+        self.stubs.Set(cinder.API, 'detach', fake_detach)
         self.stubs.Set(compute_rpcapi.ComputeAPI,
                        'reserve_block_device_name',
                        fake_rpc_reserve_block_device_name)
@@ -1549,7 +1839,7 @@ class ComputeTestCase(BaseTestCase):
                                        '/dev/vdc')
 
         self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+                self._objectify(instance), bdms, [])
 
         instances = db.instance_get_all(self.context)
         LOG.info(_("After terminating instances: %s"), instances)
@@ -1559,8 +1849,7 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual(len(bdms), 0)
 
     def test_run_terminate_no_image(self):
-        """
-        Make sure instance started without image (from volume)
+        """Make sure instance started without image (from volume)
         can be termintad without issues
         """
         params = {'image_ref': ''}
@@ -1585,40 +1874,6 @@ class ComputeTestCase(BaseTestCase):
         instances = db.instance_get_all(self.context)
         LOG.info(_("Running instances: %s"), instances)
         self.assertEqual(len(instances), 1)
-
-        # Make it look like this is no instance
-        self.mox.StubOutWithMock(self.compute, '_get_instance_nw_info')
-        self.compute._get_instance_nw_info(
-                mox.IgnoreArg(),
-                mox.IgnoreArg()).AndRaise(
-                    exception.NetworkNotFound(network_id='fake')
-                )
-        self.mox.ReplayAll()
-
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
-
-        instances = db.instance_get_all(self.context)
-        LOG.info(_("After terminating instances: %s"), instances)
-        self.assertEqual(len(instances), 0)
-
-    def test_terminate_no_fixed_ips(self):
-        # This is as reported in LP bug 1192893
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
-
-        instances = db.instance_get_all(self.context)
-        LOG.info(_("Running instances: %s"), instances)
-        self.assertEqual(len(instances), 1)
-
-        self.mox.StubOutWithMock(self.compute, '_get_instance_nw_info')
-        self.compute._get_instance_nw_info(
-                mox.IgnoreArg(),
-                mox.IgnoreArg()).AndRaise(
-                    exception.NoMoreFixedIps()
-                )
         self.mox.ReplayAll()
 
         self.compute.terminate_instance(self.context,
@@ -1684,9 +1939,9 @@ class ComputeTestCase(BaseTestCase):
                            {"task_state": task_states.POWERING_OFF})
         inst_uuid = instance['uuid']
         extra = ['system_metadata', 'metadata']
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     inst_uuid,
-                                                     expected_attrs=extra)
+        inst_obj = objects.Instance.get_by_uuid(self.context,
+                                                inst_uuid,
+                                                expected_attrs=extra)
         self.compute.stop_instance(self.context, instance=inst_obj)
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), [], [])
@@ -1700,9 +1955,9 @@ class ComputeTestCase(BaseTestCase):
                            {"task_state": task_states.POWERING_OFF})
         extra = ['system_metadata', 'metadata']
         inst_uuid = instance['uuid']
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     inst_uuid,
-                                                     expected_attrs=extra)
+        inst_obj = objects.Instance.get_by_uuid(self.context,
+                                                inst_uuid,
+                                                expected_attrs=extra)
         self.compute.stop_instance(self.context, instance=inst_obj)
         inst_obj.task_state = task_states.POWERING_ON
         inst_obj.save(self.context)
@@ -1719,9 +1974,9 @@ class ComputeTestCase(BaseTestCase):
                            {"task_state": task_states.POWERING_OFF})
         extra = ['system_metadata', 'metadata']
         inst_uuid = instance['uuid']
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     inst_uuid,
-                                                     expected_attrs=extra)
+        inst_obj = objects.Instance.get_by_uuid(self.context,
+                                                inst_uuid,
+                                                expected_attrs=extra)
         self.compute.stop_instance(self.context, instance=inst_obj)
         inst_obj.task_state = task_states.POWERING_ON
         inst_obj.save(self.context)
@@ -1747,22 +2002,20 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(nova.virt.fake.FakeDriver, 'unrescue',
                        fake_unrescue)
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        instance_uuid = instance['uuid']
+        instance = self._create_fake_instance_obj()
         self.compute.run_instance(self.context, instance, {}, {}, [], None,
                 None, True, None, False)
 
-        db.instance_update(self.context, instance_uuid,
-                           {"task_state": task_states.RESCUING})
+        instance.task_state = task_states.RESCUING
+        instance.save()
         self.compute.rescue_instance(self.context, instance, None)
         self.assertTrue(called['rescued'])
-        db.instance_update(self.context, instance_uuid,
-                           {"task_state": task_states.UNRESCUING})
-        self.compute.unrescue_instance(self.context, instance=instance)
+        instance.task_state = task_states.UNRESCUING
+        instance.save()
+        self.compute.unrescue_instance(self.context, instance)
         self.assertTrue(called['unrescued'])
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_rescue_notifications(self):
         # Ensure notifications on instance rescue.
@@ -1771,18 +2024,17 @@ class ComputeTestCase(BaseTestCase):
             pass
         self.stubs.Set(nova.virt.fake.FakeDriver, 'rescue', fake_rescue)
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        instance_uuid = instance['uuid']
+        instance = self._create_fake_instance_obj()
         self.compute.run_instance(self.context, instance, {}, {}, [], None,
                 None, True, None, False)
 
         fake_notifier.NOTIFICATIONS = []
-        db.instance_update(self.context, instance_uuid,
-                           {"task_state": task_states.RESCUING})
+        instance.task_state = task_states.RESCUING
+        instance.save()
         self.compute.rescue_instance(self.context, instance, None)
 
-        expected_notifications = ['compute.instance.exists',
-                                  'compute.instance.rescue.start',
+        expected_notifications = ['compute.instance.rescue.start',
+                                  'compute.instance.exists',
                                   'compute.instance.rescue.end']
         self.assertEqual([m.event_type for m in fake_notifier.NOTIFICATIONS],
                          expected_notifications)
@@ -1792,7 +2044,7 @@ class ComputeTestCase(BaseTestCase):
             payload = msg.payload
             self.assertEqual(payload['tenant_id'], self.project_id)
             self.assertEqual(payload['user_id'], self.user_id)
-            self.assertEqual(payload['instance_id'], instance_uuid)
+            self.assertEqual(payload['instance_id'], instance.uuid)
             self.assertEqual(payload['instance_type'], 'm1.tiny')
             type_id = flavors.get_flavor_by_name('m1.tiny')['id']
             self.assertEqual(str(payload['instance_type_id']), str(type_id))
@@ -1801,11 +2053,10 @@ class ComputeTestCase(BaseTestCase):
             self.assertIn('launched_at', payload)
             image_ref_url = glance.generate_image_url(FAKE_IMAGE_REF)
             self.assertEqual(payload['image_ref_url'], image_ref_url)
-        msg = fake_notifier.NOTIFICATIONS[1]
+        msg = fake_notifier.NOTIFICATIONS[0]
         self.assertIn('rescue_image_name', msg.payload)
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_unrescue_notifications(self):
         # Ensure notifications on instance rescue.
@@ -1814,15 +2065,14 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(nova.virt.fake.FakeDriver, 'unrescue',
                        fake_unrescue)
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        instance_uuid = instance['uuid']
+        instance = self._create_fake_instance_obj()
         self.compute.run_instance(self.context, instance, {}, {}, [], None,
                 None, True, None, False)
 
         fake_notifier.NOTIFICATIONS = []
-        db.instance_update(self.context, instance_uuid,
-                           {"task_state": task_states.UNRESCUING})
-        self.compute.unrescue_instance(self.context, instance=instance)
+        instance.task_state = task_states.UNRESCUING
+        instance.save()
+        self.compute.unrescue_instance(self.context, instance)
 
         expected_notifications = ['compute.instance.unrescue.start',
                                   'compute.instance.unrescue.end']
@@ -1834,7 +2084,7 @@ class ComputeTestCase(BaseTestCase):
             payload = msg.payload
             self.assertEqual(payload['tenant_id'], self.project_id)
             self.assertEqual(payload['user_id'], self.user_id)
-            self.assertEqual(payload['instance_id'], instance_uuid)
+            self.assertEqual(payload['instance_id'], instance.uuid)
             self.assertEqual(payload['instance_type'], 'm1.tiny')
             type_id = flavors.get_flavor_by_name('m1.tiny')['id']
             self.assertEqual(str(payload['instance_type_id']), str(type_id))
@@ -1844,35 +2094,88 @@ class ComputeTestCase(BaseTestCase):
             image_ref_url = glance.generate_image_url(FAKE_IMAGE_REF)
             self.assertEqual(payload['image_ref_url'], image_ref_url)
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_rescue_handle_err(self):
         # If the driver fails to rescue, instance state should remain the same
         # and the exception should be converted to InstanceNotRescuable
-        instance = jsonutils.to_primitive(self._create_fake_instance())
+        inst_obj = self._create_fake_instance_obj()
         self.mox.StubOutWithMock(self.compute, '_get_rescue_image')
         self.mox.StubOutWithMock(nova.virt.fake.FakeDriver, 'rescue')
 
         self.compute._get_rescue_image(
-            mox.IgnoreArg(), instance).AndReturn({})
+            mox.IgnoreArg(), inst_obj, mox.IgnoreArg()).AndReturn({})
         nova.virt.fake.FakeDriver.rescue(
-            mox.IgnoreArg(), instance, [], mox.IgnoreArg(), 'password'
+            mox.IgnoreArg(), inst_obj, [], mox.IgnoreArg(), 'password'
             ).AndRaise(RuntimeError("Try again later"))
 
         self.mox.ReplayAll()
 
         expected_message = ('Instance %s cannot be rescued: '
-                            'Driver Error: Try again later' % instance['uuid'])
-        instance['vm_state'] = 'some_random_state'
+                            'Driver Error: Try again later' % inst_obj.uuid)
+        inst_obj.vm_state = 'some_random_state'
 
         with testtools.ExpectedException(
                 exception.InstanceNotRescuable, expected_message):
                 self.compute.rescue_instance(
-                    self.context, instance=instance,
+                    self.context, instance=inst_obj,
                     rescue_password='password')
 
-        self.assertEqual('some_random_state', instance['vm_state'])
+        self.assertEqual('some_random_state', inst_obj.vm_state)
+
+    @mock.patch.object(nova.compute.utils, "get_image_metadata")
+    @mock.patch.object(nova.virt.fake.FakeDriver, "rescue")
+    def test_rescue_with_image_specified(self, mock_rescue,
+                                         mock_get_image_metadata):
+
+        image_ref = "image-ref"
+        rescue_image_meta = {}
+        params = {"task_state": task_states.RESCUING}
+        instance = self._create_fake_instance_obj(params=params)
+
+        ctxt = context.get_admin_context()
+        mock_context = mock.Mock()
+        mock_context.elevated.return_value = ctxt
+
+        mock_get_image_metadata.return_value = rescue_image_meta
+
+        self.compute.rescue_instance(mock_context, instance=instance,
+            rescue_password="password", rescue_image_ref=image_ref)
+
+        mock_get_image_metadata.assert_called_with(ctxt,
+                                                   self.compute.image_api,
+                                                   image_ref, instance)
+        mock_rescue.assert_called_with(ctxt, instance, [],
+                                       rescue_image_meta, 'password')
+        self.compute.terminate_instance(ctxt, instance, [], [])
+
+    @mock.patch.object(nova.compute.utils, "get_image_metadata")
+    @mock.patch.object(nova.virt.fake.FakeDriver, "rescue")
+    def test_rescue_with_base_image_when_image_not_specified(self,
+            mock_rescue, mock_get_image_metadata):
+
+        image_ref = "image-ref"
+        system_meta = {"image_base_image_ref": image_ref}
+        rescue_image_meta = {}
+        params = {"task_state": task_states.RESCUING,
+                  "system_metadata": system_meta}
+        instance = self._create_fake_instance_obj(params=params)
+
+        ctxt = context.get_admin_context()
+        mock_context = mock.Mock()
+        mock_context.elevated.return_value = ctxt
+
+        mock_get_image_metadata.return_value = rescue_image_meta
+
+        self.compute.rescue_instance(mock_context, instance=instance,
+                                     rescue_password="password")
+
+        mock_get_image_metadata.assert_called_with(ctxt,
+                                                   self.compute.image_api,
+                                                   image_ref, instance)
+        mock_rescue.assert_called_with(ctxt, instance, [],
+                                       rescue_image_meta, 'password')
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_power_on(self):
         # Ensure instance can be powered on.
@@ -1890,9 +2193,9 @@ class ComputeTestCase(BaseTestCase):
         self.compute.run_instance(self.context, instance, {}, {}, [], None,
                 None, True, None, False)
         extra = ['system_metadata', 'metadata']
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     instance['uuid'],
-                                                     expected_attrs=extra)
+        inst_obj = objects.Instance.get_by_uuid(self.context,
+                                                instance['uuid'],
+                                                expected_attrs=extra)
         inst_obj.task_state = task_states.POWERING_ON
         inst_obj.save(self.context)
         self.compute.start_instance(self.context, instance=inst_obj)
@@ -1915,9 +2218,9 @@ class ComputeTestCase(BaseTestCase):
         self.compute.run_instance(self.context, instance, {}, {}, [], None,
                 None, True, None, False)
         extra = ['system_metadata', 'metadata']
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     instance['uuid'],
-                                                     expected_attrs=extra)
+        inst_obj = objects.Instance.get_by_uuid(self.context,
+                                                instance['uuid'],
+                                                expected_attrs=extra)
         inst_obj.task_state = task_states.POWERING_OFF
         inst_obj.save(self.context)
         self.compute.stop_instance(self.context, instance=inst_obj)
@@ -2030,6 +2333,39 @@ class ComputeTestCase(BaseTestCase):
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), [], [])
 
+    def test_rebuild_driver(self):
+        # Make sure virt drivers can override default rebuild
+        called = {'rebuild': False}
+
+        def fake(**kwargs):
+            instance = kwargs['instance']
+            instance.task_state = task_states.REBUILD_BLOCK_DEVICE_MAPPING
+            instance.save(expected_task_state=[task_states.REBUILDING])
+            instance.task_state = task_states.REBUILD_SPAWNING
+            instance.save(
+                expected_task_state=[task_states.REBUILD_BLOCK_DEVICE_MAPPING])
+            called['rebuild'] = True
+
+        self.stubs.Set(self.compute.driver, 'rebuild', fake)
+        instance = jsonutils.to_primitive(self._create_fake_instance())
+        image_ref = instance['image_ref']
+        sys_metadata = db.instance_system_metadata_get(self.context,
+                        instance['uuid'])
+        self.compute.run_instance(self.context, instance, {}, {}, [], None,
+                None, True, None, False)
+        db.instance_update(self.context, instance['uuid'],
+                           {"task_state": task_states.REBUILDING})
+        self.compute.rebuild_instance(self.context, self._objectify(instance),
+                                      image_ref, image_ref,
+                                      injected_files=[],
+                                      new_pass="new_password",
+                                      orig_sys_metadata=sys_metadata,
+                                      bdms=[], recreate=False,
+                                      on_shared_storage=False)
+        self.assertTrue(called['rebuild'])
+        self.compute.terminate_instance(self.context,
+                self._objectify(instance), [], [])
+
     def test_rebuild_no_image(self):
         # Ensure instance can be rebuilt when started with no image.
         params = {'image_ref': ''}
@@ -2108,11 +2444,26 @@ class ComputeTestCase(BaseTestCase):
     def _test_reboot(self, soft,
                      test_delete=False, test_unrescue=False,
                      fail_reboot=False, fail_running=False):
+
+        reboot_type = soft and 'SOFT' or 'HARD'
+        task_pending = (soft and task_states.REBOOT_PENDING
+                             or task_states.REBOOT_PENDING_HARD)
+        task_started = (soft and task_states.REBOOT_STARTED
+                             or task_states.REBOOT_STARTED_HARD)
+        expected_task = (soft and task_states.REBOOTING
+                               or task_states.REBOOTING_HARD)
+        expected_tasks = (soft and (task_states.REBOOTING,
+                                    task_states.REBOOT_PENDING,
+                                    task_states.REBOOT_STARTED)
+                               or (task_states.REBOOTING_HARD,
+                                   task_states.REBOOT_PENDING_HARD,
+                                   task_states.REBOOT_STARTED_HARD))
+
         # This is a true unit test, so we don't need the network stubs.
         fake_network.unset_stub_network_methods(self.stubs)
 
         self.mox.StubOutWithMock(self.compute,
-                                 '_get_instance_volume_block_device_info')
+                                 '_get_instance_block_device_info')
         self.mox.StubOutWithMock(self.compute, '_get_instance_nw_info')
         self.mox.StubOutWithMock(self.compute, '_notify_about_instance_usage')
         self.mox.StubOutWithMock(self.compute, '_instance_update')
@@ -2130,23 +2481,27 @@ class ComputeTestCase(BaseTestCase):
             **dict(uuid='fake-instance',
                    power_state=power_state.NOSTATE,
                    vm_state=vm_states.ACTIVE,
+                   task_state=expected_task,
                    launched_at=timeutils.utcnow()))
-        instance = instance_obj.Instance._from_db_object(
-            econtext, instance_obj.Instance(), db_instance)
+        instance = objects.Instance._from_db_object(econtext,
+                                                    objects.Instance(),
+                                                    db_instance)
 
         updated_dbinstance1 = fake_instance.fake_db_instance(
             **dict(uuid='updated-instance1',
                    power_state=10003,
                    vm_state=vm_states.ACTIVE,
+                   task_state=expected_task,
                    launched_at=timeutils.utcnow()))
         updated_dbinstance2 = fake_instance.fake_db_instance(
             **dict(uuid='updated-instance2',
                    power_state=10003,
                    vm_state=vm_states.ACTIVE,
+                   task_state=expected_task,
                    launched_at=timeutils.utcnow()))
 
         if test_unrescue:
-            instance['vm_state'] = vm_states.RESCUED
+            instance.vm_state = vm_states.RESCUED
         instance.obj_reset_changes()
 
         fake_nw_model = network_model.NetworkInfo()
@@ -2155,14 +2510,13 @@ class ComputeTestCase(BaseTestCase):
         fake_power_state1 = 10001
         fake_power_state2 = power_state.RUNNING
         fake_power_state3 = 10002
-        reboot_type = soft and 'SOFT' or 'HARD'
 
         # Beginning of calls we expect.
 
         self.mox.StubOutWithMock(self.context, 'elevated')
         self.context.elevated().AndReturn(econtext)
 
-        self.compute._get_instance_volume_block_device_info(
+        self.compute._get_instance_block_device_info(
             econtext, instance).AndReturn(fake_block_dev_info)
         self.compute._get_instance_nw_info(econtext,
                                            instance).AndReturn(
@@ -2173,13 +2527,22 @@ class ComputeTestCase(BaseTestCase):
         self.compute._get_power_state(econtext,
                 instance).AndReturn(fake_power_state1)
         db.instance_update_and_get_original(econtext, instance['uuid'],
-                                            {'power_state': fake_power_state1},
-                                            update_cells=False,
-                                            columns_to_join=['system_metadata']
-                                            ).AndReturn((None,
-                                                         updated_dbinstance1))
-
+                                        {'task_state': task_pending,
+                                         'expected_task_state': expected_tasks,
+                                         'power_state': fake_power_state1},
+                                        update_cells=False,
+                                        columns_to_join=['system_metadata']
+                                        ).AndReturn((None,
+                                                     updated_dbinstance1))
         expected_nw_info = fake_nw_model
+        db.instance_update_and_get_original(econtext,
+                                        updated_dbinstance1['uuid'],
+                                        {'task_state': task_started,
+                                         'expected_task_state': task_pending},
+                                        update_cells=False,
+                                        columns_to_join=['system_metadata']
+                                        ).AndReturn((None,
+                                                     updated_dbinstance1))
 
         # Annoying.  driver.reboot is wrapped in a try/except, and
         # doesn't re-raise.  It eats exception generated by mox if
@@ -2190,6 +2553,7 @@ class ComputeTestCase(BaseTestCase):
             'args': (econtext, instance, expected_nw_info,
                      reboot_type),
             'kwargs': {'block_device_info': fake_block_dev_info}}
+        fault = exception.InstanceNotFound(instance_id='instance-0000')
 
         def fake_reboot(*args, **kwargs):
             reboot_call_info['args'] = args
@@ -2200,7 +2564,7 @@ class ComputeTestCase(BaseTestCase):
             # can't stub it out, thus we skip that comparison.
             kwargs.pop('bad_volumes_callback')
             if fail_reboot:
-                raise exception.InstanceNotFound(instance_id='instance-0000')
+                raise fault
 
         self.stubs.Set(self.compute.driver, 'reboot', fake_reboot)
 
@@ -2215,6 +2579,8 @@ class ComputeTestCase(BaseTestCase):
                     instance).AndReturn(fake_power_state3)
 
         if test_delete:
+            fault = exception.InstanceNotFound(
+                        instance_id=instance['uuid'])
             db.instance_update_and_get_original(
                 econtext, updated_dbinstance1['uuid'],
                 {'power_state': new_power_state,
@@ -2222,8 +2588,7 @@ class ComputeTestCase(BaseTestCase):
                  'vm_state': vm_states.ACTIVE},
                 update_cells=False,
                 columns_to_join=['system_metadata'],
-                ).AndRaise(exception.InstanceNotFound(
-                    instance_id=instance['uuid']))
+                ).AndRaise(fault)
             self.compute._notify_about_instance_usage(
                 econtext,
                 instance,
@@ -2234,8 +2599,7 @@ class ComputeTestCase(BaseTestCase):
                 {'vm_state': vm_states.ERROR},
                 update_cells=False,
                 columns_to_join=['system_metadata'],
-                ).AndRaise(exception.InstanceNotFound(
-                    instance_id=instance['uuid']))
+                ).AndRaise(fault)
         else:
             db.instance_update_and_get_original(
                 econtext, updated_dbinstance1['uuid'],
@@ -2245,6 +2609,9 @@ class ComputeTestCase(BaseTestCase):
                 update_cells=False,
                 columns_to_join=['system_metadata'],
                 ).AndReturn((None, updated_dbinstance2))
+            if fail_running:
+                self.compute._notify_about_instance_usage(econtext, instance,
+                        'reboot.error', fault=fault)
             self.compute._notify_about_instance_usage(
                 econtext,
                 instance,
@@ -2296,177 +2663,138 @@ class ComputeTestCase(BaseTestCase):
         self._test_reboot(False, fail_reboot=True,
                           fail_running=True)
 
-    def test_get_instance_volume_block_device_info_source_image(self):
-        def _fake_get_instance_volume_bdms(context, instance, legacy=True):
-            bdms = [{
+    def test_get_instance_block_device_info_source_image(self):
+        bdms = block_device_obj.block_device_make_list(self.context,
+                [fake_block_device.FakeDbBlockDeviceDict({
                 'id': 3,
-                'volume_id': u'4cbc9e62-6ba0-45dd-b647-934942ead7d6',
-                'instance_uuid': 'fake-instance',
-                'device_name': '/dev/vda',
-                'connection_info': '{"driver_volume_type": "rbd"}',
-                'source_type': 'image',
-                'destination_type': 'volume',
-                'image_id': 'fake-image-id-1',
-                'boot_index': 0
-            }]
+                    'volume_id': u'4cbc9e62-6ba0-45dd-b647-934942ead7d6',
+                    'instance_uuid': 'fake-instance',
+                    'device_name': '/dev/vda',
+                    'connection_info': '{"driver_volume_type": "rbd"}',
+                    'source_type': 'image',
+                    'destination_type': 'volume',
+                    'image_id': 'fake-image-id-1',
+                    'boot_index': 0
+        })])
 
-            return bdms
-
-        with mock.patch.object(self.compute, '_get_instance_volume_bdms',
-                               _fake_get_instance_volume_bdms):
+        with (mock.patch.object(
+                objects.BlockDeviceMappingList,
+                'get_by_instance_uuid',
+                return_value=bdms)
+        ) as mock_get_by_instance:
             block_device_info = (
-                self.compute._get_instance_volume_block_device_info(
+                self.compute._get_instance_block_device_info(
                     self.context, self._create_fake_instance())
             )
             expected = {
+                'swap': None,
+                'ephemerals': [],
                 'block_device_mapping': [{
                     'connection_info': {
                         'driver_volume_type': 'rbd'
                     },
                     'mount_device': '/dev/vda',
-                    'delete_on_termination': None
+                    'delete_on_termination': False
                 }]
             }
+            self.assertTrue(mock_get_by_instance.called)
             self.assertEqual(block_device_info, expected)
 
-    def test_set_admin_password(self):
-        # Ensure instance can have its admin password set.
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
-        db.instance_update(self.context, instance['uuid'],
-                           {'task_state': task_states.UPDATING_PASSWORD})
+    def test_get_instance_block_device_info_passed_bdms(self):
+        bdms = block_device_obj.block_device_make_list(self.context,
+                [fake_block_device.FakeDbBlockDeviceDict({
+                    'id': 3,
+                    'volume_id': u'4cbc9e62-6ba0-45dd-b647-934942ead7d6',
+                    'device_name': '/dev/vdd',
+                    'connection_info': '{"driver_volume_type": "rbd"}',
+                    'source_type': 'volume',
+                    'destination_type': 'volume'})
+               ])
+        with (mock.patch.object(
+                objects.BlockDeviceMappingList,
+                'get_by_instance_uuid')) as mock_get_by_instance:
+            block_device_info = (
+                self.compute._get_instance_block_device_info(
+                    self.context, self._create_fake_instance(), bdms=bdms)
+            )
+            expected = {
+                'swap': None,
+                'ephemerals': [],
+                'block_device_mapping': [{
+                    'connection_info': {
+                        'driver_volume_type': 'rbd'
+                    },
+                    'mount_device': '/dev/vdd',
+                    'delete_on_termination': False
+                }]
+            }
+            self.assertFalse(mock_get_by_instance.called)
+            self.assertEqual(block_device_info, expected)
 
-        inst_ref = db.instance_get_by_uuid(self.context, instance['uuid'])
-        self.assertEqual(inst_ref['vm_state'], vm_states.ACTIVE)
-        self.assertEqual(inst_ref['task_state'], task_states.UPDATING_PASSWORD)
+    def test_get_instance_block_device_info_swap_and_ephemerals(self):
+        instance = self._create_fake_instance()
 
-        self.compute.set_admin_password(self.context, instance, None)
-
-        inst_ref = db.instance_get_by_uuid(self.context, instance['uuid'])
-        self.assertEqual(inst_ref['vm_state'], vm_states.ACTIVE)
-        self.assertIsNone(inst_ref['task_state'])
-
-        self.compute.terminate_instance(self.context,
-                self._objectify(inst_ref), [], [])
-
-    def test_set_admin_password_bad_state(self):
-        # Test setting password while instance is rebuilding.
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
-        db.instance_update(self.context, instance['uuid'], {
-            "power_state": power_state.NOSTATE,
+        ephemeral0 = fake_block_device.FakeDbBlockDeviceDict({
+            'id': 1, 'instance_uuid': 'fake-instance',
+            'device_name': '/dev/vdb',
+            'source_type': 'blank',
+            'destination_type': 'local',
+            'device_type': 'disk',
+            'disk_bus': 'virtio',
+            'delete_on_termination': True,
+            'guest_format': None,
+            'volume_size': 1,
+            'boot_index': -1
         })
-        instance = jsonutils.to_primitive(db.instance_get_by_uuid(
-                                          self.context, instance['uuid']))
+        ephemeral1 = fake_block_device.FakeDbBlockDeviceDict({
+            'id': 2, 'instance_uuid': 'fake-instance',
+            'device_name': '/dev/vdc',
+            'source_type': 'blank',
+            'destination_type': 'local',
+            'device_type': 'disk',
+            'disk_bus': 'virtio',
+            'delete_on_termination': True,
+            'guest_format': None,
+            'volume_size': 2,
+            'boot_index': -1
+        })
+        swap = fake_block_device.FakeDbBlockDeviceDict({
+            'id': 3, 'instance_uuid': 'fake-instance',
+            'device_name': '/dev/vdd',
+            'source_type': 'blank',
+            'destination_type': 'local',
+            'device_type': 'disk',
+            'disk_bus': 'virtio',
+            'delete_on_termination': True,
+            'guest_format': 'swap',
+            'volume_size': 1,
+            'boot_index': -1
+        })
 
-        self.assertEqual(instance['power_state'], power_state.NOSTATE)
+        bdms = block_device_obj.block_device_make_list(self.context,
+            [swap, ephemeral0, ephemeral1])
 
-        def fake_driver_get_info(self2, _instance):
-            return {'state': power_state.NOSTATE,
-                    'max_mem': 0,
-                    'mem': 0,
-                    'num_cpu': 2,
-                    'cpu_time': 0}
+        with (
+              mock.patch.object(objects.BlockDeviceMappingList,
+                                'get_by_instance_uuid', return_value=bdms)
+        ) as mock_get_by_instance_uuid:
+            expected_block_device_info = {
+                'swap': {'device_name': '/dev/vdd', 'swap_size': 1},
+                'ephemerals': [{'device_name': '/dev/vdb', 'num': 0, 'size': 1,
+                                'virtual_name': 'ephemeral0'},
+                               {'device_name': '/dev/vdc', 'num': 1, 'size': 2,
+                                'virtual_name': 'ephemeral1'}],
+                'block_device_mapping': []
+            }
 
-        self.stubs.Set(nova.virt.fake.FakeDriver, 'get_info',
-                       fake_driver_get_info)
+            block_device_info = (
+                self.compute._get_instance_block_device_info(
+                    self.context, instance)
+            )
 
-        db.instance_update(self.context, instance['uuid'],
-                           {"task_state": task_states.UPDATING_PASSWORD})
-        self.assertRaises(exception.InstancePasswordSetFailed,
-                          self.compute.set_admin_password,
-                          self.context,
-                          instance, None)
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
-
-    def _do_test_set_admin_password_driver_error(self, exc, expected_vm_state,
-                                                 expected_task_state,
-                                                 expected_exception):
-        """Ensure expected exception is raised if set_admin_password fails."""
-
-        def fake_sleep(_time):
-            pass
-
-        self.stubs.Set(time, 'sleep', fake_sleep)
-
-        def fake_driver_set_pass(self2, _instance, _pwd):
-            raise exc
-
-        self.stubs.Set(nova.virt.fake.FakeDriver, 'set_admin_password',
-                       fake_driver_set_pass)
-
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
-        db.instance_update(self.context, instance['uuid'],
-                           {'task_state': task_states.UPDATING_PASSWORD})
-
-        inst_ref = db.instance_get_by_uuid(self.context, instance['uuid'])
-        self.assertEqual(inst_ref['vm_state'], vm_states.ACTIVE)
-        self.assertEqual(inst_ref['task_state'], task_states.UPDATING_PASSWORD)
-
-        #error raised from the driver should not reveal internal information
-        #so a new error is raised
-        self.assertRaises(expected_exception,
-                          self.compute.set_admin_password,
-                          self.context,
-                          instance=jsonutils.to_primitive(inst_ref),
-                          new_pass=None)
-
-        inst_ref = db.instance_get_by_uuid(self.context, instance['uuid'])
-        self.assertEqual(inst_ref['vm_state'], expected_vm_state)
-        self.assertEqual(inst_ref['task_state'], expected_task_state)
-
-        self.compute.terminate_instance(self.context,
-                self._objectify(inst_ref), [], [])
-
-    def test_set_admin_password_driver_not_authorized(self):
-        """
-        Ensure expected exception is raised if set_admin_password not
-        authorized.
-        """
-        exc = exception.NotAuthorized(_('Internal error'))
-        expected_exception = exception.InstancePasswordSetFailed
-        self._do_test_set_admin_password_driver_error(exc,
-                                                vm_states.ERROR,
-                                                None,
-                                                expected_exception)
-
-    def test_set_admin_password_driver_not_implemented(self):
-        """
-        Ensure expected exception is raised if set_admin_password not
-        implemented by driver.
-        """
-        exc = NotImplementedError()
-        expected_exception = NotImplementedError
-        self._do_test_set_admin_password_driver_error(exc,
-                                                      vm_states.ACTIVE,
-                                                      None,
-                                                      expected_exception)
-
-    def test_inject_file(self):
-        # Ensure we can write a file to an instance.
-        called = {'inject': False}
-
-        def fake_driver_inject_file(self2, instance, path, contents):
-            self.assertEqual(path, "/tmp/test")
-            self.assertEqual(contents, "File Contents")
-            called['inject'] = True
-
-        self.stubs.Set(nova.virt.fake.FakeDriver, 'inject_file',
-                       fake_driver_inject_file)
-
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
-        self.compute.inject_file(self.context, "/tmp/test",
-                "File Contents", instance=instance)
-        self.assertTrue(called['inject'])
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+            mock_get_by_instance_uuid.assert_called_once_with(self.context,
+                                                              instance.uuid)
+            self.assertEqual(expected_block_device_info, block_device_info)
 
     def test_inject_network_info(self):
         # Ensure we can inject network info.
@@ -2531,7 +2859,8 @@ class ComputeTestCase(BaseTestCase):
         self.compute.snapshot_instance(self.context, image_id='fakesnap',
                                        instance=inst_obj)
 
-    def _test_snapshot_fails(self, raise_during_cleanup):
+    def _test_snapshot_fails(self, raise_during_cleanup, method,
+                             expected_state=True):
         def fake_snapshot(*args, **kwargs):
             raise test.TestingException()
 
@@ -2547,18 +2876,95 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(fake_image._FakeImageService, 'delete', fake_delete)
 
         inst_obj = self._get_snapshotting_instance()
-        self.assertRaises(test.TestingException,
-                          self.compute.snapshot_instance,
-                          self.context, image_id='fakesnap',
-                          instance=inst_obj)
-        self.assertTrue(self.fake_image_delete_called)
+        if method == 'snapshot':
+            self.assertRaises(test.TestingException,
+                              self.compute.snapshot_instance,
+                              self.context, image_id='fakesnap',
+                              instance=inst_obj)
+        else:
+            self.assertRaises(test.TestingException,
+                              self.compute.backup_instance,
+                              self.context, image_id='fakesnap',
+                              instance=inst_obj, backup_type='fake',
+                              rotation=1)
+
+        self.assertEqual(expected_state, self.fake_image_delete_called)
         self._assert_state({'task_state': None})
 
+    @mock.patch.object(nova.compute.manager.ComputeManager, '_rotate_backups')
+    def test_backup_fails(self, mock_rotate):
+        self._test_snapshot_fails(False, 'backup')
+
+    @mock.patch.object(nova.compute.manager.ComputeManager, '_rotate_backups')
+    def test_backup_fails_cleanup_ignores_exception(self, mock_rotate):
+        self._test_snapshot_fails(True, 'backup')
+
+    @mock.patch.object(nova.compute.manager.ComputeManager, '_rotate_backups')
+    @mock.patch.object(nova.compute.manager.ComputeManager,
+                       '_do_snapshot_instance')
+    def test_backup_fails_rotate_backup(self, mock_snap, mock_rotate):
+        mock_rotate.side_effect = test.TestingException()
+        self._test_snapshot_fails(True, 'backup', False)
+
     def test_snapshot_fails(self):
-        self._test_snapshot_fails(False)
+        self._test_snapshot_fails(False, 'snapshot')
 
     def test_snapshot_fails_cleanup_ignores_exception(self):
-        self._test_snapshot_fails(True)
+        self._test_snapshot_fails(True, 'snapshot')
+
+    def _test_snapshot_deletes_image_on_failure(self, status, exc):
+        self.fake_image_delete_called = False
+
+        def fake_show(self_, context, image_id, **kwargs):
+            self.assertEqual('fakesnap', image_id)
+            image = {'id': image_id,
+                     'status': status}
+            return image
+
+        self.stubs.Set(fake_image._FakeImageService, 'show', fake_show)
+
+        def fake_delete(self_, context, image_id):
+            self.fake_image_delete_called = True
+            self.assertEqual('fakesnap', image_id)
+
+        self.stubs.Set(fake_image._FakeImageService, 'delete', fake_delete)
+
+        def fake_snapshot(*args, **kwargs):
+            raise exc
+
+        self.stubs.Set(self.compute.driver, 'snapshot', fake_snapshot)
+
+        fake_image.stub_out_image_service(self.stubs)
+
+        inst_obj = self._get_snapshotting_instance()
+
+        self.compute.snapshot_instance(self.context, image_id='fakesnap',
+                                       instance=inst_obj)
+
+    def test_snapshot_fails_with_glance_error(self):
+        image_not_found = exception.ImageNotFound(image_id='fakesnap')
+        self._test_snapshot_deletes_image_on_failure('error', image_not_found)
+        self.assertFalse(self.fake_image_delete_called)
+        self._assert_state({'task_state': None})
+
+    def test_snapshot_fails_with_task_state_error(self):
+        deleting_state_error = exception.UnexpectedDeletingTaskStateError(
+            expected=task_states.IMAGE_SNAPSHOT, actual=task_states.DELETING)
+        self._test_snapshot_deletes_image_on_failure(
+            'error', deleting_state_error)
+        self.assertTrue(self.fake_image_delete_called)
+        self._test_snapshot_deletes_image_on_failure(
+            'active', deleting_state_error)
+        self.assertFalse(self.fake_image_delete_called)
+
+    def test_snapshot_fails_with_instance_not_found(self):
+        instance_not_found = exception.InstanceNotFound(instance_id='uuid')
+        self._test_snapshot_deletes_image_on_failure(
+            'error', instance_not_found)
+        self.assertTrue(self.fake_image_delete_called)
+        self._test_snapshot_deletes_image_on_failure(
+            'active', instance_not_found)
+        self.assertFalse(self.fake_image_delete_called)
 
     def test_snapshot_handles_cases_when_instance_is_deleted(self):
         inst_obj = self._get_snapshotting_instance()
@@ -2569,8 +2975,7 @@ class ComputeTestCase(BaseTestCase):
 
     def test_snapshot_handles_cases_when_instance_is_not_found(self):
         inst_obj = self._get_snapshotting_instance()
-        inst_obj2 = instance_obj.Instance.get_by_uuid(self.context,
-                                                      inst_obj.uuid)
+        inst_obj2 = objects.Instance.get_by_uuid(self.context, inst_obj.uuid)
         inst_obj2.destroy()
         self.compute.snapshot_instance(self.context, image_id='fakesnap',
                                        instance=inst_obj)
@@ -2591,49 +2996,97 @@ class ComputeTestCase(BaseTestCase):
 
     def test_console_output(self):
         # Make sure we can get console output from instance.
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
 
         output = self.compute.get_console_output(self.context,
                 instance=instance, tail_length=None)
         self.assertEqual(output, 'FAKE CONSOLE OUTPUT\nANOTHER\nLAST LINE')
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_console_output_tail(self):
         # Make sure we can get console output from instance.
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
 
         output = self.compute.get_console_output(self.context,
                 instance=instance, tail_length=2)
         self.assertEqual(output, 'ANOTHER\nLAST LINE')
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
+
+    def test_console_output_not_implemented(self):
+        def fake_not_implemented(*args, **kwargs):
+            raise NotImplementedError()
+
+        self.stubs.Set(self.compute.driver, 'get_console_output',
+                       fake_not_implemented)
+
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
+
+        self.assertRaises(messaging.ExpectedException,
+                          self.compute.get_console_output, self.context,
+                          instance, 0)
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(NotImplementedError,
+                          self.compute.get_console_output, self.context,
+                          instance, 0)
+
+        self.compute.terminate_instance(self.context, instance, [], [])
+
+    def test_console_output_instance_not_found(self):
+        def fake_not_found(*args, **kwargs):
+            raise exception.InstanceNotFound(instance_id='fake-instance')
+
+        self.stubs.Set(self.compute.driver, 'get_console_output',
+                       fake_not_found)
+
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
+
+        self.assertRaises(messaging.ExpectedException,
+                          self.compute.get_console_output, self.context,
+                          instance, 0)
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(exception.InstanceNotFound,
+                          self.compute.get_console_output, self.context,
+                          instance, 0)
+
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_novnc_vnc_console(self):
         # Make sure we can a vnc console for an instance.
         self.flags(vnc_enabled=True)
         self.flags(enabled=False, group='spice')
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
 
         # Try with the full instance
         console = self.compute.get_vnc_console(self.context, 'novnc',
                                                instance=instance)
         self.assertTrue(console)
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_validate_console_port_vnc(self):
         self.flags(vnc_enabled=True)
         self.flags(enabled=True, group='spice')
-        instance = jsonutils.to_primitive(self._create_fake_instance())
+        instance = self._create_fake_instance_obj()
 
         def fake_driver_get_console(*args, **kwargs):
             return {'host': "fake_host", 'port': "5900",
@@ -2641,15 +3094,14 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.driver, "get_vnc_console",
                        fake_driver_get_console)
 
-        self.assertTrue(self.compute.validate_console_port(self.context,
-                                                            instance,
-                                                            "5900",
-                                                            "novnc"))
+        self.assertTrue(self.compute.validate_console_port(
+            context=self.context, instance=instance, port="5900",
+            console_type="novnc"))
 
     def test_validate_console_port_spice(self):
         self.flags(vnc_enabled=True)
         self.flags(enabled=True, group='spice')
-        instance = jsonutils.to_primitive(self._create_fake_instance())
+        instance = self._create_fake_instance_obj()
 
         def fake_driver_get_console(*args, **kwargs):
             return {'host': "fake_host", 'port': "5900",
@@ -2657,15 +3109,28 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.driver, "get_spice_console",
                        fake_driver_get_console)
 
-        self.assertTrue(self.compute.validate_console_port(self.context,
-                                                            instance,
-                                                            "5900",
-                                                            "spice-html5"))
+        self.assertTrue(self.compute.validate_console_port(
+            context=self.context, instance=instance, port="5900",
+            console_type="spice-html5"))
+
+    def test_validate_console_port_rdp(self):
+        self.flags(enabled=True, group='rdp')
+        instance = self._create_fake_instance_obj()
+
+        def fake_driver_get_console(*args, **kwargs):
+            return {'host': "fake_host", 'port': "5900",
+                    'internal_access_path': None}
+        self.stubs.Set(self.compute.driver, "get_rdp_console",
+                       fake_driver_get_console)
+
+        self.assertTrue(self.compute.validate_console_port(
+            context=self.context, instance=instance, port="5900",
+            console_type="rdp-html5"))
 
     def test_validate_console_port_wrong_port(self):
         self.flags(vnc_enabled=True)
         self.flags(enabled=True, group='spice')
-        instance = jsonutils.to_primitive(self._create_fake_instance())
+        instance = self._create_fake_instance_obj()
 
         def fake_driver_get_console(*args, **kwargs):
             return {'host': "fake_host", 'port': "5900",
@@ -2673,36 +3138,36 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.driver, "get_vnc_console",
                        fake_driver_get_console)
 
-        self.assertFalse(self.compute.validate_console_port(self.context,
-                                                            instance,
-                                                            "wrongport",
-                                                            "spice-html5"))
+        self.assertFalse(self.compute.validate_console_port(
+            context=self.context, instance=instance, port="wrongport",
+            console_type="spice-html5"))
 
     def test_xvpvnc_vnc_console(self):
         # Make sure we can a vnc console for an instance.
         self.flags(vnc_enabled=True)
         self.flags(enabled=False, group='spice')
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
 
         console = self.compute.get_vnc_console(self.context, 'xvpvnc',
                                                instance=instance)
         self.assertTrue(console)
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_invalid_vnc_console_type(self):
         # Raise useful error if console type is an unrecognised string.
         self.flags(vnc_enabled=True)
         self.flags(enabled=False, group='spice')
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
 
-        self.assertRaises(rpc_common.ClientException,
+        self.assertRaises(messaging.ExpectedException,
                           self.compute.get_vnc_console,
                           self.context, 'invalid', instance=instance)
 
@@ -2712,19 +3177,19 @@ class ComputeTestCase(BaseTestCase):
                           self.compute.get_vnc_console,
                           self.context, 'invalid', instance=instance)
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_missing_vnc_console_type(self):
         # Raise useful error is console type is None.
         self.flags(vnc_enabled=True)
         self.flags(enabled=False, group='spice')
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
 
-        self.assertRaises(rpc_common.ClientException,
+        self.assertRaises(messaging.ExpectedException,
                           self.compute.get_vnc_console,
                           self.context, None, instance=instance)
 
@@ -2734,8 +3199,28 @@ class ComputeTestCase(BaseTestCase):
                           self.compute.get_vnc_console,
                           self.context, None, instance=instance)
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.compute.terminate_instance(self.context, instance, [], [])
+
+    def test_get_vnc_console_not_implemented(self):
+        self.stubs.Set(self.compute.driver, 'get_vnc_console',
+                       fake_not_implemented)
+
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
+
+        self.assertRaises(messaging.ExpectedException,
+                          self.compute.get_vnc_console,
+                          self.context, 'novnc', instance=instance)
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(NotImplementedError,
+                          self.compute.get_vnc_console,
+                          self.context, 'novnc', instance=instance)
+
+        self.compute.terminate_instance(self.context, instance, [], [])
 
     def test_spicehtml5_spice_console(self):
         # Make sure we can a spice console for an instance.
@@ -2764,7 +3249,7 @@ class ComputeTestCase(BaseTestCase):
             jsonutils.to_primitive(instance), {}, {}, [], None,
             None, True, None, False)
 
-        self.assertRaises(rpc_common.ClientException,
+        self.assertRaises(messaging.ExpectedException,
                           self.compute.get_spice_console,
                           self.context, 'invalid', instance=instance)
 
@@ -2786,7 +3271,7 @@ class ComputeTestCase(BaseTestCase):
             jsonutils.to_primitive(instance), {}, {}, [], None,
             None, True, None, False)
 
-        self.assertRaises(rpc_common.ClientException,
+        self.assertRaises(messaging.ExpectedException,
                           self.compute.get_spice_console,
                           self.context, None, instance=instance)
 
@@ -2798,12 +3283,72 @@ class ComputeTestCase(BaseTestCase):
 
         self.compute.terminate_instance(self.context, instance, [], [])
 
+    def test_rdphtml5_rdp_console(self):
+        # Make sure we can a rdp console for an instance.
+        self.flags(vnc_enabled=False)
+        self.flags(enabled=True, group='rdp')
+
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
+
+        # Try with the full instance
+        console = self.compute.get_rdp_console(self.context, 'rdp-html5',
+                                               instance=instance)
+        self.assertTrue(console)
+
+        self.compute.terminate_instance(self.context, instance, [], [])
+
+    def test_invalid_rdp_console_type(self):
+        # Raise useful error if console type is an unrecognised string
+        self.flags(vnc_enabled=False)
+        self.flags(enabled=True, group='rdp')
+
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
+
+        self.assertRaises(messaging.ExpectedException,
+                          self.compute.get_rdp_console,
+                          self.context, 'invalid', instance=instance)
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(exception.ConsoleTypeInvalid,
+                          self.compute.get_rdp_console,
+                          self.context, 'invalid', instance=instance)
+
+        self.compute.terminate_instance(self.context, instance, [], [])
+
+    def test_missing_rdp_console_type(self):
+        # Raise useful error is console type is None
+        self.flags(vnc_enabled=False)
+        self.flags(enabled=True, group='rdp')
+
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+            jsonutils.to_primitive(instance), {}, {}, [], None,
+            None, True, None, False)
+
+        self.assertRaises(messaging.ExpectedException,
+                          self.compute.get_rdp_console,
+                          self.context, None, instance=instance)
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(exception.ConsoleTypeInvalid,
+                          self.compute.get_rdp_console,
+                          self.context, None, instance=instance)
+
+        self.compute.terminate_instance(self.context, instance, [], [])
+
     def test_vnc_console_instance_not_ready(self):
         self.flags(vnc_enabled=True)
         self.flags(enabled=False, group='spice')
-        instance = self._create_fake_instance(
+        instance = self._create_fake_instance_obj(
                 params={'vm_state': vm_states.BUILDING})
-        instance = jsonutils.to_primitive(instance)
 
         def fake_driver_get_console(*args, **kwargs):
             raise exception.InstanceNotFound(instance_id=instance['uuid'])
@@ -2835,6 +3380,57 @@ class ComputeTestCase(BaseTestCase):
                 self.compute.get_spice_console, self.context, 'spice-html5',
                 instance=instance)
 
+    def test_rdp_console_instance_not_ready(self):
+        self.flags(vnc_enabled=False)
+        self.flags(enabled=True, group='rdp')
+        instance = self._create_fake_instance_obj(
+                params={'vm_state': vm_states.BUILDING})
+
+        def fake_driver_get_console(*args, **kwargs):
+            raise exception.InstanceNotFound(instance_id=instance['uuid'])
+
+        self.stubs.Set(self.compute.driver, "get_rdp_console",
+                       fake_driver_get_console)
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(exception.InstanceNotReady,
+                self.compute.get_rdp_console, self.context, 'rdp-html5',
+                instance=instance)
+
+    def test_vnc_console_disabled(self):
+        self.flags(vnc_enabled=False)
+        instance = self._create_fake_instance_obj(
+                params={'vm_state': vm_states.BUILDING})
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(exception.ConsoleTypeUnavailable,
+                self.compute.get_vnc_console, self.context, 'novnc',
+                instance=instance)
+
+    def test_spice_console_disabled(self):
+        self.flags(enabled=False, group='spice')
+        instance = self._create_fake_instance_obj(
+                params={'vm_state': vm_states.BUILDING})
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(exception.ConsoleTypeUnavailable,
+                self.compute.get_spice_console, self.context, 'spice-html5',
+                instance=instance)
+
+    def test_rdp_console_disabled(self):
+        self.flags(enabled=False, group='rdp')
+        instance = self._create_fake_instance_obj(
+                params={'vm_state': vm_states.BUILDING})
+
+        self.compute = utils.ExceptionHelper(self.compute)
+
+        self.assertRaises(exception.ConsoleTypeUnavailable,
+                self.compute.get_rdp_console, self.context, 'rdp-html5',
+                instance=instance)
+
     def test_diagnostics(self):
         # Make sure we can get diagnostics for an instance.
         expected_diagnostic = {'cpu0_time': 17300000000,
@@ -2854,13 +3450,48 @@ class ComputeTestCase(BaseTestCase):
                              'vnet1_tx_packets': 662,
                             }
 
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
+        instance = self._create_fake_instance_obj()
+        self.compute.run_instance(self.context,
+                jsonutils.to_primitive(instance), {}, {}, [], None,
                 None, True, None, False)
 
         diagnostics = self.compute.get_diagnostics(self.context,
                 instance=instance)
         self.assertEqual(diagnostics, expected_diagnostic)
+        self.compute.terminate_instance(self.context, instance, [], [])
+
+    def test_instance_diagnostics(self):
+        # Make sure we can get diagnostics for an instance.
+        instance = jsonutils.to_primitive(self._create_fake_instance())
+        self.compute.run_instance(self.context, instance, {}, {}, [], None,
+                None, True, None, False)
+
+        diagnostics = self.compute.get_instance_diagnostics(self.context,
+                instance=instance)
+        expected = {'config_drive': True,
+                    'cpu_details': [{'time': 17300000000}],
+                    'disk_details': [{'errors_count': 0,
+                                      'id': 'fake-disk-id',
+                                      'read_bytes': 262144,
+                                      'read_requests': 112,
+                                      'write_bytes': 5778432,
+                                      'write_requests': 488}],
+                    'driver': 'fake',
+                    'hypervisor_os': 'fake-os',
+                    'memory_details': {'maximum': 524288, 'used': 0},
+                    'nic_details': [{'mac_address': '01:23:45:67:89:ab',
+                                     'rx_drop': 0,
+                                     'rx_errors': 0,
+                                     'rx_octets': 2070139,
+                                     'rx_packets': 26701,
+                                     'tx_drop': 0,
+                                     'tx_errors': 0,
+                                     'tx_octets': 140208,
+                                     'tx_packets': 662}],
+                    'state': 'running',
+                    'uptime': 46664,
+                    'version': '1.0'}
+        self.assertEqual(expected, diagnostics)
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), [], [])
 
@@ -2879,7 +3510,7 @@ class ComputeTestCase(BaseTestCase):
 
         self.assertEqual(len(fake_notifier.NOTIFICATIONS), 0)
         self.compute.add_fixed_ip_to_instance(self.context, network_id=1,
-                instance=instance)
+                instance=self._objectify(instance))
 
         self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
         self.compute.terminate_instance(self.context,
@@ -2906,24 +3537,25 @@ class ComputeTestCase(BaseTestCase):
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), [], [])
 
-    def test_run_instance_usage_notification(self):
+    def test_run_instance_usage_notification(self, request_spec=None):
         # Ensure run instance generates appropriate usage notification.
+        request_spec = request_spec or {}
         instance = jsonutils.to_primitive(self._create_fake_instance())
         instance_uuid = instance['uuid']
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
+        expected_image_name = request_spec.get('image', {}).get('name', '')
+        self.compute.run_instance(self.context, instance, request_spec,
+                {}, [], None, None, True, None, False)
         self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
         inst_ref = db.instance_get_by_uuid(self.context, instance_uuid)
         msg = fake_notifier.NOTIFICATIONS[0]
         self.assertEqual(msg.event_type, 'compute.instance.create.start')
-        self.assertEqual(msg.payload['image_name'], 'fake_name')
         # The last event is the one with the sugar in it.
         msg = fake_notifier.NOTIFICATIONS[1]
         self.assertEqual(msg.priority, 'INFO')
         self.assertEqual(msg.event_type, 'compute.instance.create.end')
         payload = msg.payload
         self.assertEqual(payload['tenant_id'], self.project_id)
-        self.assertEqual(payload['image_name'], 'fake_name')
+        self.assertEqual(expected_image_name, payload['image_name'])
         self.assertEqual(payload['user_id'], self.user_id)
         self.assertEqual(payload['instance_id'], inst_ref['uuid'])
         self.assertEqual(payload['instance_type'], 'm1.tiny')
@@ -2942,6 +3574,15 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual('Success', payload['message'])
         self.compute.terminate_instance(self.context,
                 self._objectify(inst_ref), [], [])
+
+    def test_run_instance_image_usage_notification(self):
+        request_spec = {'image': {'name': 'fake_name', 'key': 'value'}}
+        self.test_run_instance_usage_notification(request_spec=request_spec)
+
+    def test_run_instance_usage_notification_volume_meta(self):
+        # Volume's image metadata won't contain the image name
+        request_spec = {'image': {'key': 'value'}}
+        self.test_run_instance_usage_notification(request_spec=request_spec)
 
     def test_run_instance_end_notification_on_abort(self):
         # Test that an end notif is sent if the build is aborted
@@ -2965,7 +3606,7 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual('INFO', msg.priority)
         payload = msg.payload
         message = payload['message']
-        self.assertTrue(message.find("already deleted") != -1)
+        self.assertNotEqual(-1, message.find("already deleted"))
 
     def test_run_instance_error_notification_on_reschedule(self):
         # Test that error notif is sent if the build got rescheduled
@@ -2990,7 +3631,7 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual('ERROR', msg.priority)
         payload = msg.payload
         message = payload['message']
-        self.assertTrue(message.find("something bad happened") != -1)
+        self.assertNotEqual(-1, message.find("something bad happened"))
 
     def test_run_instance_error_notification_on_failure(self):
         # Test that error notif is sent if build fails hard
@@ -3014,7 +3655,7 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual('ERROR', msg.priority)
         payload = msg.payload
         message = payload['message']
-        self.assertTrue(message.find("i'm dying") != -1)
+        self.assertNotEqual(-1, message.find("i'm dying"))
 
     def test_terminate_usage_notification(self):
         # Ensure terminate_instance generates correct usage notification.
@@ -3090,10 +3731,45 @@ class ComputeTestCase(BaseTestCase):
                 fake_network.fake_get_instance_nw_info(self.stubs, 1, 1))
 
         self.mox.StubOutWithMock(self.compute.driver, "macs_for_instance")
-        self.compute.driver.macs_for_instance(instance).AndReturn(macs)
+        self.compute.driver.macs_for_instance(
+            mox.IsA(instance_obj.Instance)).AndReturn(macs)
         self.mox.ReplayAll()
         self.compute.run_instance(self.context, instance, {}, {}, None, None,
                 None, True, None, False)
+
+    def _create_server_group(self):
+        group_instance = self._create_fake_instance_obj(
+                params=dict(host=self.compute.host))
+
+        instance_group = objects.InstanceGroup(self.context)
+        instance_group.user_id = self.user_id
+        instance_group.project_id = self.project_id
+        instance_group.name = 'messi'
+        instance_group.uuid = str(uuid.uuid4())
+        instance_group.members = [group_instance.uuid]
+        instance_group.policies = ['anti-affinity']
+        instance_group.create()
+        return instance_group
+
+    def _run_instance_reschedules_on_anti_affinity_violation(self, group,
+                                                             hint):
+        instance = jsonutils.to_primitive(self._create_fake_instance())
+        filter_properties = {'scheduler_hints': {'group': hint}}
+        self.assertRaises(exception.RescheduledException,
+                          self.compute._build_instance,
+                          self.context, {}, filter_properties,
+                          [], None, None, True, None, instance,
+                          None, False)
+
+    def test_run_instance_reschedules_on_anti_affinity_violation_by_name(self):
+        group = self._create_server_group()
+        self._run_instance_reschedules_on_anti_affinity_violation(group,
+                group.name)
+
+    def test_run_instance_reschedules_on_anti_affinity_violation_by_uuid(self):
+        group = self._create_server_group()
+        self._run_instance_reschedules_on_anti_affinity_violation(group,
+                group.uuid)
 
     def test_instance_set_to_error_on_uncaught_exception(self):
         # Test that instance is set to error state when exception is raised.
@@ -3109,7 +3785,7 @@ class ComputeTestCase(BaseTestCase):
                 requested_networks=None,
                 vpn=False, macs=None,
                 security_groups=[], dhcp_options=None
-                ).AndRaise(rpc_common.RemoteError())
+                ).AndRaise(messaging.RemoteError())
         self.compute.network_api.deallocate_for_instance(
                 mox.IgnoreArg(),
                 mox.IgnoreArg(),
@@ -3119,7 +3795,7 @@ class ComputeTestCase(BaseTestCase):
 
         self.mox.ReplayAll()
 
-        self.assertRaises(rpc_common.RemoteError,
+        self.assertRaises(messaging.RemoteError,
                           self.compute.run_instance,
                           self.context, instance, {}, {}, None, None, None,
                           True, None, False)
@@ -3131,18 +3807,6 @@ class ComputeTestCase(BaseTestCase):
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), [], [])
 
-    def test_delete_instance_succedes_on_volume_fail(self):
-        instance = self._create_fake_instance_obj()
-
-        def fake_cleanup_volumes(context, instance):
-            raise test.TestingException()
-
-        self.stubs.Set(self.compute, '_cleanup_volumes',
-                       fake_cleanup_volumes)
-
-        self.compute._delete_instance(self.context, instance=instance,
-                                      bdms={})
-
     def test_delete_instance_keeps_net_on_power_off_fail(self):
         self.mox.StubOutWithMock(self.compute.driver, 'destroy')
         self.mox.StubOutWithMock(self.compute, '_deallocate_network')
@@ -3153,12 +3817,13 @@ class ComputeTestCase(BaseTestCase):
                                     mox.IgnoreArg()).AndRaise(exp)
         # mox will detect if _deallocate_network gets called unexpectedly
         self.mox.ReplayAll()
-        instance = self._create_fake_instance()
+        instance = self._create_fake_instance_obj()
         self.assertRaises(exception.InstancePowerOffFailure,
                           self.compute._delete_instance,
                           self.context,
-                          instance=jsonutils.to_primitive(instance),
-                          bdms={})
+                          instance,
+                          [],
+                          self.none_quotas)
 
     def test_delete_instance_loses_net_on_other_fail(self):
         self.mox.StubOutWithMock(self.compute.driver, 'destroy')
@@ -3172,12 +3837,13 @@ class ComputeTestCase(BaseTestCase):
                                          mox.IgnoreArg(),
                                          mox.IgnoreArg())
         self.mox.ReplayAll()
-        instance = self._create_fake_instance()
+        instance = self._create_fake_instance_obj()
         self.assertRaises(test.TestingException,
                           self.compute._delete_instance,
                           self.context,
-                          instance=jsonutils.to_primitive(instance),
-                          bdms={})
+                          instance,
+                          [],
+                          self.none_quotas)
 
     def test_delete_instance_deletes_console_auth_tokens(self):
         instance = self._create_fake_instance_obj()
@@ -3192,8 +3858,8 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(cauth_rpcapi, 'delete_tokens_for_instance',
                        fake_delete_tokens)
 
-        self.compute._delete_instance(self.context, instance=instance,
-                                      bdms={})
+        self.compute._delete_instance(self.context, instance, [],
+                                      self.none_quotas)
 
         self.assertTrue(self.tokens_deleted)
 
@@ -3211,8 +3877,8 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(cells_rpcapi, 'consoleauth_delete_tokens',
                        fake_delete_tokens)
 
-        self.compute._delete_instance(self.context, instance=instance,
-                                      bdms={})
+        self.compute._delete_instance(self.context, instance,
+                                      [], self.none_quotas)
 
         self.assertTrue(self.tokens_deleted)
 
@@ -3229,8 +3895,10 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute, '_delete_instance',
                        fake_delete_instance)
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        self.assertRaises(exception.InstanceTerminationFailure,
+                          self.compute.terminate_instance,
+                          self.context,
+                          self._objectify(instance), [], [])
         instance = db.instance_get_by_uuid(self.context, instance['uuid'])
         self.assertEqual(instance['vm_state'], vm_states.ERROR)
 
@@ -3241,11 +3909,11 @@ class ComputeTestCase(BaseTestCase):
         self.mox.StubOutWithMock(self.compute, "_prep_block_device")
         self.compute._prep_block_device(
                 mox.IgnoreArg(), mox.IgnoreArg(),
-                mox.IgnoreArg()).AndRaise(rpc.common.RemoteError('', '', ''))
+                mox.IgnoreArg()).AndRaise(messaging.RemoteError('', '', ''))
 
         self.mox.ReplayAll()
 
-        self.assertRaises(rpc.common.RemoteError,
+        self.assertRaises(messaging.RemoteError,
                           self.compute.run_instance,
                           self.context, instance, {}, {}, None, None, None,
                           True, None, False)
@@ -3274,8 +3942,7 @@ class ComputeTestCase(BaseTestCase):
             self.assertEqual(instance['task_state'], task_state)
 
         # should fail with locked nonadmin context
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     instance['uuid'])
+        inst_obj = objects.Instance.get_by_uuid(self.context, instance['uuid'])
 
         self.compute_api.lock(self.context, inst_obj)
         self.assertRaises(exception.InstanceIsLocked,
@@ -3304,7 +3971,7 @@ class ComputeTestCase(BaseTestCase):
 
     def _check_locked_by(self, instance_uuid, locked_by):
         instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['locked'], locked_by != None)
+        self.assertEqual(instance['locked'], locked_by is not None)
         self.assertEqual(instance['locked_by'], locked_by)
         return instance
 
@@ -3362,7 +4029,7 @@ class ComputeTestCase(BaseTestCase):
         self._check_locked_by(instance_uuid, None)
 
     def _test_state_revert(self, instance, operation, pre_task_state,
-                           kwargs=None):
+                           kwargs=None, vm_state=None):
         if kwargs is None:
             kwargs = {}
 
@@ -3392,11 +4059,14 @@ class ComputeTestCase(BaseTestCase):
 
         # Fetch the instance's task_state and make sure it reverted to None.
         instance = db.instance_get_by_uuid(self.context, instance['uuid'])
+        if vm_state:
+            self.assertEqual(instance.vm_state, vm_state)
         self.assertIsNone(instance["task_state"])
 
     def test_state_revert(self):
         # ensure that task_state is reverted after a failed operation.
-        migration = migration_obj.Migration()
+        migration = objects.Migration()
+        migration.instance_uuid = 'b48316c5-71e8-45e4-9884-6c78055b9b13'
         migration.new_instance_type_id = '1'
 
         actions = [
@@ -3406,8 +4076,9 @@ class ComputeTestCase(BaseTestCase):
             ("stop_instance", task_states.POWERING_OFF),
             ("start_instance", task_states.POWERING_ON),
             ("terminate_instance", task_states.DELETING,
-                                   {'bdms': [],
-                                    'reservations': []}),
+                                     {'bdms': [],
+                                     'reservations': []},
+                                     vm_states.ERROR),
             ("soft_delete_instance", task_states.SOFT_DELETING,
                                      {'reservations': []}),
             ("restore_instance", task_states.RESTORING),
@@ -3453,8 +4124,8 @@ class ComputeTestCase(BaseTestCase):
 
         self._stub_out_resize_network_methods()
         instance = self._create_fake_instance()
-        inst_obj = instance_obj.Instance._from_db_object(
-            self.context, instance_obj.Instance(), instance,
+        inst_obj = objects.Instance._from_db_object(
+            self.context, objects.Instance(), instance,
             expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
         for operation in actions:
             if operation[0] in want_objects:
@@ -3462,39 +4133,29 @@ class ComputeTestCase(BaseTestCase):
             else:
                 self._test_state_revert(instance, *operation)
 
-    def _ensure_quota_reservations_committed(self, expect_project=False,
-                                             expect_user=False):
+    def _ensure_quota_reservations_committed(self, instance):
         """Mock up commit of quota reservations."""
         reservations = list('fake_res')
         self.mox.StubOutWithMock(nova.quota.QUOTAS, 'commit')
         nova.quota.QUOTAS.commit(mox.IgnoreArg(), reservations,
-                                 project_id=(expect_project and
-                                             self.context.project_id or
-                                             None),
-                                 user_id=(expect_user and
-                                          self.context.user_id or
-                                          None))
+                                 project_id=instance['project_id'],
+                                 user_id=instance['user_id'])
         self.mox.ReplayAll()
         return reservations
 
-    def _ensure_quota_reservations_rolledback(self, expect_project=False,
-                                              expect_user=False):
+    def _ensure_quota_reservations_rolledback(self, instance):
         """Mock up rollback of quota reservations."""
         reservations = list('fake_res')
         self.mox.StubOutWithMock(nova.quota.QUOTAS, 'rollback')
         nova.quota.QUOTAS.rollback(mox.IgnoreArg(), reservations,
-                                   project_id=(expect_project and
-                                               self.context.project_id or
-                                               None),
-                                   user_id=(expect_user and
-                                            self.context.user_id or
-                                            None))
+                                   project_id=instance['project_id'],
+                                   user_id=instance['user_id'])
         self.mox.ReplayAll()
         return reservations
 
-    def test_quotas_succesful_delete(self):
+    def test_quotas_successful_delete(self):
         instance = jsonutils.to_primitive(self._create_fake_instance())
-        resvs = self._ensure_quota_reservations_committed(True, True)
+        resvs = self._ensure_quota_reservations_committed(instance)
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), bdms=[], reservations=resvs)
 
@@ -3507,16 +4168,16 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute, '_shutdown_instance',
                        fake_shutdown_instance)
 
-        resvs = self._ensure_quota_reservations_rolledback(True, True)
+        resvs = self._ensure_quota_reservations_rolledback(instance)
         self.assertRaises(test.TestingException,
                           self.compute.terminate_instance,
                           self.context, self._objectify(instance),
                           bdms=[], reservations=resvs)
 
-    def test_quotas_succesful_soft_delete(self):
+    def test_quotas_successful_soft_delete(self):
         instance = self._objectify(self._create_fake_instance(
                 params=dict(task_state=task_states.SOFT_DELETING)))
-        resvs = self._ensure_quota_reservations_committed(True, True)
+        resvs = self._ensure_quota_reservations_committed(instance)
         self.compute.soft_delete_instance(self.context, instance,
                                           reservations=resvs)
 
@@ -3530,7 +4191,7 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.driver, 'soft_delete',
                        fake_soft_delete)
 
-        resvs = self._ensure_quota_reservations_rolledback(True, True)
+        resvs = self._ensure_quota_reservations_rolledback(instance)
         self.assertRaises(test.TestingException,
                           self.compute.soft_delete_instance,
                           self.context, instance,
@@ -3541,7 +4202,7 @@ class ComputeTestCase(BaseTestCase):
             params=dict(vm_state=vm_states.SOFT_DELETED)))
         # Termination should be successful, but quota reservations
         # rolled back because the instance was in SOFT_DELETED state.
-        resvs = self._ensure_quota_reservations_rolledback()
+        resvs = self._ensure_quota_reservations_rolledback(instance)
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), bdms=[], reservations=resvs)
 
@@ -3583,24 +4244,23 @@ class ComputeTestCase(BaseTestCase):
             self.assertEqual(vm_states.ACTIVE, sys_meta['old_vm_state'])
         else:
             self.assertEqual(vm_states.STOPPED, sys_meta['old_vm_state'])
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
 
         orig_mig_save = migration.save
         orig_inst_save = instance.save
         network_api = self.compute.network_api
-        conductor_api = self.compute.conductor_api
 
         self.mox.StubOutWithMock(network_api, 'setup_networks_on_host')
-        self.mox.StubOutWithMock(conductor_api,
-                                 'network_migrate_instance_finish')
+        self.mox.StubOutWithMock(network_api,
+                                 'migrate_instance_finish')
         self.mox.StubOutWithMock(self.compute, '_get_instance_nw_info')
         self.mox.StubOutWithMock(self.compute,
                                  '_notify_about_instance_usage')
         self.mox.StubOutWithMock(self.compute.driver, 'finish_migration')
         self.mox.StubOutWithMock(self.compute,
-                                 '_get_instance_volume_block_device_info')
+                                 '_get_instance_block_device_info')
         self.mox.StubOutWithMock(migration, 'save')
         self.mox.StubOutWithMock(instance, 'save')
         self.mox.StubOutWithMock(self.context, 'elevated')
@@ -3635,9 +4295,9 @@ class ComputeTestCase(BaseTestCase):
 
         network_api.setup_networks_on_host(self.context, instance,
                                            'fake-mini')
-        conductor_api.network_migrate_instance_finish(self.context,
-                                                      mox.IsA(dict),
-                                                      mox.IsA(dict))
+        network_api.migrate_instance_finish(self.context,
+                                            mox.IsA(dict),
+                                            mox.IsA(dict))
 
         self.compute._get_instance_nw_info(
                 self.context, instance).AndReturn('fake-nwinfo1')
@@ -3650,7 +4310,7 @@ class ComputeTestCase(BaseTestCase):
                 self.context, instance, 'finish_resize.start',
                 network_info='fake-nwinfo1')
 
-        self.compute._get_instance_volume_block_device_info(
+        self.compute._get_instance_block_device_info(
                 self.context, instance,
                 refresh_conn_info=True).AndReturn('fake-bdminfo')
         # nova.conf sets the default flavor to m1.small and the test
@@ -3670,7 +4330,7 @@ class ComputeTestCase(BaseTestCase):
                 self.context, instance, 'finish_resize.end',
                 network_info='fake-nwinfo1')
         # NOTE(comstud): This actually does the mox.ReplayAll()
-        reservations = self._ensure_quota_reservations_committed()
+        reservations = self._ensure_quota_reservations_committed(instance)
 
         self.compute.finish_resize(self.context,
                 migration=migration,
@@ -3693,12 +4353,24 @@ class ComputeTestCase(BaseTestCase):
         volume_id = 'fake'
         volume = {'instance_uuid': None,
                   'device_name': None,
-                  'volume_id': volume_id}
+                  'id': volume_id,
+                  'attach_status': 'detached'}
+        bdm = objects.BlockDeviceMapping(
+                        **{'source_type': 'volume',
+                           'destination_type': 'volume',
+                           'volume_id': volume_id,
+                           'instance_uuid': instance['uuid'],
+                           'device_name': '/dev/vdc'})
+        bdm.create(self.context)
 
         # stub out volume attach
-        def fake_volume_get(self, context, volume):
+        def fake_volume_get(self, context, volume_id):
             return volume
         self.stubs.Set(cinder.API, "get", fake_volume_get)
+
+        def fake_volume_check_attach(self, context, volume_id, instance):
+            pass
+        self.stubs.Set(cinder.API, "check_attach", fake_volume_check_attach)
 
         def fake_get_volume_encryption_metadata(self, context, volume_id):
             return {}
@@ -3716,11 +4388,12 @@ class ComputeTestCase(BaseTestCase):
             'data': orig_connection_data,
         }
 
-        def fake_init_conn(self, context, volume, session):
+        def fake_init_conn(self, context, volume_id, session):
             return connection_info
         self.stubs.Set(cinder.API, "initialize_connection", fake_init_conn)
 
-        def fake_attach(self, context, volume_id, instance_uuid, device_name):
+        def fake_attach(self, context, volume_id, instance_uuid, device_name,
+                        mode='rw'):
             volume['instance_uuid'] = instance_uuid
             volume['device_name'] = device_name
         self.stubs.Set(cinder.API, "attach", fake_attach)
@@ -3738,8 +4411,8 @@ class ComputeTestCase(BaseTestCase):
 
         # attach volume to instance
         instance_p = obj_base.obj_to_primitive(instance)
-        self.compute.attach_volume(self.context, volume['volume_id'],
-                                   '/dev/vdc', instance_p)
+        self.compute.attach_volume(self.context, volume['id'],
+                                   '/dev/vdc', instance_p, bdm=bdm)
 
         # assert volume attached correctly
         self.assertEqual(volume['device_name'], '/dev/vdc')
@@ -3768,7 +4441,7 @@ class ComputeTestCase(BaseTestCase):
 
         self._stub_out_resize_network_methods()
 
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
         self.compute.resize_instance(self.context, instance=instance,
@@ -3795,7 +4468,7 @@ class ComputeTestCase(BaseTestCase):
         instance.task_state = task_states.RESIZE_MIGRATED
         instance.save()
 
-        reservations = self._ensure_quota_reservations_committed()
+        reservations = self._ensure_quota_reservations_committed(instance)
 
         # new initialize connection
         new_connection_data = dict(orig_connection_data)
@@ -3844,10 +4517,11 @@ class ComputeTestCase(BaseTestCase):
 
         self._stub_out_resize_network_methods()
 
-        reservations = self._ensure_quota_reservations_rolledback()
+        old_flavor_name = 'm1.tiny'
+        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
+        reservations = self._ensure_quota_reservations_rolledback(instance)
 
-        instance = self._create_fake_instance_obj()
-        instance_type = flavors.get_default_flavor()
+        instance_type = flavors.get_flavor_by_name('m1.small')
 
         self.compute.prep_resize(self.context, instance=instance,
                                  instance_type=instance_type,
@@ -3855,7 +4529,7 @@ class ComputeTestCase(BaseTestCase):
                                  request_spec={}, filter_properties={},
                                  node=None)
 
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
 
@@ -3867,10 +4541,32 @@ class ComputeTestCase(BaseTestCase):
                           migration=migration,
                           disk_info={}, image={}, instance=instance,
                           reservations=reservations)
-        # NOTE(comstud): error path doesn't use objects, so our object
-        # is not updated.  Refresh and compare against the DB.
         instance.refresh()
         self.assertEqual(vm_states.ERROR, instance.vm_state)
+
+        old_flavor = flavors.get_flavor_by_name(old_flavor_name)
+        self.assertEqual(old_flavor['memory_mb'], instance.memory_mb)
+        self.assertEqual(old_flavor['vcpus'], instance.vcpus)
+        self.assertEqual(old_flavor['root_gb'], instance.root_gb)
+        self.assertEqual(old_flavor['ephemeral_gb'], instance.ephemeral_gb)
+        self.assertEqual(old_flavor['id'], instance.instance_type_id)
+        self.assertNotEqual(instance_type['id'], instance.instance_type_id)
+
+    def test_save_instance_info(self):
+        old_flavor_name = 'm1.tiny'
+        new_flavor_name = 'm1.small'
+        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
+        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
+
+        self.compute._save_instance_info(instance, new_flavor,
+                                         instance.system_metadata)
+
+        self.assertEqual(new_flavor['memory_mb'], instance.memory_mb)
+        self.assertEqual(new_flavor['vcpus'], instance.vcpus)
+        self.assertEqual(new_flavor['root_gb'], instance.root_gb)
+        self.assertEqual(new_flavor['ephemeral_gb'], instance.ephemeral_gb)
+        self.assertEqual(new_flavor['id'], instance.instance_type_id)
+        self.assertEqual(new_flavor['id'], instance.instance_type_id)
 
     def test_rebuild_instance_notification(self):
         # Ensure notifications on instance migrate/resize.
@@ -3967,7 +4663,7 @@ class ComputeTestCase(BaseTestCase):
 
         self._stub_out_resize_network_methods()
 
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
         self.compute.resize_instance(self.context, instance=instance,
@@ -4064,7 +4760,7 @@ class ComputeTestCase(BaseTestCase):
 
         instance = self._create_fake_instance_obj()
 
-        reservations = self._ensure_quota_reservations_rolledback()
+        reservations = self._ensure_quota_reservations_rolledback(instance)
 
         instance_p = obj_base.obj_to_primitive(instance)
         self.compute.run_instance(self.context, instance_p, {}, {}, None, None,
@@ -4087,7 +4783,7 @@ class ComputeTestCase(BaseTestCase):
         """
         instance = self._create_fake_instance_obj()
 
-        reservations = self._ensure_quota_reservations_rolledback()
+        reservations = self._ensure_quota_reservations_rolledback(instance)
 
         instance_p = obj_base.obj_to_primitive(instance)
         self.compute.run_instance(self.context, instance_p, {}, {}, None, None,
@@ -4116,7 +4812,7 @@ class ComputeTestCase(BaseTestCase):
         instance = self._create_fake_instance_obj()
         instance_type = flavors.get_default_flavor()
 
-        reservations = self._ensure_quota_reservations_rolledback()
+        reservations = self._ensure_quota_reservations_rolledback(instance)
 
         instance_p = obj_base.obj_to_primitive(instance)
         self.compute.run_instance(self.context, instance_p, {}, {}, None, None,
@@ -4129,11 +4825,11 @@ class ComputeTestCase(BaseTestCase):
                                  filter_properties={}, node=None)
         instance.task_state = task_states.RESIZE_PREP
         instance.save()
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
 
-        #verify
+        # verify
         self.assertRaises(test.TestingException, self.compute.resize_instance,
                           self.context, instance=instance,
                           migration=migration, image={},
@@ -4157,7 +4853,7 @@ class ComputeTestCase(BaseTestCase):
 
         instance = self._create_fake_instance_obj()
         instance_type = flavors.get_default_flavor()
-        reservations = self._ensure_quota_reservations_rolledback()
+        reservations = self._ensure_quota_reservations_rolledback(instance)
         instance_p = obj_base.obj_to_primitive(instance)
         self.compute.run_instance(self.context, instance_p, {}, {}, None, None,
                 None, True, None, False)
@@ -4170,7 +4866,7 @@ class ComputeTestCase(BaseTestCase):
         instance.task_state = task_states.RESIZE_PREP
         instance.save()
 
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
 
@@ -4211,16 +4907,29 @@ class ComputeTestCase(BaseTestCase):
         instance.task_state = task_states.RESIZE_PREP
         instance.save()
 
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
 
-        self.compute.resize_instance(self.context, instance=instance,
-                migration=migration, image={}, reservations=[],
-                instance_type=jsonutils.to_primitive(instance_type))
-        self.assertEqual(migration.dest_compute, instance.host)
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+        with contextlib.nested(
+            mock.patch.object(objects.BlockDeviceMappingList,
+                'get_by_instance_uuid', return_value='fake_bdms'),
+            mock.patch.object(
+                self.compute, '_get_instance_block_device_info',
+                return_value='fake_bdinfo'),
+            mock.patch.object(self.compute, '_terminate_volume_connections')
+        ) as (mock_get_by_inst_uuid, mock_get_instance_vol_bdinfo,
+                mock_terminate_vol_conn):
+            self.compute.resize_instance(self.context, instance=instance,
+                    migration=migration, image={}, reservations=[],
+                    instance_type=jsonutils.to_primitive(instance_type))
+            mock_get_instance_vol_bdinfo.assert_called_once_with(
+                    self.context, instance, bdms='fake_bdms')
+            mock_terminate_vol_conn.assert_called_once_with(self.context,
+                    instance, 'fake_bdms')
+            self.assertEqual(migration.dest_compute, instance.host)
+            self.compute.terminate_instance(self.context,
+                    self._objectify(instance), [], [])
 
     def _test_confirm_resize(self, power_on):
         # Common test case method for confirm_resize
@@ -4251,7 +4960,7 @@ class ComputeTestCase(BaseTestCase):
 
         self._stub_out_resize_network_methods()
 
-        reservations = self._ensure_quota_reservations_committed()
+        reservations = self._ensure_quota_reservations_committed(instance)
 
         instance_p = obj_base.obj_to_primitive(instance)
         self.compute.run_instance(self.context, instance_p, {}, {}, None, None,
@@ -4276,7 +4985,7 @@ class ComputeTestCase(BaseTestCase):
                 image={}, reservations=reservations, request_spec={},
                 filter_properties={}, node=None)
 
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
 
@@ -4326,8 +5035,7 @@ class ComputeTestCase(BaseTestCase):
 
     def _test_finish_revert_resize(self, power_on,
                                    remove_old_vm_state=False):
-        """
-        Convenience method that does most of the work for the
+        """Convenience method that does most of the work for the
         test_finish_revert_resize tests.
         :param power_on -- True if testing resize from ACTIVE state, False if
         testing resize from STOPPED state.
@@ -4358,7 +5066,7 @@ class ComputeTestCase(BaseTestCase):
 
         self._stub_out_resize_network_methods()
 
-        reservations = self._ensure_quota_reservations_committed()
+        reservations = self._ensure_quota_reservations_committed(instance)
 
         instance_p = obj_base.obj_to_primitive(instance)
         self.compute.run_instance(self.context, instance_p, {}, {}, None, None,
@@ -4384,7 +5092,7 @@ class ComputeTestCase(BaseTestCase):
                 image={}, reservations=reservations, request_spec={},
                 filter_properties={}, node=None)
 
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
 
@@ -4494,15 +5202,15 @@ class ComputeTestCase(BaseTestCase):
         self._test_cleanup_stored_instance_types('1', '1', True)
 
     def test_get_by_flavor_id(self):
-        type = flavors.get_flavor_by_flavor_id(1)
-        self.assertEqual(type['name'], 'm1.tiny')
+        flavor_type = flavors.get_flavor_by_flavor_id(1)
+        self.assertEqual(flavor_type['name'], 'm1.tiny')
 
     def test_resize_same_source_fails(self):
         """Ensure instance fails to migrate when source and destination are
         the same host.
         """
-        reservations = self._ensure_quota_reservations_rolledback()
         instance = self._create_fake_instance_obj()
+        reservations = self._ensure_quota_reservations_rolledback(instance)
         instance_p = obj_base.obj_to_primitive(instance)
         self.compute.run_instance(self.context, instance_p, {}, {}, None, None,
                 None, True, None, False)
@@ -4524,9 +5232,9 @@ class ComputeTestCase(BaseTestCase):
                 'migrate_disk_and_power_off',
                 raise_migration_failure)
 
-        reservations = self._ensure_quota_reservations_rolledback()
-
         instance = self._create_fake_instance_obj()
+        reservations = self._ensure_quota_reservations_rolledback(instance)
+
         instance_type = flavors.get_default_flavor()
 
         instance_p = obj_base.obj_to_primitive(instance)
@@ -4539,7 +5247,7 @@ class ComputeTestCase(BaseTestCase):
                                  image={}, reservations=reservations,
                                  request_spec={}, filter_properties={},
                                  node=None)
-        migration = migration_obj.Migration.get_by_instance_and_status(
+        migration = objects.Migration.get_by_instance_and_status(
                 self.context.elevated(),
                 instance.uuid, 'pre-migrating')
         instance.task_state = task_states.RESIZE_PREP
@@ -4559,7 +5267,7 @@ class ComputeTestCase(BaseTestCase):
     def test_pre_live_migration_instance_has_no_fixed_ip(self):
         # Confirm that no exception is raised if there is no fixed ip on
         # pre_live_migration
-        instance = jsonutils.to_primitive(self._create_fake_instance())
+        instance = self._create_fake_instance_obj()
         c = context.get_admin_context()
 
         self.mox.ReplayAll()
@@ -4577,15 +5285,15 @@ class ComputeTestCase(BaseTestCase):
                        '_get_instance_nw_info', stupid)
 
         # creating instance testdata
-        instance = jsonutils.to_primitive(self._create_fake_instance(
-                                          {'host': 'dummy'}))
+        instance = self._create_fake_instance_obj({'host': 'dummy'})
         c = context.get_admin_context()
         nw_info = fake_network.fake_get_instance_nw_info(self.stubs)
 
         # creating mocks
         self.mox.StubOutWithMock(self.compute.driver, 'pre_live_migration')
         self.compute.driver.pre_live_migration(mox.IsA(c), mox.IsA(instance),
-                                               {'block_device_mapping': []},
+                                               {'swap': None, 'ephemerals': [],
+                                                'block_device_mapping': []},
                                                mox.IgnoreArg(),
                                                mox.IgnoreArg(),
                                                mox.IgnoreArg())
@@ -4602,7 +5310,7 @@ class ComputeTestCase(BaseTestCase):
         fake_notifier.NOTIFICATIONS = []
         # start test
         self.mox.ReplayAll()
-        migrate_data = {'is_shared_storage': False}
+        migrate_data = {'is_shared_instance_path': False}
         ret = self.compute.pre_live_migration(c, instance=instance,
                                               block_migration=False, disk=None,
                                               migrate_data=migrate_data)
@@ -4622,21 +5330,30 @@ class ComputeTestCase(BaseTestCase):
         # Confirm exception when pre_live_migration fails.
         c = context.get_admin_context()
 
-        src_host = 'fake-src-host'
-        instance = dict(uuid='fake_instance', host=src_host,
-                        name='fake-name')
-        updated_instance = self._create_fake_instance(
+        instance = self._create_fake_instance_obj(
+            {'host': 'src_host',
+             'task_state': task_states.MIGRATING})
+        updated_instance = self._create_fake_instance_obj(
                                                {'host': 'fake-dest-host'})
         dest_host = updated_instance['host']
-        fake_bdms = [dict(volume_id='vol1-id'), dict(volume_id='vol2-id')]
+        fake_bdms = [
+                objects.BlockDeviceMapping(
+                    **fake_block_device.FakeDbBlockDeviceDict(
+                        {'volume_id': 'vol1-id', 'source_type': 'volume',
+                         'destination_type': 'volume'})),
+                objects.BlockDeviceMapping(
+                    **fake_block_device.FakeDbBlockDeviceDict(
+                        {'volume_id': 'vol2-id', 'source_type': 'volume',
+                         'destination_type': 'volume'}))
+        ]
 
         # creating mocks
         self.mox.StubOutWithMock(self.compute.driver,
                                  'get_instance_disk_info')
         self.mox.StubOutWithMock(self.compute.compute_rpcapi,
                                  'pre_live_migration')
-        self.mox.StubOutWithMock(self.compute, '_instance_update')
-        self.mox.StubOutWithMock(self.compute, '_get_instance_volume_bdms')
+        self.mox.StubOutWithMock(objects.BlockDeviceMappingList,
+                                 'get_by_instance_uuid')
         self.mox.StubOutWithMock(self.compute.network_api,
                                  'setup_networks_on_host')
         self.mox.StubOutWithMock(self.compute.compute_rpcapi,
@@ -4645,26 +5362,21 @@ class ComputeTestCase(BaseTestCase):
                                  'rollback_live_migration_at_destination')
 
         self.compute.driver.get_instance_disk_info(
-                instance['name']).AndReturn('fake_disk')
+                instance.name).AndReturn('fake_disk')
         self.compute.compute_rpcapi.pre_live_migration(c,
                 instance, True, 'fake_disk', dest_host,
                 {}).AndRaise(test.TestingException())
 
-        self.compute._instance_update(c, instance['uuid'],
-                host=src_host, vm_state=vm_states.ACTIVE,
-                task_state=None,
-                expected_task_state=task_states.MIGRATING).AndReturn(
-                        updated_instance)
         self.compute.network_api.setup_networks_on_host(c,
-                updated_instance, self.compute.host)
-        self.compute._get_instance_volume_bdms(c,
-                updated_instance).AndReturn(fake_bdms)
+                instance, self.compute.host)
+        objects.BlockDeviceMappingList.get_by_instance_uuid(c,
+                instance.uuid).AndReturn(fake_bdms)
         self.compute.compute_rpcapi.remove_volume_connection(
-                c, updated_instance, 'vol1-id', dest_host)
+                c, instance, 'vol1-id', dest_host)
         self.compute.compute_rpcapi.remove_volume_connection(
-                c, updated_instance, 'vol2-id', dest_host)
+                c, instance, 'vol2-id', dest_host)
         self.compute.compute_rpcapi.rollback_live_migration_at_destination(
-                c, updated_instance, dest_host)
+                c, instance, dest_host, destroy_disks=True, migrate_data={})
 
         # start test
         self.mox.ReplayAll()
@@ -4672,30 +5384,31 @@ class ComputeTestCase(BaseTestCase):
                           self.compute.live_migration,
                           c, dest=dest_host, block_migration=True,
                           instance=instance, migrate_data={})
+        instance.refresh()
+        self.assertEqual('src_host', instance.host)
+        self.assertEqual(vm_states.ACTIVE, instance.vm_state)
+        self.assertIsNone(instance.task_state)
 
     def test_live_migration_works_correctly(self):
         # Confirm live_migration() works as expected correctly.
         # creating instance testdata
         c = context.get_admin_context()
-        instance_ref = self._create_fake_instance()
-        instance_ref['host'] = self.compute.host
+        instance = self._objectify(self._create_fake_instance_obj())
+        instance.host = self.compute.host
         dest = 'desthost'
-        inst_uuid = instance_ref['uuid']
 
-        instance = jsonutils.to_primitive(instance_ref)
-
-        migrate_data = {'is_shared_storage': False}
+        migrate_data = {'is_shared_instance_path': False}
 
         self.mox.StubOutWithMock(self.compute.compute_rpcapi,
                                  'pre_live_migration')
         self.compute.compute_rpcapi.pre_live_migration(
             c, instance, False, None, dest, migrate_data)
 
-        self.mox.StubOutWithMock(self.compute.conductor_api,
-                                 'network_migrate_instance_start')
+        self.mox.StubOutWithMock(self.compute.network_api,
+                                 'migrate_instance_start')
         migration = {'source_compute': instance['host'], 'dest_compute': dest}
-        self.compute.conductor_api.network_migrate_instance_start(c, instance,
-                                                                  migration)
+        self.compute.network_api.migrate_instance_start(c, instance,
+                                                        migration)
         self.mox.StubOutWithMock(self.compute.compute_rpcapi,
                                  'post_live_migration_at_destination')
         self.compute.compute_rpcapi.post_live_migration_at_destination(
@@ -4706,6 +5419,10 @@ class ComputeTestCase(BaseTestCase):
         self.compute.network_api.setup_networks_on_host(c, instance,
                                                         instance['host'],
                                                         teardown=True)
+        self.mox.StubOutWithMock(self.compute.instance_events,
+                                 'clear_events_for_instance')
+        self.compute.instance_events.clear_events_for_instance(
+            mox.IgnoreArg())
 
         # start test
         self.mox.ReplayAll()
@@ -4717,7 +5434,7 @@ class ComputeTestCase(BaseTestCase):
         self.assertIsNone(ret)
 
         # cleanup
-        db.instance_destroy(c, inst_uuid)
+        instance.destroy(c)
 
     def test_post_live_migration_no_shared_storage_working_correctly(self):
         """Confirm post_live_migration() works correctly as expected
@@ -4725,51 +5442,57 @@ class ComputeTestCase(BaseTestCase):
         """
         # Create stubs
         result = {}
+        # No share storage live migration don't need to destroy at source
+        # server because instance has been migrated to destination, but a
+        # cleanup for block device and network are needed.
 
-        def fakedestroy(*args, **kwargs):
-            result['destroyed'] = True
-        self.stubs.Set(self.compute.driver, 'destroy', fakedestroy)
+        def fakecleanup(*args, **kwargs):
+            result['cleanup'] = True
+
+        self.stubs.Set(self.compute.driver, 'cleanup', fakecleanup)
         dest = 'desthost'
         srchost = self.compute.host
 
         # creating testdata
         c = context.get_admin_context()
-        inst_ref = jsonutils.to_primitive(self._create_fake_instance({
-                                          'host': srchost,
-                                          'state_description': 'migrating',
-                                          'state': power_state.PAUSED}))
-        inst_uuid = inst_ref['uuid']
+        instance = self._create_fake_instance_obj({
+                                'host': srchost,
+                                'state_description': 'migrating',
+                                'state': power_state.PAUSED,
+                                'task_state': task_states.MIGRATING,
+                                'power_state': power_state.PAUSED})
 
-        db.instance_update(c, inst_uuid,
-                           {'task_state': task_states.MIGRATING,
-                            'power_state': power_state.PAUSED})
         # creating mocks
         self.mox.StubOutWithMock(self.compute.driver, 'unfilter_instance')
-        self.compute.driver.unfilter_instance(inst_ref, [])
-        self.mox.StubOutWithMock(self.compute.conductor_api,
-                                 'network_migrate_instance_start')
+        self.compute.driver.unfilter_instance(instance, [])
+        self.mox.StubOutWithMock(self.compute.network_api,
+                                 'migrate_instance_start')
         migration = {'source_compute': srchost, 'dest_compute': dest, }
-        self.compute.conductor_api.network_migrate_instance_start(c, inst_ref,
-                                                                  migration)
+        self.compute.network_api.migrate_instance_start(c, instance,
+                                                        migration)
 
         self.mox.StubOutWithMock(self.compute.compute_rpcapi,
                                  'post_live_migration_at_destination')
         self.compute.compute_rpcapi.post_live_migration_at_destination(
-            c, inst_ref, False, dest)
+            c, instance, False, dest)
 
         self.mox.StubOutWithMock(self.compute.network_api,
                                  'setup_networks_on_host')
-        self.compute.network_api.setup_networks_on_host(c, inst_ref,
+        self.compute.network_api.setup_networks_on_host(c, instance,
                                                         self.compute.host,
                                                         teardown=True)
+        self.mox.StubOutWithMock(self.compute.instance_events,
+                                 'clear_events_for_instance')
+        self.compute.instance_events.clear_events_for_instance(
+            mox.IgnoreArg())
 
         # start test
         self.mox.ReplayAll()
-        migrate_data = {'is_shared_storage': False}
-        self.compute._post_live_migration(c, inst_ref, dest,
+        migrate_data = {'is_shared_instance_path': False}
+        self.compute._post_live_migration(c, instance, dest,
                                           migrate_data=migrate_data)
-        self.assertIn('destroyed', result)
-        self.assertTrue(result['destroyed'] == True)
+        self.assertIn('cleanup', result)
+        self.assertEqual(result['cleanup'], True)
 
     def test_post_live_migration_working_correctly(self):
         # Confirm post_live_migration() works as expected correctly.
@@ -4778,52 +5501,106 @@ class ComputeTestCase(BaseTestCase):
 
         # creating testdata
         c = context.get_admin_context()
-        inst_ref = jsonutils.to_primitive(self._create_fake_instance({
-                                'host': srchost,
-                                'state_description': 'migrating',
-                                'state': power_state.PAUSED}))
-        inst_uuid = inst_ref['uuid']
+        instance = self._objectify(self._create_fake_instance({
+                                        'host': srchost,
+                                        'state_description': 'migrating',
+                                        'state': power_state.PAUSED}))
 
-        db.instance_update(c, inst_uuid,
-                           {'task_state': task_states.MIGRATING,
-                            'power_state': power_state.PAUSED})
+        instance.update({'task_state': task_states.MIGRATING,
+                        'power_state': power_state.PAUSED})
+        instance.save(c)
 
         # creating mocks
         with contextlib.nested(
             mock.patch.object(self.compute.driver, 'post_live_migration'),
             mock.patch.object(self.compute.driver, 'unfilter_instance'),
-            mock.patch.object(self.compute.conductor_api,
-                              'network_migrate_instance_start'),
+            mock.patch.object(self.compute.network_api,
+                              'migrate_instance_start'),
             mock.patch.object(self.compute.compute_rpcapi,
                               'post_live_migration_at_destination'),
-            mock.patch.object(self.compute.driver, 'unplug_vifs'),
+            mock.patch.object(self.compute.driver,
+                              'post_live_migration_at_source'),
             mock.patch.object(self.compute.network_api,
-                              'setup_networks_on_host')
+                              'setup_networks_on_host'),
+            mock.patch.object(self.compute.instance_events,
+                              'clear_events_for_instance')
         ) as (
             post_live_migration, unfilter_instance,
-            network_migrate_instance_start, post_live_migration_at_destination,
-            unplug_vifs, setup_networks_on_host
+            migrate_instance_start, post_live_migration_at_destination,
+            post_live_migration_at_source, setup_networks_on_host,
+            clear_events
         ):
-            self.compute._post_live_migration(c, inst_ref, dest)
+            self.compute._post_live_migration(c, instance, dest)
 
             post_live_migration.assert_has_calls([
-                mock.call(c, inst_ref, {'block_device_mapping': []}, None)])
-            unfilter_instance.assert_has_calls([mock.call(inst_ref, [])])
+                mock.call(c, instance, {'swap': None, 'ephemerals': [],
+                                        'block_device_mapping': []}, None)])
+            unfilter_instance.assert_has_calls([mock.call(instance, [])])
             migration = {'source_compute': srchost,
                          'dest_compute': dest, }
-            network_migrate_instance_start.assert_has_calls([
-                mock.call(c, inst_ref, migration)])
+            migrate_instance_start.assert_has_calls([
+                mock.call(c, instance, migration)])
             post_live_migration_at_destination.assert_has_calls([
-                mock.call(c, inst_ref, False, dest)])
-            unplug_vifs.assert_has_calls([mock.call(inst_ref, [])])
+                mock.call(c, instance, False, dest)])
+            post_live_migration_at_source.assert_has_calls(
+                [mock.call(c, instance, [])])
             setup_networks_on_host.assert_has_calls([
-                mock.call(c, inst_ref, self.compute.host, teardown=True)])
+                mock.call(c, instance, self.compute.host, teardown=True)])
+            clear_events.assert_called_once_with(instance)
+
+    def test_post_live_migration_terminate_volume_connections(self):
+        c = context.get_admin_context()
+        instance = self._objectify(self._create_fake_instance({
+                                        'host': self.compute.host,
+                                        'state_description': 'migrating',
+                                        'state': power_state.PAUSED}))
+        instance.update({'task_state': task_states.MIGRATING,
+                         'power_state': power_state.PAUSED})
+        instance.save(c)
+
+        bdms = block_device_obj.block_device_make_list(c,
+                [fake_block_device.FakeDbBlockDeviceDict({
+                    'source_type': 'blank', 'guest_format': None,
+                    'destination_type': 'local'}),
+                 fake_block_device.FakeDbBlockDeviceDict({
+                    'source_type': 'volume', 'destination_type': 'volume',
+                    'volume_id': 'fake-volume-id'}),
+                 ])
+
+        with contextlib.nested(
+            mock.patch.object(self.compute.network_api,
+                              'migrate_instance_start'),
+            mock.patch.object(self.compute.compute_rpcapi,
+                              'post_live_migration_at_destination'),
+            mock.patch.object(self.compute.network_api,
+                              'setup_networks_on_host'),
+            mock.patch.object(self.compute.instance_events,
+                              'clear_events_for_instance'),
+            mock.patch.object(self.compute,
+                              '_get_instance_block_device_info'),
+            mock.patch.object(objects.BlockDeviceMappingList,
+                              'get_by_instance_uuid'),
+            mock.patch.object(self.compute.driver, 'get_volume_connector'),
+            mock.patch.object(cinder.API, 'terminate_connection')
+        ) as (
+            migrate_instance_start, post_live_migration_at_destination,
+            setup_networks_on_host, clear_events_for_instance,
+            get_instance_volume_block_device_info, get_by_instance_uuid,
+            get_volume_connector, terminate_connection
+        ):
+            get_by_instance_uuid.return_value = bdms
+            get_volume_connector.return_value = 'fake-connector'
+
+            self.compute._post_live_migration(c, instance, 'dest_host')
+
+            terminate_connection.assert_called_once_with(
+                    c, 'fake-volume-id', 'fake-connector')
 
     def _begin_post_live_migration_at_destination(self):
         self.mox.StubOutWithMock(self.compute.network_api,
                                  'setup_networks_on_host')
-        self.mox.StubOutWithMock(self.compute.conductor_api,
-                                 'network_migrate_instance_finish')
+        self.mox.StubOutWithMock(self.compute.network_api,
+                                 'migrate_instance_finish')
         self.mox.StubOutWithMock(self.compute, '_get_power_state')
         self.mox.StubOutWithMock(self.compute, '_get_compute_info')
 
@@ -4833,15 +5610,16 @@ class ComputeTestCase(BaseTestCase):
                                   self._create_fake_instance(params))
 
         self.admin_ctxt = context.get_admin_context()
-        self.instance = db.instance_get_by_uuid(self.admin_ctxt,
-                                                self.instance['uuid'])
+        self.instance = objects.Instance._from_db_object(self.context,
+               objects.Instance(),
+               db.instance_get_by_uuid(self.admin_ctxt, self.instance['uuid']))
 
         self.compute.network_api.setup_networks_on_host(self.admin_ctxt,
                                                         self.instance,
                                                         self.compute.host)
         migration = {'source_compute': self.instance['host'],
                      'dest_compute': self.compute.host, }
-        self.compute.conductor_api.network_migrate_instance_finish(
+        self.compute.network_api.migrate_instance_finish(
                 self.admin_ctxt, self.instance, migration)
         fake_net_info = []
         fake_block_dev_info = {'foo': 'bar'}
@@ -4851,8 +5629,7 @@ class ComputeTestCase(BaseTestCase):
                 False,
                 fake_block_dev_info)
         self.compute._get_power_state(self.admin_ctxt,
-                                      self.instance).AndReturn(
-                                                     'fake_power_state')
+                                      self.instance).AndReturn(10001)
 
     def _finish_post_live_migration_at_destination(self):
         self.compute.network_api.setup_networks_on_host(self.admin_ctxt,
@@ -4872,14 +5649,15 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual(msg.event_type,
                          'compute.instance.live_migration.post.dest.end')
 
-        return self.compute.conductor_api.instance_get_by_uuid(self.admin_ctxt,
-                                                        self.instance['uuid'])
+        return objects.Instance.get_by_uuid(self.admin_ctxt,
+                                            self.instance['uuid'])
 
     def test_post_live_migration_at_destination_with_compute_info(self):
         """The instance's node property should be updated correctly."""
         self._begin_post_live_migration_at_destination()
         hypervisor_hostname = 'fake_hypervisor_hostname'
-        fake_compute_info = {'hypervisor_hostname': hypervisor_hostname}
+        fake_compute_info = objects.ComputeNode(
+            hypervisor_hostname=hypervisor_hostname)
         self.compute._get_compute_info(mox.IgnoreArg(),
                                        mox.IgnoreArg()).AndReturn(
                                                         fake_compute_info)
@@ -4900,11 +5678,8 @@ class ComputeTestCase(BaseTestCase):
     def test_rollback_live_migration_at_destination_correctly(self):
         # creating instance testdata
         c = context.get_admin_context()
-        instance_ref = self._create_fake_instance({'host': 'dummy'})
-        inst_uuid = instance_ref['uuid']
-        inst_id = instance_ref['id']
+        instance = self._create_fake_instance_obj({'host': 'dummy'})
 
-        instance = jsonutils.to_primitive(db.instance_get(c, inst_id))
         fake_notifier.NOTIFICATIONS = []
 
         self.mox.StubOutWithMock(self.compute.network_api,
@@ -4912,6 +5687,12 @@ class ComputeTestCase(BaseTestCase):
         self.compute.network_api.setup_networks_on_host(c, instance,
                                                         self.compute.host,
                                                         teardown=True)
+        self.mox.StubOutWithMock(self.compute.driver,
+                                 'rollback_live_migration_at_destination')
+        self.compute.driver.rollback_live_migration_at_destination(c,
+                instance, [], {'swap': None, 'ephemerals': [],
+                               'block_device_mapping': []},
+                destroy_disks=True, migrate_data=None)
 
         # start test
         self.mox.ReplayAll()
@@ -4925,9 +5706,6 @@ class ComputeTestCase(BaseTestCase):
         msg = fake_notifier.NOTIFICATIONS[1]
         self.assertEqual(msg.event_type,
                         'compute.instance.live_migration.rollback.dest.end')
-
-        # cleanup
-        db.instance_destroy(c, inst_uuid)
 
     def test_run_kill_vm(self):
         # Detect when a vm is terminated behind the scenes.
@@ -4952,6 +5730,16 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual(len(instances), 1)
         self.assertIsNone(instances[0]['task_state'])
 
+    def _fill_fault(self, values):
+        extra = dict([(x, None) for x in ['created_at',
+                                          'deleted_at',
+                                          'updated_at',
+                                          'deleted']])
+        extra['id'] = 1
+        extra['details'] = ''
+        extra.update(values)
+        return extra
+
     def test_add_instance_fault(self):
         instance = self._create_fake_instance()
         exc_info = None
@@ -4967,6 +5755,7 @@ class ComputeTestCase(BaseTestCase):
                 'host': self.compute.host
             }
             self.assertEqual(expected, values)
+            return self._fill_fault(expected)
 
         try:
             raise NotImplementedError('test')
@@ -4977,7 +5766,6 @@ class ComputeTestCase(BaseTestCase):
 
         ctxt = context.get_admin_context()
         compute_utils.add_instance_fault_from_exc(ctxt,
-                                                  self.compute.conductor_api,
                                                   instance,
                                                   NotImplementedError('test'),
                                                   exc_info)
@@ -4987,8 +5775,7 @@ class ComputeTestCase(BaseTestCase):
         exc_info = None
 
         def fake_db_fault_create(ctxt, values):
-            self.assertTrue('raise rpc_common.RemoteError'
-                in values['details'])
+            self.assertIn('raise messaging.RemoteError', values['details'])
             del values['details']
 
             expected = {
@@ -4998,17 +5785,18 @@ class ComputeTestCase(BaseTestCase):
                 'host': self.compute.host
             }
             self.assertEqual(expected, values)
+            return self._fill_fault(expected)
 
         try:
-            raise rpc_common.RemoteError('test', 'My Test Message')
-        except rpc_common.RemoteError as exc:
+            raise messaging.RemoteError('test', 'My Test Message')
+        except messaging.RemoteError as exc:
             exc_info = sys.exc_info()
 
         self.stubs.Set(nova.db, 'instance_fault_create', fake_db_fault_create)
 
         ctxt = context.get_admin_context()
         compute_utils.add_instance_fault_from_exc(ctxt,
-            self.compute.conductor_api, instance, exc, exc_info)
+            instance, exc, exc_info)
 
     def test_add_instance_fault_user_error(self):
         instance = self._create_fake_instance()
@@ -5024,6 +5812,7 @@ class ComputeTestCase(BaseTestCase):
                 'host': self.compute.host
             }
             self.assertEqual(expected, values)
+            return self._fill_fault(expected)
 
         user_exc = exception.Invalid('fake details', code=400)
 
@@ -5036,7 +5825,7 @@ class ComputeTestCase(BaseTestCase):
 
         ctxt = context.get_admin_context()
         compute_utils.add_instance_fault_from_exc(ctxt,
-            self.compute.conductor_api, instance, user_exc, exc_info)
+            instance, user_exc, exc_info)
 
     def test_add_instance_fault_no_exc_info(self):
         instance = self._create_fake_instance()
@@ -5050,12 +5839,12 @@ class ComputeTestCase(BaseTestCase):
                 'host': self.compute.host
             }
             self.assertEqual(expected, values)
+            return self._fill_fault(expected)
 
         self.stubs.Set(nova.db, 'instance_fault_create', fake_db_fault_create)
 
         ctxt = context.get_admin_context()
         compute_utils.add_instance_fault_from_exc(ctxt,
-                                                  self.compute.conductor_api,
                                                   instance,
                                                   NotImplementedError('test'))
 
@@ -5073,12 +5862,12 @@ class ComputeTestCase(BaseTestCase):
                 'host': self.compute.host
             }
             self.assertEqual(expected, values)
+            return self._fill_fault(expected)
 
         self.stubs.Set(nova.db, 'instance_fault_create', fake_db_fault_create)
 
         ctxt = context.get_admin_context()
         compute_utils.add_instance_fault_from_exc(ctxt,
-                                                  self.compute.conductor_api,
                                                   instance,
                                                   NotImplementedError(message))
 
@@ -5102,15 +5891,41 @@ class ComputeTestCase(BaseTestCase):
 
         return admin_context, instance1, instance2
 
-    def test_cleanup_running_deleted_instances_reap(self):
-        bdms = []
+    def test_cleanup_running_deleted_instances_unrecognized_value(self):
+        admin_context = context.get_admin_context()
+        deleted_at = (timeutils.utcnow() -
+                      datetime.timedelta(hours=1, minutes=5))
+        instance = self._create_fake_instance({"deleted_at": deleted_at,
+                                               "deleted": True})
+        self.flags(running_deleted_instance_action='foo-action')
 
+        with mock.patch.object(
+                self.compute, '_get_instances_on_driver',
+                return_value=[instance]):
+            try:
+                # We cannot simply use an assertRaises here because the
+                # exception raised is too generally "Exception". To be sure
+                # that the exception raised is the expected one, we check
+                # the message.
+                self.compute._cleanup_running_deleted_instances(admin_context)
+                self.fail("Be sure this will never be executed.")
+            except Exception as e:
+                self.assertIn("Unrecognized value", six.text_type(e))
+
+    def test_cleanup_running_deleted_instances_reap(self):
         ctxt, inst1, inst2 = self._test_cleanup_running('reap')
+        bdms = block_device_obj.block_device_make_list(ctxt, [])
 
         self.mox.StubOutWithMock(self.compute, "_shutdown_instance")
+        self.mox.StubOutWithMock(objects.BlockDeviceMappingList,
+                                 "get_by_instance_uuid")
         # Simulate an error and make sure cleanup proceeds with next instance.
         self.compute._shutdown_instance(ctxt, inst1, bdms, notify=False).\
                                         AndRaise(test.TestingException)
+        objects.BlockDeviceMappingList.get_by_instance_uuid(ctxt,
+                inst1.uuid, use_slave=True).AndReturn(bdms)
+        objects.BlockDeviceMappingList.get_by_instance_uuid(ctxt,
+                inst2.uuid, use_slave=True).AndReturn(bdms)
         self.compute._shutdown_instance(ctxt, inst2, bdms, notify=False).\
                                         AndReturn(None)
 
@@ -5218,12 +6033,12 @@ class ComputeTestCase(BaseTestCase):
                                 use_slave=False
                                 ).AndReturn(fake_inst)
         self.compute.network_api.get_instance_nw_info(self.context,
-                mox.IsA(instance_obj.Instance)).AndReturn(fake_nw_info)
+                mox.IsA(objects.Instance)).AndReturn(fake_nw_info)
 
         self.mox.ReplayAll()
 
-        fake_inst_obj = instance_obj.Instance._from_db_object(
-            self.context, instance_obj.Instance(), fake_inst, [])
+        fake_inst_obj = objects.Instance._from_db_object(
+            self.context, objects.Instance(), fake_inst, [])
         result = self.compute._get_instance_nw_info(self.context,
                                                     fake_inst_obj)
         self.assertEqual(fake_nw_info, result)
@@ -5235,7 +6050,7 @@ class ComputeTestCase(BaseTestCase):
 
         instance_map = {}
         instances = []
-        for x in xrange(5):
+        for x in xrange(8):
             inst_uuid = 'fake-uuid-%s' % x
             instance_map[inst_uuid] = fake_instance.fake_db_instance(
                 uuid=inst_uuid, host=CONF.host, created_at=None)
@@ -5256,7 +6071,8 @@ class ComputeTestCase(BaseTestCase):
             if instance_uuid not in instance_map:
                 raise exception.InstanceNotFound(instance_id=instance_uuid)
             call_info['get_by_uuid'] += 1
-            self.assertEqual(['system_metadata'], columns_to_join)
+            self.assertEqual(['system_metadata', 'info_cache'],
+                             columns_to_join)
             return instance_map[instance_uuid]
 
         # NOTE(comstud): Override the stub in setUp()
@@ -5276,66 +6092,80 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute, '_get_instance_nw_info',
                 fake_get_instance_nw_info)
 
-        call_info['expected_instance'] = instances[0]
+        # Make an instance appear to be still Building
+        instances[0]['vm_state'] = vm_states.BUILDING
+        # Make an instance appear to be Deleting
+        instances[1]['task_state'] = task_states.DELETING
+        # '0', '1' should be skipped..
+        call_info['expected_instance'] = instances[2]
         self.compute._heal_instance_info_cache(ctxt)
         self.assertEqual(1, call_info['get_all_by_host'])
         self.assertEqual(0, call_info['get_by_uuid'])
         self.assertEqual(1, call_info['get_nw_info'])
 
-        call_info['expected_instance'] = instances[1]
+        call_info['expected_instance'] = instances[3]
         self.compute._heal_instance_info_cache(ctxt)
         self.assertEqual(1, call_info['get_all_by_host'])
         self.assertEqual(1, call_info['get_by_uuid'])
         self.assertEqual(2, call_info['get_nw_info'])
 
         # Make an instance switch hosts
-        instances[2]['host'] = 'not-me'
+        instances[4]['host'] = 'not-me'
         # Make an instance disappear
-        instance_map.pop(instances[3]['uuid'])
-        # '2' and '3' should be skipped..
-        call_info['expected_instance'] = instances[4]
+        instance_map.pop(instances[5]['uuid'])
+        # Make an instance switch to be Deleting
+        instances[6]['task_state'] = task_states.DELETING
+        # '4', '5', and '6' should be skipped..
+        call_info['expected_instance'] = instances[7]
         self.compute._heal_instance_info_cache(ctxt)
-        self.assertEqual(call_info['get_all_by_host'], 1)
-        # Incremented for '2' and '4'.. '3' caused a raise above.
-        self.assertEqual(call_info['get_by_uuid'], 3)
-        self.assertEqual(call_info['get_nw_info'], 3)
+        self.assertEqual(1, call_info['get_all_by_host'])
+        self.assertEqual(4, call_info['get_by_uuid'])
+        self.assertEqual(3, call_info['get_nw_info'])
         # Should be no more left.
-        self.assertEqual(len(self.compute._instance_uuids_to_heal), 0)
+        self.assertEqual(0, len(self.compute._instance_uuids_to_heal))
 
-        # This should cause a DB query now so we get first instance
-        # back again
-        call_info['expected_instance'] = instances[0]
+        # This should cause a DB query now, so get a list of instances
+        # where none can be processed to make sure we handle that case
+        # cleanly.   Use just '0' (Building) and '1' (Deleting)
+        instances = instances[0:2]
+
         self.compute._heal_instance_info_cache(ctxt)
-        self.assertEqual(call_info['get_all_by_host'], 2)
-        # Stays the same, because the instance came from the DB
-        self.assertEqual(call_info['get_by_uuid'], 3)
-        self.assertEqual(call_info['get_nw_info'], 4)
+        # Should have called the list once more
+        self.assertEqual(2, call_info['get_all_by_host'])
+        # Stays the same because we remove invalid entries from the list
+        self.assertEqual(4, call_info['get_by_uuid'])
+        # Stays the same because we didn't find anything to process
+        self.assertEqual(3, call_info['get_nw_info'])
 
-    def test_poll_rescued_instances(self):
+    @mock.patch('nova.objects.InstanceList.get_by_filters')
+    @mock.patch('nova.compute.api.API.unrescue')
+    def test_poll_rescued_instances(self, unrescue, get):
         timed_out_time = timeutils.utcnow() - datetime.timedelta(minutes=5)
         not_timed_out_time = timeutils.utcnow()
 
-        instances = [{'uuid': 'fake_uuid1', 'vm_state': vm_states.RESCUED,
-                      'launched_at': timed_out_time},
-                     {'uuid': 'fake_uuid2', 'vm_state': vm_states.RESCUED,
-                      'launched_at': timed_out_time},
-                     {'uuid': 'fake_uuid3', 'vm_state': vm_states.RESCUED,
-                      'launched_at': not_timed_out_time}]
+        instances = [objects.Instance(uuid='fake_uuid1',
+                                           vm_state=vm_states.RESCUED,
+                                           launched_at=timed_out_time),
+                     objects.Instance(uuid='fake_uuid2',
+                                           vm_state=vm_states.RESCUED,
+                                           launched_at=timed_out_time),
+                     objects.Instance(uuid='fake_uuid3',
+                                           vm_state=vm_states.RESCUED,
+                                           launched_at=not_timed_out_time)]
         unrescued_instances = {'fake_uuid1': False, 'fake_uuid2': False}
 
         def fake_instance_get_all_by_filters(context, filters,
-                                             columns_to_join):
-            self.assertEqual(columns_to_join, [])
+                                             expected_attrs=None,
+                                             use_slave=False):
+            self.assertEqual(["system_metadata"], expected_attrs)
             return instances
+
+        get.side_effect = fake_instance_get_all_by_filters
 
         def fake_unrescue(context, instance):
             unrescued_instances[instance['uuid']] = True
 
-        self.stubs.Set(self.compute.conductor_api,
-                       'instance_get_all_by_filters',
-                       fake_instance_get_all_by_filters)
-        self.stubs.Set(self.compute.conductor_api, 'compute_unrescue',
-                       fake_unrescue)
+        unrescue.side_effect = fake_unrescue
 
         self.flags(rescue_timeout=60)
         ctxt = context.get_admin_context()
@@ -5433,34 +6263,9 @@ class ComputeTestCase(BaseTestCase):
 
         self.compute._poll_unconfirmed_resizes(ctxt)
 
-        for uuid, status in expected_migration_status.iteritems():
-            self.assertEqual(status, fetch_instance_migration_status(uuid))
-
-    def test_instance_build_timeout_disabled(self):
-        # Tests that no instances are set to error state when there is no
-        # instance_build_timeout configured.
-        self.flags(instance_build_timeout=0)
-        ctxt = context.get_admin_context()
-        created_at = timeutils.utcnow() + datetime.timedelta(seconds=-60)
-
-        filters = {'vm_state': vm_states.BUILDING, 'host': CONF.host}
-        instances = []
-        for x in xrange(5):
-            instance = {'uuid': str(uuid.uuid4()), 'created_at': created_at}
-            instance.update(filters)
-            instances.append(instance)
-
-        # creating mocks
-        with mock.patch.object(self.compute.conductor_api,
-                               'instance_get_all_by_filters',
-                               return_value=instances) as (
-            instance_get_all_by_filters
-        ):
-            # run the code
-            self.compute._check_instance_build_time(ctxt)
-            # check our assertions
-            self.assertThat(instance_get_all_by_filters.mock_calls,
-                            testtools_matchers.HasLength(0))
+        for instance_uuid, status in expected_migration_status.iteritems():
+            self.assertEqual(status,
+                             fetch_instance_migration_status(instance_uuid))
 
     def test_instance_build_timeout_mixed_instances(self):
         # Tests that instances which failed to build within the configured
@@ -5475,16 +6280,18 @@ class ComputeTestCase(BaseTestCase):
         for x in xrange(4):
             instance = {'uuid': str(uuid.uuid4()), 'created_at': created_at}
             instance.update(filters)
-            old_instances.append(instance)
+            old_instances.append(fake_instance.fake_db_instance(**instance))
 
-        #not expired
+        # not expired
         instances = list(old_instances)  # copy the contents of old_instances
         new_instance = {
             'uuid': str(uuid.uuid4()),
             'created_at': timeutils.utcnow(),
         }
+        sort_key = 'created_at'
+        sort_dir = 'desc'
         new_instance.update(filters)
-        instances.append(new_instance)
+        instances.append(fake_instance.fake_db_instance(**new_instance))
 
         # need something to return from conductor_api.instance_update
         # that is defined outside the for loop and can be used in the mock
@@ -5493,7 +6300,7 @@ class ComputeTestCase(BaseTestCase):
 
         # creating mocks
         with contextlib.nested(
-            mock.patch.object(self.compute.conductor_api,
+            mock.patch.object(self.compute.db.sqlalchemy.api,
                               'instance_get_all_by_filters',
                               return_value=instances),
             mock.patch.object(self.compute.conductor_api, 'instance_update',
@@ -5509,7 +6316,13 @@ class ComputeTestCase(BaseTestCase):
             self.compute._check_instance_build_time(ctxt)
             # check our assertions
             instance_get_all_by_filters.assert_called_once_with(
-                                            ctxt, filters, columns_to_join=[])
+                                            ctxt, filters,
+                                            sort_key,
+                                            sort_dir,
+                                            marker=None,
+                                            columns_to_join=[],
+                                            use_slave=True,
+                                            limit=None)
             self.assertThat(conductor_instance_update.mock_calls,
                             testtools_matchers.HasLength(len(old_instances)))
             self.assertThat(node_is_available.mock_calls,
@@ -5567,7 +6380,7 @@ class ComputeTestCase(BaseTestCase):
         self.mox.StubOutWithMock(self.compute,
                                  '_get_instance_nw_info')
         self.mox.StubOutWithMock(self.compute,
-                                 '_get_instance_volume_block_device_info')
+                                 '_get_instance_block_device_info')
         self.mox.StubOutWithMock(self.compute,
                                  '_is_instance_storage_shared')
         self.mox.StubOutWithMock(self.compute.driver, 'destroy')
@@ -5577,7 +6390,7 @@ class ComputeTestCase(BaseTestCase):
         self.compute._get_instance_nw_info(fake_context,
                                            evacuated_instance).AndReturn(
                                                    'fake_network_info')
-        self.compute._get_instance_volume_block_device_info(
+        self.compute._get_instance_block_device_info(
                 fake_context, evacuated_instance).AndReturn('fake_bdi')
         self.compute._is_instance_storage_shared(fake_context,
                         evacuated_instance).AndReturn(True)
@@ -5614,7 +6427,7 @@ class ComputeTestCase(BaseTestCase):
         self.mox.StubOutWithMock(self.compute,
                                  '_get_instance_nw_info')
         self.mox.StubOutWithMock(self.compute,
-                                 '_get_instance_volume_block_device_info')
+                                 '_get_instance_block_device_info')
         self.mox.StubOutWithMock(self.compute.driver,
                                  'check_instance_shared_storage_local')
         self.mox.StubOutWithMock(self.compute.compute_rpcapi,
@@ -5628,12 +6441,12 @@ class ComputeTestCase(BaseTestCase):
         self.compute._get_instance_nw_info(fake_context,
                                            evacuated_instance).AndReturn(
                                                    'fake_network_info')
-        self.compute._get_instance_volume_block_device_info(
+        self.compute._get_instance_block_device_info(
                 fake_context, evacuated_instance).AndReturn('fake_bdi')
         self.compute.driver.check_instance_shared_storage_local(fake_context,
                 evacuated_instance).AndReturn({'filename': 'tmpfilename'})
         self.compute.compute_rpcapi.check_instance_shared_storage(fake_context,
-                obj_base.obj_to_primitive(evacuated_instance),
+                evacuated_instance,
                 {'filename': 'tmpfilename'}).AndReturn(False)
         self.compute.driver.check_instance_shared_storage_cleanup(fake_context,
                 {'filename': 'tmpfilename'})
@@ -5670,7 +6483,7 @@ class ComputeTestCase(BaseTestCase):
         self.mox.StubOutWithMock(self.compute,
                                  '_get_instance_nw_info')
         self.mox.StubOutWithMock(self.compute,
-                                 '_get_instance_volume_block_device_info')
+                                 '_get_instance_block_device_info')
         self.mox.StubOutWithMock(self.compute.driver,
                                  'check_instance_shared_storage_local')
         self.mox.StubOutWithMock(self.compute.compute_rpcapi,
@@ -5684,7 +6497,7 @@ class ComputeTestCase(BaseTestCase):
         self.compute._get_instance_nw_info(fake_context,
                                            evacuated_instance).AndReturn(
                                                    'fake_network_info')
-        self.compute._get_instance_volume_block_device_info(
+        self.compute._get_instance_block_device_info(
                 fake_context, evacuated_instance).AndReturn('fake_bdi')
         self.compute.driver.check_instance_shared_storage_local(fake_context,
                 evacuated_instance).AndRaise(NotImplementedError())
@@ -5698,8 +6511,9 @@ class ComputeTestCase(BaseTestCase):
 
     def test_complete_partial_deletion(self):
         admin_context = context.get_admin_context()
-        instance = instance_obj.Instance()
+        instance = objects.Instance()
         instance.id = 1
+        instance.uuid = 'fake-uuid'
         instance.vm_state = vm_states.DELETED
         instance.task_state = None
         instance.system_metadata = {'fake_key': 'fake_value'}
@@ -5714,23 +6528,22 @@ class ComputeTestCase(BaseTestCase):
 
         self.stubs.Set(instance, 'destroy', fake_destroy)
 
-        self.stubs.Set(self.compute,
-                       '_get_instance_volume_bdms',
+        self.stubs.Set(db, 'block_device_mapping_get_all_by_instance',
                        lambda *a, **k: None)
 
         self.stubs.Set(self.compute,
                        '_complete_deletion',
                        lambda *a, **k: None)
 
-        self.stubs.Set(quotas_obj.Quotas, 'reserve', lambda *a, **k: None)
+        self.stubs.Set(objects.Quotas, 'reserve', lambda *a, **k: None)
 
         self.compute._complete_partial_deletion(admin_context, instance)
 
-        self.assertFalse(instance.deleted == 0)
+        self.assertNotEqual(0, instance.deleted)
 
     def test_init_instance_for_partial_deletion(self):
         admin_context = context.get_admin_context()
-        instance = instance_obj.Instance(admin_context)
+        instance = objects.Instance(admin_context)
         instance.id = 1
         instance.vm_state = vm_states.DELETED
         instance.deleted = False
@@ -5743,12 +6556,12 @@ class ComputeTestCase(BaseTestCase):
                        fake_partial_deletion)
         self.compute._init_instance(admin_context, instance)
 
-        self.assertFalse(instance['deleted'] == 0)
+        self.assertNotEqual(0, instance['deleted'])
 
     def test_partial_deletion_raise_exception(self):
         admin_context = context.get_admin_context()
-        instance = instance_obj.Instance(admin_context)
-        instance.id = 1
+        instance = objects.Instance(admin_context)
+        instance.uuid = str(uuid.uuid4())
         instance.vm_state = vm_states.DELETED
         instance.deleted = False
 
@@ -5768,17 +6581,17 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.network_api,
                        'remove_fixed_ip_from_instance', _noop)
 
-        instance = self._create_fake_instance()
+        instance = self._create_fake_instance_obj()
         updated_at_1 = instance['updated_at']
 
         self.compute.add_fixed_ip_to_instance(self.context, 'fake', instance)
-        instance = db.instance_get_by_uuid(self.context, instance['uuid'])
-        updated_at_2 = instance['updated_at']
+        updated_at_2 = db.instance_get_by_uuid(self.context,
+                                               instance['uuid'])['updated_at']
 
         self.compute.remove_fixed_ip_from_instance(self.context, 'fake',
-                                                   instance)
-        instance = db.instance_get_by_uuid(self.context, instance['uuid'])
-        updated_at_3 = instance['updated_at']
+                                                   self._objectify(instance))
+        updated_at_3 = db.instance_get_by_uuid(self.context,
+                                               instance['uuid'])['updated_at']
 
         updated_ats = (updated_at_1, updated_at_2, updated_at_3)
         self.assertEqual(len(updated_ats), len(set(updated_ats)))
@@ -5811,7 +6624,7 @@ class ComputeTestCase(BaseTestCase):
         # Deleted old enough (only this one should be reclaimed)
         deleted_at = (timeutils.utcnow() -
                       datetime.timedelta(hours=1, minutes=5))
-        instance = self._create_fake_instance(
+        self._create_fake_instance(
                 params={'host': CONF.host,
                         'vm_state': vm_states.SOFT_DELETED,
                         'deleted_at': deleted_at})
@@ -5827,7 +6640,9 @@ class ComputeTestCase(BaseTestCase):
                         'task_state': task_states.RESTORING})
 
         self.mox.StubOutWithMock(self.compute, '_delete_instance')
-        self.compute._delete_instance(ctxt, mox.IsA(instance_obj.Instance), [])
+        self.compute._delete_instance(
+                ctxt, mox.IsA(objects.Instance), [],
+                mox.IsA(objects.Quotas))
 
         self.mox.ReplayAll()
 
@@ -5852,31 +6667,33 @@ class ComputeTestCase(BaseTestCase):
         instances.append(instance1)
         instances.append(instance2)
 
-        self.mox.StubOutWithMock(instance_obj.InstanceList,
+        self.mox.StubOutWithMock(objects.InstanceList,
                                  'get_by_filters')
         self.mox.StubOutWithMock(self.compute, '_deleted_old_enough')
-        self.mox.StubOutWithMock(self.compute.conductor_api,
-                                 'block_device_mapping_get_all_by_instance')
+        self.mox.StubOutWithMock(objects.BlockDeviceMappingList,
+                                 'get_by_instance_uuid')
         self.mox.StubOutWithMock(self.compute, '_delete_instance')
 
-        instance_obj.InstanceList.get_by_filters(
+        objects.InstanceList.get_by_filters(
             ctxt, mox.IgnoreArg(),
-            expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS
+            expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS,
+            use_slave=True
             ).AndReturn(instances)
 
         # The first instance delete fails.
         self.compute._deleted_old_enough(instance1, 3600).AndReturn(True)
-        self.compute.conductor_api.block_device_mapping_get_all_by_instance(
-                ctxt, instance1).AndReturn(None)
+        objects.BlockDeviceMappingList.get_by_instance_uuid(
+                ctxt, instance1.uuid).AndReturn([])
         self.compute._delete_instance(ctxt, instance1,
-                                      None).AndRaise(test.TestingException)
+                                      [], self.none_quotas).AndRaise(
+                                              test.TestingException)
 
         # The second instance delete that follows.
         self.compute._deleted_old_enough(instance2, 3600).AndReturn(True)
-        self.compute.conductor_api.block_device_mapping_get_all_by_instance(
-                ctxt, instance2).AndReturn(None)
+        objects.BlockDeviceMappingList.get_by_instance_uuid(
+                ctxt, instance2.uuid).AndReturn([])
         self.compute._delete_instance(ctxt, instance2,
-                                      None)
+                                      [], self.none_quotas)
 
         self.mox.ReplayAll()
 
@@ -5915,7 +6732,7 @@ class ComputeTestCase(BaseTestCase):
         uuid = instance['uuid']
 
         self.mox.StubOutWithMock(self.compute, '_sync_instance_power_state')
-        if power_state != None:
+        if power_state is not None:
             self.compute._sync_instance_power_state(
                 mox.IgnoreArg(),
                 mox.ContainsKeyValue('uuid', uuid),
@@ -5972,7 +6789,7 @@ class ComputeTestCase(BaseTestCase):
         self.stubs.Set(self.compute.network_api, 'setup_networks_on_host',
                        fake_setup_networks_on_host)
 
-        migration = migration_obj.Migration()
+        migration = objects.Migration()
         migration.instance_uuid = instance.uuid
         migration.status = 'finished'
         migration.create(self.context.elevated())
@@ -5990,13 +6807,14 @@ class ComputeTestCase(BaseTestCase):
     def _get_instance_and_bdm_for_dev_defaults_tests(self):
         instance = self._create_fake_instance(
             params={'root_device_name': '/dev/vda'})
-        block_device_mapping = [
-            {'id': 3, 'instance_uuid': 'fake-instance',
-             'device_name': '/dev/vda',
-             'source_type': 'volume',
-             'destination_type': 'volume',
-             'image_id': 'fake-image-id-1',
-             'boot_index': 0}]
+        block_device_mapping = block_device_obj.block_device_make_list(
+                self.context, [fake_block_device.FakeDbBlockDeviceDict(
+                    {'id': 3, 'instance_uuid': 'fake-instance',
+                     'device_name': '/dev/vda',
+                     'source_type': 'volume',
+                     'destination_type': 'volume',
+                     'image_id': 'fake-image-id-1',
+                     'boot_index': 0})])
 
         return instance, block_device_mapping
 
@@ -6009,9 +6827,8 @@ class ComputeTestCase(BaseTestCase):
         self.compute._instance_update(self.context, instance['uuid'],
                                       root_device_name='/dev/vda')
         self.compute._default_device_names_for_instance(instance,
-                                                        '/dev/vda',
-                                                        mox.IgnoreArg(),
-                                                        [], [], bdms)
+                                                        '/dev/vda', [], [],
+                                                        [bdm for bdm in bdms])
         self.mox.ReplayAll()
         self.compute._default_block_device_names(self.context,
                                                  instance,
@@ -6020,16 +6837,14 @@ class ComputeTestCase(BaseTestCase):
     def test_default_block_device_names_empty_root_device(self):
         instance, bdms = self._get_instance_and_bdm_for_dev_defaults_tests()
         bdms[0]['device_name'] = None
-        self.mox.StubOutWithMock(self.compute.conductor_api,
-                                 'block_device_mapping_update')
+        self.mox.StubOutWithMock(self.compute, '_instance_update')
         self.mox.StubOutWithMock(self.compute,
                                  '_default_device_names_for_instance')
-        self.compute.conductor_api.block_device_mapping_update(
-            self.context, bdms[0]['id'], {'device_name': '/dev/vda'})
+        self.mox.StubOutWithMock(objects.BlockDeviceMapping, 'save')
+        bdms[0].save().AndReturn(None)
         self.compute._default_device_names_for_instance(instance,
-                                                        '/dev/vda',
-                                                        mox.IgnoreArg(),
-                                                        [], [], bdms)
+                                                        '/dev/vda', [], [],
+                                                        [bdm for bdm in bdms])
         self.mox.ReplayAll()
         self.compute._default_block_device_names(self.context,
                                                  instance,
@@ -6040,8 +6855,7 @@ class ComputeTestCase(BaseTestCase):
         instance['root_device_name'] = None
         bdms[0]['device_name'] = None
         self.mox.StubOutWithMock(self.compute, '_instance_update')
-        self.mox.StubOutWithMock(self.compute.conductor_api,
-                                 'block_device_mapping_update')
+        self.mox.StubOutWithMock(objects.BlockDeviceMapping, 'save')
         self.mox.StubOutWithMock(self.compute,
                                  '_default_root_device_name')
         self.mox.StubOutWithMock(self.compute,
@@ -6051,16 +6865,98 @@ class ComputeTestCase(BaseTestCase):
                                                bdms[0]).AndReturn('/dev/vda')
         self.compute._instance_update(self.context, instance['uuid'],
                                       root_device_name='/dev/vda')
-        self.compute.conductor_api.block_device_mapping_update(
-            self.context, bdms[0]['id'], {'device_name': '/dev/vda'})
+        bdms[0].save().AndReturn(None)
         self.compute._default_device_names_for_instance(instance,
-                                                        '/dev/vda',
-                                                        mox.IgnoreArg(),
-                                                        [], [], bdms)
+                                                        '/dev/vda', [], [],
+                                                        [bdm for bdm in bdms])
         self.mox.ReplayAll()
         self.compute._default_block_device_names(self.context,
                                                  instance,
                                                  {}, bdms)
+
+    def test_default_block_device_names_with_blank_volumes(self):
+        instance = self._create_fake_instance()
+        image_meta = {}
+        root_volume = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'id': 1, 'instance_uuid': 'fake-instance',
+                'source_type': 'volume',
+                'destination_type': 'volume',
+                'image_id': 'fake-image-id-1',
+                'boot_index': 0}))
+        blank_volume1 = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'id': 2, 'instance_uuid': 'fake-instance',
+                'source_type': 'blank',
+                'destination_type': 'volume',
+                'boot_index': -1}))
+        blank_volume2 = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'id': 3, 'instance_uuid': 'fake-instance',
+                'source_type': 'blank',
+                'destination_type': 'volume',
+                'boot_index': -1}))
+        ephemeral = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'id': 4, 'instance_uuid': 'fake-instance',
+                'source_type': 'blank',
+                'destination_type': 'local'}))
+        swap = objects.BlockDeviceMapping(
+             **fake_block_device.FakeDbBlockDeviceDict({
+                'id': 5, 'instance_uuid': 'fake-instance',
+                'source_type': 'blank',
+                'destination_type': 'local',
+                'guest_format': 'swap'
+                }))
+        bdms = block_device_obj.block_device_make_list(
+            self.context, [root_volume, blank_volume1, blank_volume2,
+                           ephemeral, swap])
+
+        with contextlib.nested(
+            mock.patch.object(self.compute, '_default_root_device_name',
+                              return_value='/dev/vda'),
+            mock.patch.object(self.compute, '_instance_update'),
+            mock.patch.object(objects.BlockDeviceMapping, 'save'),
+            mock.patch.object(self.compute,
+                              '_default_device_names_for_instance')
+        ) as (default_root_device, instance_update, object_save,
+              default_device_names):
+            self.compute._default_block_device_names(self.context, instance,
+                                                     image_meta, bdms)
+            default_root_device.assert_called_once_with(instance, image_meta,
+                                                        bdms[0])
+            instance_update.assert_called_once_with(
+                self.context, instance['uuid'], root_device_name='/dev/vda')
+            self.assertTrue(object_save.called)
+            default_device_names.assert_called_once_with(instance,
+                '/dev/vda', [bdms[-2]], [bdms[-1]],
+                [bdm for bdm in bdms[:-2]])
+
+    def test_reserve_block_device_name(self):
+        instance = self._create_fake_instance_obj(
+                params={'root_device_name': '/dev/vda'})
+        bdm = objects.BlockDeviceMapping(
+                **{'source_type': 'image', 'destination_type': 'local',
+                   'image_id': 'fake-image-id', 'device_name': '/dev/vda',
+                   'instance_uuid': instance.uuid})
+        bdm.create(self.context)
+
+        self.compute.reserve_block_device_name(self.context, instance,
+                                               '/dev/vdb', 'fake-volume-id',
+                                               'virtio', 'disk')
+
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                self.context, instance.uuid)
+        bdms = list(bdms)
+        self.assertEqual(len(bdms), 2)
+        bdms.sort(key=operator.attrgetter('device_name'))
+        vol_bdm = bdms[1]
+        self.assertEqual(vol_bdm.source_type, 'volume')
+        self.assertEqual(vol_bdm.destination_type, 'volume')
+        self.assertEqual(vol_bdm.device_name, '/dev/vdb')
+        self.assertEqual(vol_bdm.volume_id, 'fake-volume-id')
+        self.assertEqual(vol_bdm.disk_bus, 'virtio')
+        self.assertEqual(vol_bdm.device_type, 'disk')
 
 
 class ComputeAPITestCase(BaseTestCase):
@@ -6085,7 +6981,7 @@ class ComputeAPITestCase(BaseTestCase):
                            'ramdisk_id': 'fake_ramdisk_id'},
         }
 
-        def fake_show(obj, context, image_id):
+        def fake_show(obj, context, image_id, **kwargs):
             if image_id:
                 return self.fake_image
             else:
@@ -6274,7 +7170,7 @@ class ComputeAPITestCase(BaseTestCase):
             self.assertEqual(len(db.security_group_get_by_instance(
                              self.context, ref[0]['uuid'])), 1)
             group = db.security_group_get(self.context, group['id'])
-            self.assertTrue(len(group['instances']) == 1)
+            self.assertEqual(1, len(group['instances']))
         finally:
             db.security_group_destroy(self.context, group['id'])
             db.instance_destroy(self.context, ref[0]['uuid'])
@@ -6334,7 +7230,7 @@ class ComputeAPITestCase(BaseTestCase):
     def test_populate_instance_for_create(self):
         base_options = {'image_ref': self.fake_image['id'],
                         'system_metadata': {'fake': 'value'}}
-        instance = instance_obj.Instance()
+        instance = objects.Instance()
         instance.update(base_options)
         inst_type = flavors.get_flavor_by_name("m1.tiny")
         instance = self.compute_api._populate_instance_for_create(
@@ -6377,6 +7273,51 @@ class ComputeAPITestCase(BaseTestCase):
             finally:
                 db.instance_destroy(self.context, ref[0]['uuid'])
 
+    def test_instance_create_adds_to_instance_group(self):
+        self.stubs.Set(fake_image._FakeImageService, 'show', self.fake_show)
+
+        group = objects.InstanceGroup(self.context)
+        group.uuid = str(uuid.uuid4())
+        group.create()
+
+        inst_type = flavors.get_default_flavor()
+        (refs, resv_id) = self.compute_api.create(
+            self.context, inst_type, self.fake_image['id'],
+            scheduler_hints={'group': group.uuid})
+
+        group = objects.InstanceGroup.get_by_uuid(self.context, group.uuid)
+        self.assertIn(refs[0]['uuid'], group.members)
+
+        db.instance_destroy(self.context, refs[0]['uuid'])
+
+    def test_instance_create_auto_creates_group(self):
+        self.stubs.Set(fake_image._FakeImageService, 'show', self.fake_show)
+
+        inst_type = flavors.get_default_flavor()
+        (refs, resv_id) = self.compute_api.create(
+            self.context, inst_type, self.fake_image['id'],
+            scheduler_hints={'group': 'groupname'})
+
+        group = objects.InstanceGroup.get_by_name(self.context, 'groupname')
+        self.assertEqual('groupname', group.name)
+        self.assertIn('legacy', group.policies)
+        self.assertEqual(1, len(group.members))
+        self.assertIn(refs[0]['uuid'], group.members)
+
+        # On a second instance, make sure it gets added to the group that was
+        # auto-created above
+        (refs2, resv_id) = self.compute_api.create(
+            self.context, inst_type, self.fake_image['id'],
+            scheduler_hints={'group': 'groupname'})
+        group = objects.InstanceGroup.get_by_name(self.context, 'groupname')
+        self.assertEqual('groupname', group.name)
+        self.assertIn('legacy', group.policies)
+        self.assertEqual(2, len(group.members))
+        self.assertIn(refs[0]['uuid'], group.members)
+        self.assertIn(refs2[0]['uuid'], group.members)
+
+        db.instance_destroy(self.context, refs[0]['uuid'])
+
     def test_destroy_instance_disassociates_security_groups(self):
         # Make sure destroying disassociates security groups.
         group = self._create_group()
@@ -6389,7 +7330,7 @@ class ComputeAPITestCase(BaseTestCase):
         try:
             db.instance_destroy(self.context, ref[0]['uuid'])
             group = db.security_group_get(self.context, group['id'])
-            self.assertTrue(len(group['instances']) == 0)
+            self.assertEqual(0, len(group['instances']))
         finally:
             db.security_group_destroy(self.context, group['id'])
 
@@ -6408,41 +7349,9 @@ class ComputeAPITestCase(BaseTestCase):
             admin_deleted_context = context.get_admin_context(
                     read_deleted="only")
             group = db.security_group_get(admin_deleted_context, group['id'])
-            self.assertTrue(len(group['instances']) == 0)
+            self.assertEqual(0, len(group['instances']))
         finally:
             db.instance_destroy(self.context, ref[0]['uuid'])
-
-    def test_restore(self):
-        # Ensure instance can be restored from a soft delete.
-        instance, instance_uuid = self._run_instance(params={
-                'host': CONF.host,
-                'cell_name': 'foo'})
-
-        instance = instance_obj.Instance.get_by_uuid(
-            self.context, instance_uuid,
-            expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
-        self.compute_api.soft_delete(self.context, instance)
-
-        instance.refresh()
-        self.assertEqual(instance.task_state, task_states.SOFT_DELETING)
-
-        # set the state that the instance gets when soft_delete finishes
-        instance.vm_state = vm_states.SOFT_DELETED
-        instance.task_state = None
-        instance.save()
-
-        # Ensure quotas are committed
-        self.mox.StubOutWithMock(nova.quota.QUOTAS, 'commit')
-        nova.quota.QUOTAS.commit(mox.IgnoreArg(), mox.IgnoreArg())
-        self.mox.ReplayAll()
-
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.compute_api.restore(self.context, instance)
-
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['task_state'], task_states.RESTORING)
-
-        db.instance_destroy(self.context, instance['uuid'])
 
     def _test_rebuild(self, vm_state):
         instance = jsonutils.to_primitive(self._create_fake_instance())
@@ -6450,50 +7359,52 @@ class ComputeAPITestCase(BaseTestCase):
         self.compute.run_instance(self.context, instance, {}, {}, None, None,
                 None, True, None, False)
 
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertIsNone(instance['task_state'])
+        instance = objects.Instance.get_by_uuid(self.context,
+                                                instance_uuid)
+        self.assertIsNone(instance.task_state)
         # Set some image metadata that should get wiped out and reset
         # as well as some other metadata that should be preserved.
-        db.instance_system_metadata_update(self.context, instance_uuid,
-                {'image_kernel_id': 'old-data',
-                 'image_ramdisk_id': 'old_data',
-                 'image_something_else': 'old-data',
-                 'image_should_remove': 'bye-bye',
-                 'preserved': 'preserve this!'},
-                True)
+        instance.system_metadata.update({
+                'image_kernel_id': 'old-data',
+                'image_ramdisk_id': 'old_data',
+                'image_something_else': 'old-data',
+                'image_should_remove': 'bye-bye',
+                'preserved': 'preserve this!'})
+
+        instance.save()
 
         # Make sure Compute API updates the image_ref before casting to
         # compute manager.
-        orig_update = self.compute_api.update
-        info = {'image_ref': None}
+        info = {'image_ref': None, 'clean': False}
 
-        def update_wrapper(*args, **kwargs):
-            if 'image_ref' in kwargs:
-                info['image_ref'] = kwargs['image_ref']
-            return orig_update(*args, **kwargs)
+        def fake_rpc_rebuild(context, **kwargs):
+            info['image_ref'] = kwargs['instance'].image_ref
+            info['clean'] = kwargs['instance'].obj_what_changed() == set()
 
-        self.stubs.Set(self.compute_api, 'update', update_wrapper)
+        self.stubs.Set(self.compute_api.compute_task_api, 'rebuild_instance',
+                       fake_rpc_rebuild)
 
         image_ref = instance["image_ref"] + '-new_image_ref'
         password = "new_password"
 
-        db.instance_update(self.context, instance['uuid'],
-                           {"vm_state": vm_state})
+        instance.vm_state = vm_state
+        instance.save()
 
         self.compute_api.rebuild(self.context, instance, image_ref, password)
         self.assertEqual(info['image_ref'], image_ref)
+        self.assertTrue(info['clean'])
 
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['task_state'], task_states.REBUILDING)
-        sys_metadata = db.instance_system_metadata_get(self.context,
-                instance_uuid)
-        self.assertEqual(sys_metadata,
+        instance.refresh()
+        self.assertEqual(instance.task_state, task_states.REBUILDING)
+        sys_meta = dict([(k, v) for k, v in instance.system_metadata.items()
+                         if not k.startswith('instance_type')])
+        self.assertEqual(sys_meta,
                 {'image_kernel_id': 'fake_kernel_id',
                 'image_min_disk': '1',
                 'image_ramdisk_id': 'fake_ramdisk_id',
                 'image_something_else': 'meow',
                 'preserved': 'preserve this!'})
-        db.instance_destroy(self.context, instance['uuid'])
+        instance.destroy()
 
     def test_rebuild(self):
         self._test_rebuild(vm_state=vm_states.ACTIVE)
@@ -6522,9 +7433,8 @@ class ComputeAPITestCase(BaseTestCase):
                           "new password")
 
     def test_rebuild_no_image(self):
-        instance = jsonutils.to_primitive(
-            self._create_fake_instance(params={'image_ref': ''}))
-        instance_uuid = instance['uuid']
+        instance = self._create_fake_instance_obj(params={'image_ref': ''})
+        instance_uuid = instance.uuid
         self.stubs.Set(fake_image._FakeImageService, 'show', self.fake_show)
         self.compute.run_instance(self.context, instance, {}, {}, None, None,
                 None, True, None, False)
@@ -6536,9 +7446,7 @@ class ComputeAPITestCase(BaseTestCase):
     def test_rebuild_with_deleted_image(self):
         # If we're given a deleted image by glance, we should not be able to
         # rebuild from it
-        instance = jsonutils.to_primitive(
-            self._create_fake_instance(params={'image_ref': '1'}))
-
+        instance = self._create_fake_instance_obj(params={'image_ref': '1'})
         self.fake_image['name'] = 'fake_name'
         self.fake_image['status'] = 'DELETED'
         self.stubs.Set(fake_image._FakeImageService, 'show', self.fake_show)
@@ -6552,11 +7460,11 @@ class ComputeAPITestCase(BaseTestCase):
                                      self.fake_image['id'], 'new_password')
 
     def test_rebuild_with_too_little_ram(self):
-        instance = jsonutils.to_primitive(
-            self._create_fake_instance(params={'image_ref': '1'}))
+        instance = self._create_fake_instance_obj(params={'image_ref': '1'})
 
-        def fake_extract_flavor(_inst):
-            return dict(memory_mb=64, root_gb=1)
+        def fake_extract_flavor(_inst, prefix):
+            self.assertEqual('', prefix)
+            return dict(test_flavor.fake_flavor, memory_mb=64, root_gb=1)
 
         self.stubs.Set(flavors, 'extract_flavor',
                        fake_extract_flavor)
@@ -6576,11 +7484,11 @@ class ComputeAPITestCase(BaseTestCase):
         db.instance_destroy(self.context, instance['uuid'])
 
     def test_rebuild_with_too_little_disk(self):
-        instance = jsonutils.to_primitive(
-            self._create_fake_instance(params={'image_ref': '1'}))
+        instance = self._create_fake_instance_obj(params={'image_ref': '1'})
 
-        def fake_extract_flavor(_inst):
-            return dict(memory_mb=64, root_gb=1)
+        def fake_extract_flavor(_inst, prefix):
+            self.assertEqual('', prefix)
+            return dict(test_flavor.fake_flavor, memory_mb=64, root_gb=1)
 
         self.stubs.Set(flavors, 'extract_flavor',
                        fake_extract_flavor)
@@ -6600,11 +7508,11 @@ class ComputeAPITestCase(BaseTestCase):
         db.instance_destroy(self.context, instance['uuid'])
 
     def test_rebuild_with_just_enough_ram_and_disk(self):
-        instance = jsonutils.to_primitive(
-            self._create_fake_instance(params={'image_ref': '1'}))
+        instance = self._create_fake_instance_obj(params={'image_ref': '1'})
 
-        def fake_extract_flavor(_inst):
-            return dict(memory_mb=64, root_gb=1)
+        def fake_extract_flavor(_inst, prefix):
+            self.assertEqual('', prefix)
+            return dict(test_flavor.fake_flavor, memory_mb=64, root_gb=1)
 
         self.stubs.Set(flavors, 'extract_flavor',
                        fake_extract_flavor)
@@ -6618,11 +7526,11 @@ class ComputeAPITestCase(BaseTestCase):
         db.instance_destroy(self.context, instance['uuid'])
 
     def test_rebuild_with_no_ram_and_disk_reqs(self):
-        instance = jsonutils.to_primitive(
-            self._create_fake_instance(params={'image_ref': '1'}))
+        instance = self._create_fake_instance_obj(params={'image_ref': '1'})
 
-        def fake_extract_flavor(_inst):
-            return dict(memory_mb=64, root_gb=1)
+        def fake_extract_flavor(_inst, prefix):
+            self.assertEqual('', prefix)
+            return dict(test_flavor.fake_flavor, memory_mb=64, root_gb=1)
 
         self.stubs.Set(flavors, 'extract_flavor',
                        fake_extract_flavor)
@@ -6633,11 +7541,11 @@ class ComputeAPITestCase(BaseTestCase):
         db.instance_destroy(self.context, instance['uuid'])
 
     def test_rebuild_with_too_large_image(self):
-        instance = jsonutils.to_primitive(
-            self._create_fake_instance(params={'image_ref': '1'}))
+        instance = self._create_fake_instance_obj(params={'image_ref': '1'})
 
-        def fake_extract_flavor(_inst):
-            return dict(memory_mb=64, root_gb=1)
+        def fake_extract_flavor(_inst, prefix):
+            self.assertEqual('', prefix)
+            return dict(test_flavor.fake_flavor, memory_mb=64, root_gb=1)
 
         self.stubs.Set(flavors, 'extract_flavor',
                        fake_extract_flavor)
@@ -6665,106 +7573,70 @@ class ComputeAPITestCase(BaseTestCase):
 
         self.assertEqual('test-host', instances[0]['hostname'])
 
-    def test_set_admin_password(self):
-        # Ensure instance can have its admin password set.
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        instance_uuid = instance['uuid']
-        self.compute.run_instance(self.context, instance, {}, {}, None, None,
-                None, True, None, False)
-
-        inst_ref = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(inst_ref['vm_state'], vm_states.ACTIVE)
-        self.assertIsNone(inst_ref['task_state'])
-
-        def fake_rpc_method(context, topic, msg, do_cast=True):
-            self.assertFalse(do_cast)
-
-        self.stubs.Set(rpc, 'call', fake_rpc_method)
-
-        self.compute_api.set_admin_password(self.context, inst_ref)
-
-        inst_ref = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(inst_ref['vm_state'], vm_states.ACTIVE)
-        self.assertEqual(inst_ref['task_state'],
-                         task_states.UPDATING_PASSWORD)
-
-        self.compute.terminate_instance(self.context,
-                self._objectify(inst_ref), [], [])
-
-    def test_rescue_unrescue(self):
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        instance_uuid = instance['uuid']
-        self.compute.run_instance(self.context, instance, {}, {}, None, None,
-                None, True, None, False)
-
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['vm_state'], vm_states.ACTIVE)
-        self.assertIsNone(instance['task_state'])
-
-        self.compute_api.rescue(self.context, instance)
-
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['vm_state'], vm_states.ACTIVE)
-        self.assertEqual(instance['task_state'], task_states.RESCUING)
-
-        params = {'vm_state': vm_states.RESCUED, 'task_state': None}
-        db.instance_update(self.context, instance_uuid, params)
-
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.compute_api.unrescue(self.context, instance)
-
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['vm_state'], vm_states.RESCUED)
-        self.assertEqual(instance['task_state'], task_states.UNRESCUING)
-
-        self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
-
-    def test_rescue_volume_backed(self):
-        # Instance started without an image
-        volume_backed_inst_1 = jsonutils.to_primitive(
-            self._create_fake_instance({'image_ref': ''}))
-
-        # Instance started with a placeholder image (for metadata)
-        volume_backed_inst_2 = jsonutils.to_primitive(
-            self._create_fake_instance(
-                {'image_ref': 'my_placeholder_img',
-                 'root_device_name': '/dev/vda'})
-            )
-
-        def fake_get_instance_bdms(*args, **kwargs):
-            return [{'device_name': '/dev/vda',
+    def _fake_rescue_block_devices(self, instance, status="in-use"):
+        fake_bdms = block_device_obj.block_device_make_list(self.context,
+                    [fake_block_device.FakeDbBlockDeviceDict(
+                     {'device_name': '/dev/vda',
                      'source_type': 'volume',
                      'boot_index': 0,
                      'destination_type': 'volume',
-                     'volume_id': 'bf0b6b00-a20c-11e2-9e96-0800200c9a66'}]
+                     'volume_id': 'bf0b6b00-a20c-11e2-9e96-0800200c9a66'})])
 
-        self.stubs.Set(self.compute_api, 'get_instance_bdms',
-                       fake_get_instance_bdms)
+        volume = {'id': 'bf0b6b00-a20c-11e2-9e96-0800200c9a66',
+                  'state': 'active', 'instance_uuid': instance['uuid']}
 
-        def fake_volume_get(self, context, volume_id):
-            return {'id': volume_id, 'status': 'in-use'}
+        return fake_bdms, volume
 
-        self.stubs.Set(cinder.API, 'get', fake_volume_get)
+    @mock.patch.object(objects.BlockDeviceMappingList,
+                       'get_by_instance_uuid')
+    @mock.patch.object(cinder.API, 'get')
+    def test_rescue_volume_backed_no_image(self, mock_get_vol, mock_get_bdms):
+        # Instance started without an image
+        params = {'image_ref': ''}
+        volume_backed_inst_1 = self._create_fake_instance_obj(params=params)
+        bdms, volume = self._fake_rescue_block_devices(volume_backed_inst_1)
 
-        self.compute.run_instance(self.context,
-                                  volume_backed_inst_1, {}, {}, None, None,
-                                  None, True, None, False)
-        self.compute.run_instance(self.context,
-                                  volume_backed_inst_2, {}, {}, None, None,
-                                  None, True, None, False)
+        mock_get_vol.return_value = {'id': volume['id'], 'status': "in-use"}
+        mock_get_bdms.return_value = bdms
+
+        with mock.patch.object(self.compute, '_prep_block_device'):
+            self.compute.run_instance(self.context,
+                                      volume_backed_inst_1, {}, {}, None, None,
+                                      None, True, None, False)
 
         self.assertRaises(exception.InstanceNotRescuable,
                           self.compute_api.rescue, self.context,
                           volume_backed_inst_1)
+
+        self.compute.terminate_instance(self.context, volume_backed_inst_1,
+                                        [], [])
+
+    @mock.patch.object(objects.BlockDeviceMappingList,
+                       'get_by_instance_uuid')
+    @mock.patch.object(cinder.API, 'get')
+    def test_rescue_volume_backed_placeholder_image(self,
+                                                    mock_get_vol,
+                                                    mock_get_bdms):
+        # Instance started with a placeholder image (for metadata)
+        volume_backed_inst_2 = self._create_fake_instance_obj(
+                {'image_ref': 'my_placeholder_img',
+                 'root_device_name': '/dev/vda'})
+        bdms, volume = self._fake_rescue_block_devices(volume_backed_inst_2)
+
+        mock_get_vol.return_value = {'id': volume['id'], 'status': "in-use"}
+        mock_get_bdms.return_value = bdms
+
+        with mock.patch.object(self.compute, '_prep_block_device'):
+            self.compute.run_instance(self.context,
+                                      volume_backed_inst_2, {}, {}, None, None,
+                                      None, True, None, False)
+
         self.assertRaises(exception.InstanceNotRescuable,
                           self.compute_api.rescue, self.context,
                           volume_backed_inst_2)
 
-        self.compute.terminate_instance(self.context,
-                self._objectify(volume_backed_inst_1), [], [])
-        self.compute.terminate_instance(self.context,
-                self._objectify(volume_backed_inst_2), [], [])
+        self.compute.terminate_instance(self.context, volume_backed_inst_2,
+                                        [], [])
 
     def test_get(self):
         # Test get instance.
@@ -6772,8 +7644,8 @@ class ComputeAPITestCase(BaseTestCase):
         # NOTE(danms): Transform the db object in a similar way as
         # the API method will do.
         expected = obj_base.obj_to_primitive(
-            instance_obj.Instance._from_db_object(
-                self.context, instance_obj.Instance(), exp_instance,
+            objects.Instance._from_db_object(
+                self.context, objects.Instance(), exp_instance,
                 instance_obj.INSTANCE_DEFAULT_FIELDS + ['fault']))
 
         def fake_db_get(_context, _instance_uuid,
@@ -6793,8 +7665,8 @@ class ComputeAPITestCase(BaseTestCase):
         # NOTE(danms): Transform the db object in a similar way as
         # the API method will do.
         expected = obj_base.obj_to_primitive(
-            instance_obj.Instance._from_db_object(
-                c, instance_obj.Instance(), exp_instance,
+            objects.Instance._from_db_object(
+                c, objects.Instance(), exp_instance,
                 instance_obj.INSTANCE_DEFAULT_FIELDS + ['fault']))
 
         def fake_db_get(context, instance_uuid,
@@ -6813,8 +7685,8 @@ class ComputeAPITestCase(BaseTestCase):
         # NOTE(danms): Transform the db object in a similar way as
         # the API method will do.
         expected = obj_base.obj_to_primitive(
-            instance_obj.Instance._from_db_object(
-                self.context, instance_obj.Instance(), exp_instance,
+            objects.Instance._from_db_object(
+                self.context, objects.Instance(), exp_instance,
                 instance_obj.INSTANCE_DEFAULT_FIELDS + ['fault']))
 
         def fake_db_get(_context, _instance_id, columns_to_join=None):
@@ -6869,10 +7741,17 @@ class ComputeAPITestCase(BaseTestCase):
         db.instance_destroy(c, instance2['uuid'])
         db.instance_destroy(c, instance3['uuid'])
 
-    def test_get_all_by_multiple_options_at_once(self):
+    @mock.patch('nova.db.network_get')
+    @mock.patch('nova.db.fixed_ips_by_virtual_interface')
+    def test_get_all_by_multiple_options_at_once(self, fixed_get, network_get):
         # Test searching by multiple options at once.
         c = context.get_admin_context()
-        network_manager = fake_network.FakeNetworkManager()
+        network_manager = fake_network.FakeNetworkManager(self.stubs)
+        fixed_get.side_effect = (
+            network_manager.db.fixed_ips_by_virtual_interface)
+        network_get.return_value = (
+            dict(test_network.fake_network,
+                 **network_manager.db.network_get(None, 1)))
         self.stubs.Set(self.compute_api.network_api,
                        'get_instance_uuids_by_ip_filter',
                        network_manager.get_instance_uuids_by_ip_filter)
@@ -7097,33 +7976,33 @@ class ComputeAPITestCase(BaseTestCase):
         db.instance_destroy(c, instance4['uuid'])
 
     def test_all_instance_metadata(self):
-        instance1 = self._create_fake_instance({'metadata': {'key1': 'value1'},
-                                               'user_id': 'user1',
-                                               'project_id': 'project1'})
+        self._create_fake_instance({'metadata': {'key1': 'value1'},
+                                                'user_id': 'user1',
+                                                'project_id': 'project1'})
 
-        instance2 = self._create_fake_instance({'metadata': {'key2': 'value2'},
-                                               'user_id': 'user2',
-                                               'project_id': 'project2'})
+        self._create_fake_instance({'metadata': {'key2': 'value2'},
+                                                'user_id': 'user2',
+                                                'project_id': 'project2'})
 
         _context = self.context
         _context.user_id = 'user1'
         _context.project_id = 'project1'
         metadata = self.compute_api.get_all_instance_metadata(_context,
                                                               search_filts=[])
-        self.assertTrue(len(metadata) == 1)
+        self.assertEqual(1, len(metadata))
         self.assertEqual(metadata[0]['key'], 'key1')
 
         _context.user_id = 'user2'
         _context.project_id = 'project2'
         metadata = self.compute_api.get_all_instance_metadata(_context,
                                                               search_filts=[])
-        self.assertTrue(len(metadata) == 1)
+        self.assertEqual(1, len(metadata))
         self.assertEqual(metadata[0]['key'], 'key2')
 
         _context = context.get_admin_context()
         metadata = self.compute_api.get_all_instance_metadata(_context,
                                                               search_filts=[])
-        self.assertTrue(len(metadata) == 2)
+        self.assertEqual(2, len(metadata))
 
     def test_instance_metadata(self):
         meta_changes = [None]
@@ -7136,8 +8015,8 @@ class ComputeAPITestCase(BaseTestCase):
                        fake_change_instance_metadata)
 
         _context = context.get_admin_context()
-        instance = self._create_fake_instance({'metadata': {'key1': 'value1'}})
-        instance = dict(instance.iteritems())
+        instance = self._create_fake_instance_obj({'metadata':
+                                                       {'key1': 'value1'}})
 
         metadata = self.compute_api.get_instance_metadata(_context, instance)
         self.assertEqual(metadata, {'key1': 'value1'})
@@ -7180,7 +8059,7 @@ class ComputeAPITestCase(BaseTestCase):
         msg = fake_notifier.NOTIFICATIONS[2]
         payload = msg.payload
         self.assertIn('metadata', payload)
-        self.assertEqual(payload['metadata'], {})
+        self.assertEqual(payload['metadata'], {'key3': 'value3'})
 
         db.instance_destroy(_context, instance['uuid'])
 
@@ -7304,7 +8183,7 @@ class ComputeAPITestCase(BaseTestCase):
                  'no_device': True}]
 
         image_mapping = self.compute_api._prepare_image_mapping(
-            instance_type, instance['uuid'], mappings)
+            instance_type, mappings)
         self.compute_api._update_block_device_mapping(
             self.context, instance_type, instance['uuid'], image_mapping)
 
@@ -7390,7 +8269,106 @@ class ComputeAPITestCase(BaseTestCase):
         self.compute.terminate_instance(self.context,
                 self._objectify(instance), [], [])
 
-    def test_check_and_transform_bdm(self):
+    def _test_check_and_transform_bdm(self, bdms, expected_bdms,
+                                      image_bdms=None, base_options=None,
+                                      legacy_bdms=False,
+                                      legacy_image_bdms=False):
+        image_bdms = image_bdms or []
+        image_meta = {}
+        if image_bdms:
+            image_meta = {'properties': {'block_device_mapping': image_bdms}}
+            if not legacy_image_bdms:
+                image_meta['properties']['bdm_v2'] = True
+        base_options = base_options or {'root_device_name': 'vda',
+                                        'image_ref': FAKE_IMAGE_REF}
+        transformed_bdm = self.compute_api._check_and_transform_bdm(
+                base_options, {}, image_meta, 1, 1, bdms, legacy_bdms)
+        self.assertThat(expected_bdms,
+                            matchers.DictListMatches(transformed_bdm))
+
+    def test_check_and_transform_legacy_bdm_no_image_bdms(self):
+        legacy_bdms = [
+            {'device_name': '/dev/vda',
+             'volume_id': '33333333-aaaa-bbbb-cccc-333333333333',
+             'delete_on_termination': False}]
+        expected_bdms = [block_device.BlockDeviceDict.from_legacy(
+            legacy_bdms[0])]
+        expected_bdms[0]['boot_index'] = 0
+        self._test_check_and_transform_bdm(legacy_bdms, expected_bdms,
+                                           legacy_bdms=True)
+
+    def test_check_and_transform_legacy_bdm_legacy_image_bdms(self):
+        image_bdms = [
+            {'device_name': '/dev/vda',
+             'volume_id': '33333333-aaaa-bbbb-cccc-333333333333',
+             'delete_on_termination': False}]
+        legacy_bdms = [
+            {'device_name': '/dev/vdb',
+             'volume_id': '33333333-aaaa-bbbb-cccc-444444444444',
+             'delete_on_termination': False}]
+        expected_bdms = [
+                block_device.BlockDeviceDict.from_legacy(legacy_bdms[0]),
+                block_device.BlockDeviceDict.from_legacy(image_bdms[0])]
+        expected_bdms[0]['boot_index'] = -1
+        expected_bdms[1]['boot_index'] = 0
+        self._test_check_and_transform_bdm(legacy_bdms, expected_bdms,
+                                           image_bdms=image_bdms,
+                                           legacy_bdms=True,
+                                           legacy_image_bdms=True)
+
+    def test_check_and_transform_legacy_bdm_image_bdms(self):
+        legacy_bdms = [
+            {'device_name': '/dev/vdb',
+             'volume_id': '33333333-aaaa-bbbb-cccc-444444444444',
+             'delete_on_termination': False}]
+        image_bdms = [block_device.BlockDeviceDict(
+            {'source_type': 'volume', 'destination_type': 'volume',
+             'volume_id': '33333333-aaaa-bbbb-cccc-444444444444',
+             'boot_index': 0})]
+        expected_bdms = [
+                block_device.BlockDeviceDict.from_legacy(legacy_bdms[0]),
+                image_bdms[0]]
+        expected_bdms[0]['boot_index'] = -1
+        self._test_check_and_transform_bdm(legacy_bdms, expected_bdms,
+                                           image_bdms=image_bdms,
+                                           legacy_bdms=True)
+
+    def test_check_and_transform_bdm_no_image_bdms(self):
+        bdms = [block_device.BlockDeviceDict({'source_type': 'image',
+                                              'destination_type': 'local',
+                                              'image_id': FAKE_IMAGE_REF,
+                                              'boot_index': 0})]
+        expected_bdms = bdms
+        self._test_check_and_transform_bdm(bdms, expected_bdms)
+
+    def test_check_and_transform_bdm_image_bdms(self):
+        bdms = [block_device.BlockDeviceDict({'source_type': 'image',
+                                              'destination_type': 'local',
+                                              'image_id': FAKE_IMAGE_REF,
+                                              'boot_index': 0})]
+        image_bdms = [block_device.BlockDeviceDict(
+            {'source_type': 'volume', 'destination_type': 'volume',
+             'volume_id': '33333333-aaaa-bbbb-cccc-444444444444'})]
+        expected_bdms = bdms + image_bdms
+        self._test_check_and_transform_bdm(bdms, expected_bdms,
+                                           image_bdms=image_bdms)
+
+    def test_check_and_transform_bdm_legacy_image_bdms(self):
+        bdms = [block_device.BlockDeviceDict({'source_type': 'image',
+                                              'destination_type': 'local',
+                                              'image_id': FAKE_IMAGE_REF,
+                                              'boot_index': 0})]
+        image_bdms = [{'device_name': '/dev/vda',
+                       'volume_id': '33333333-aaaa-bbbb-cccc-333333333333',
+                       'delete_on_termination': False}]
+        expected_bdms = [block_device.BlockDeviceDict.from_legacy(
+            image_bdms[0])]
+        expected_bdms[0]['boot_index'] = 0
+        self._test_check_and_transform_bdm(bdms, expected_bdms,
+                                           image_bdms=image_bdms,
+                                           legacy_image_bdms=True)
+
+    def test_check_and_transform_image(self):
         base_options = {'root_device_name': 'vdb',
                         'image_ref': FAKE_IMAGE_REF}
         fake_legacy_bdms = [
@@ -7404,27 +8382,27 @@ class ComputeAPITestCase(BaseTestCase):
 
         # We get an image BDM
         transformed_bdm = self.compute_api._check_and_transform_bdm(
-            base_options, {}, 1, 1, fake_legacy_bdms, True)
+            base_options, {}, {}, 1, 1, fake_legacy_bdms, True)
         self.assertEqual(len(transformed_bdm), 2)
 
         # No image BDM created if image already defines a root BDM
         base_options['root_device_name'] = 'vda'
         transformed_bdm = self.compute_api._check_and_transform_bdm(
-            base_options, image_meta, 1, 1, [], True)
+            base_options, {}, image_meta, 1, 1, [], True)
         self.assertEqual(len(transformed_bdm), 1)
 
         # No image BDM created
         transformed_bdm = self.compute_api._check_and_transform_bdm(
-            base_options, {}, 1, 1, fake_legacy_bdms, True)
+            base_options, {}, {}, 1, 1, fake_legacy_bdms, True)
         self.assertEqual(len(transformed_bdm), 1)
 
         # Volumes with multiple instances fails
         self.assertRaises(exception.InvalidRequest,
             self.compute_api._check_and_transform_bdm,
-            base_options, {}, 1, 2, fake_legacy_bdms, True)
+            base_options, {}, {}, 1, 2, fake_legacy_bdms, True)
 
         checked_bdm = self.compute_api._check_and_transform_bdm(
-            base_options, {}, 1, 1, transformed_bdm, True)
+            base_options, {}, {}, 1, 1, transformed_bdm, True)
         self.assertEqual(checked_bdm, transformed_bdm)
 
     def test_volume_size(self):
@@ -7462,33 +8440,46 @@ class ComputeAPITestCase(BaseTestCase):
 
         instance = self._create_fake_instance({'root_device_name': 'vda'})
         self.assertFalse(
-            self.compute_api.is_volume_backed_instance(ctxt, instance, []))
+            self.compute_api.is_volume_backed_instance(
+                ctxt, instance,
+                block_device_obj.block_device_make_list(ctxt, [])))
 
-        bdms = [{'device_name': '/dev/vda',
-                 'volume_id': 'fake_volume_id',
-                 'boot_index': 0,
-                 'destination_type': 'volume'}]
+        bdms = block_device_obj.block_device_make_list(ctxt,
+                            [fake_block_device.FakeDbBlockDeviceDict(
+                                {'source_type': 'volume',
+                                 'device_name': '/dev/vda',
+                                 'volume_id': 'fake_volume_id',
+                                 'boot_index': 0,
+                                 'destination_type': 'volume'})])
         self.assertTrue(
             self.compute_api.is_volume_backed_instance(ctxt, instance, bdms))
 
-        bdms = [{'device_name': '/dev/vda',
+        bdms = block_device_obj.block_device_make_list(ctxt,
+               [fake_block_device.FakeDbBlockDeviceDict(
+                {'source_type': 'volume',
+                 'device_name': '/dev/vda',
                  'volume_id': 'fake_volume_id',
                  'destination_type': 'local',
                  'boot_index': 0,
-                 'snapshot_id': None},
-                {'device_name': '/dev/vdb',
+                 'snapshot_id': None}),
+                fake_block_device.FakeDbBlockDeviceDict(
+                {'source_type': 'volume',
+                 'device_name': '/dev/vdb',
                  'boot_index': 1,
                  'destination_type': 'volume',
                  'volume_id': 'c2ec2156-d75e-11e2-985b-5254009297d6',
-                 'snapshot_id': None}]
+                 'snapshot_id': None})])
         self.assertFalse(
             self.compute_api.is_volume_backed_instance(ctxt, instance, bdms))
 
-        bdms = [{'device_name': '/dev/vda',
+        bdms = block_device_obj.block_device_make_list(ctxt,
+               [fake_block_device.FakeDbBlockDeviceDict(
+                {'source_type': 'volume',
+                 'device_name': '/dev/vda',
                  'snapshot_id': 'de8836ac-d75e-11e2-8271-5254009297d6',
                  'destination_type': 'volume',
                  'boot_index': 0,
-                 'volume_id': None}]
+                 'volume_id': None})])
         self.assertTrue(
             self.compute_api.is_volume_backed_instance(ctxt, instance, bdms))
 
@@ -7496,9 +8487,11 @@ class ComputeAPITestCase(BaseTestCase):
         ctxt = self.context
         instance = self._create_fake_instance()
 
-        self.mox.StubOutWithMock(self.compute_api, 'get_instance_bdms')
-        self.compute_api.get_instance_bdms(ctxt, instance,
-                                           legacy=False).AndReturn([])
+        self.mox.StubOutWithMock(objects.BlockDeviceMappingList,
+                                 'get_by_instance_uuid')
+        objects.BlockDeviceMappingList.get_by_instance_uuid(
+                    ctxt, instance['uuid']).AndReturn(
+                            block_device_obj.block_device_make_list(ctxt, []))
         self.mox.ReplayAll()
 
         self.compute_api.is_volume_backed_instance(ctxt, instance, None)
@@ -7607,8 +8600,11 @@ class ComputeAPITestCase(BaseTestCase):
         instance = self._create_fake_instance(params={'host': CONF.host})
         self.stubs.Set(self.compute_api.network_api, 'deallocate_for_instance',
                        lambda *a, **kw: None)
-        self.compute_api.add_fixed_ip(self.context, instance, '1')
-        self.compute_api.remove_fixed_ip(self.context, instance, '192.168.1.1')
+        self.compute_api.add_fixed_ip(self.context, self._objectify(instance),
+                                      '1')
+        self.compute_api.remove_fixed_ip(self.context,
+                                         self._objectify(instance),
+                                         '192.168.1.1')
         self.compute_api.delete(self.context, self._objectify(instance))
 
     def test_attach_volume_invalid(self):
@@ -7616,6 +8612,7 @@ class ComputeAPITestCase(BaseTestCase):
                 self.compute_api.attach_volume,
                 self.context,
                 {'locked': False, 'vm_state': vm_states.ACTIVE,
+                 'task_state': None,
                  'launched_at': timeutils.utcnow()},
                 None,
                 '/invalid')
@@ -7639,6 +8636,15 @@ class ComputeAPITestCase(BaseTestCase):
                 None,
                 '/dev/vdb')
 
+    def test_no_attach_volume_in_suspended_state(self):
+        self.assertRaises(exception.InstanceInvalidState,
+                self.compute_api.attach_volume,
+                self.context,
+                {'uuid': 'fake_uuid', 'locked': False,
+                'vm_state': vm_states.SUSPENDED},
+                {'id': 'fake-volume-id'},
+                '/dev/vdb')
+
     def test_no_detach_volume_in_rescue_state(self):
         # Ensure volume can be detached from instance
 
@@ -7652,23 +8658,20 @@ class ComputeAPITestCase(BaseTestCase):
                 self.compute_api.detach_volume,
                 self.context, instance, volume)
 
-    def test_no_rescue_in_volume_state_attaching(self):
+    @mock.patch.object(objects.BlockDeviceMappingList,
+                       'get_by_instance_uuid')
+    @mock.patch.object(cinder.API, 'get')
+    def test_no_rescue_in_volume_state_attaching(self,
+                                                 mock_get_vol,
+                                                 mock_get_bdms):
         # Make sure a VM cannot be rescued while volume is being attached
         instance = self._create_fake_instance()
+        bdms, volume = self._fake_rescue_block_devices(instance)
 
-        def fake_get_instance_bdms(*args, **kwargs):
-            return [{'device_name': '/dev/vda',
-                     'source_type': 'volume',
-                     'destination_type': 'volume',
-                     'volume_id': 'bf0b6b00-a20c-11e2-9e96-0800200c9a66'}]
+        mock_get_vol.return_value = {'id': volume['id'],
+                                     'status': "attaching"}
+        mock_get_bdms.return_value = bdms
 
-        self.stubs.Set(self.compute_api, 'get_instance_bdms',
-                       fake_get_instance_bdms)
-
-        def fake_volume_get(self, context, volume_id):
-            return {'id': volume_id, 'status': 'attaching'}
-
-        self.stubs.Set(cinder.API, 'get', fake_volume_get)
         self.assertRaises(exception.InvalidVolume,
                 self.compute_api.rescue, self.context, instance)
 
@@ -7683,26 +8686,20 @@ class ComputeAPITestCase(BaseTestCase):
                              'host': 'fake_console_host',
                              'port': 'fake_console_port',
                              'internal_access_path': 'fake_access_path',
-                             'instance_uuid': fake_instance['uuid']}
-        fake_connect_info2 = copy.deepcopy(fake_connect_info)
-        fake_connect_info2['access_url'] = 'fake_console_url'
+                             'instance_uuid': fake_instance['uuid'],
+                             'access_url': 'fake_console_url'}
 
-        self.mox.StubOutWithMock(rpc, 'call')
+        rpcapi = compute_rpcapi.ComputeAPI
+        self.mox.StubOutWithMock(rpcapi, 'get_vnc_console')
+        rpcapi.get_vnc_console(
+            self.context, instance=fake_instance,
+            console_type=fake_console_type).AndReturn(fake_connect_info)
 
-        rpc_msg1 = {'method': 'get_vnc_console',
-                    'namespace': None,
-                    'args': {'instance': fake_instance,
-                             'console_type': fake_console_type},
-                   'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION}
-        rpc_msg2 = {'method': 'authorize_console',
-                    'namespace': None,
-                    'args': fake_connect_info,
-                    'version': '2.0'}
-
-        rpc.call(self.context, 'compute.%s' % fake_instance['host'],
-                rpc_msg1, None).AndReturn(fake_connect_info2)
-        rpc.call(self.context, CONF.consoleauth_topic,
-                rpc_msg2, None).AndReturn(None)
+        self.mox.StubOutWithMock(self.compute_api.consoleauth_rpcapi,
+                                 'authorize_console')
+        self.compute_api.consoleauth_rpcapi.authorize_console(
+            self.context, 'fake_token', fake_console_type, 'fake_console_host',
+            'fake_console_port', 'fake_access_path', 'fake_uuid')
 
         self.mox.ReplayAll()
 
@@ -7730,26 +8727,20 @@ class ComputeAPITestCase(BaseTestCase):
                              'host': 'fake_console_host',
                              'port': 'fake_console_port',
                              'internal_access_path': 'fake_access_path',
-                             'instance_uuid': fake_instance['uuid']}
-        fake_connect_info2 = copy.deepcopy(fake_connect_info)
-        fake_connect_info2['access_url'] = 'fake_console_url'
+                             'instance_uuid': fake_instance['uuid'],
+                             'access_url': 'fake_console_url'}
 
-        self.mox.StubOutWithMock(rpc, 'call')
+        rpcapi = compute_rpcapi.ComputeAPI
+        self.mox.StubOutWithMock(rpcapi, 'get_spice_console')
+        rpcapi.get_spice_console(
+            self.context, instance=fake_instance,
+            console_type=fake_console_type).AndReturn(fake_connect_info)
 
-        rpc_msg1 = {'method': 'get_spice_console',
-                    'namespace': None,
-                    'args': {'instance': fake_instance,
-                             'console_type': fake_console_type},
-                   'version': '3.1'}
-        rpc_msg2 = {'method': 'authorize_console',
-                    'namespace': None,
-                    'args': fake_connect_info,
-                    'version': '2.0'}
-
-        rpc.call(self.context, 'compute.%s' % fake_instance['host'],
-                rpc_msg1, None).AndReturn(fake_connect_info2)
-        rpc.call(self.context, CONF.consoleauth_topic,
-                rpc_msg2, None).AndReturn(None)
+        self.mox.StubOutWithMock(self.compute_api.consoleauth_rpcapi,
+                                 'authorize_console')
+        self.compute_api.consoleauth_rpcapi.authorize_console(
+            self.context, 'fake_token', fake_console_type, 'fake_console_host',
+            'fake_console_port', 'fake_access_path', 'fake_uuid')
 
         self.mox.ReplayAll()
 
@@ -7766,21 +8757,58 @@ class ComputeAPITestCase(BaseTestCase):
 
         db.instance_destroy(self.context, instance['uuid'])
 
+    def test_rdp_console(self):
+        # Make sure we can a rdp console for an instance.
+
+        fake_instance = {'uuid': 'fake_uuid',
+                         'host': 'fake_compute_host'}
+        fake_console_type = "rdp-html5"
+        fake_connect_info = {'token': 'fake_token',
+                             'console_type': fake_console_type,
+                             'host': 'fake_console_host',
+                             'port': 'fake_console_port',
+                             'internal_access_path': 'fake_access_path',
+                             'instance_uuid': fake_instance['uuid'],
+                             'access_url': 'fake_console_url'}
+
+        rpcapi = compute_rpcapi.ComputeAPI
+        self.mox.StubOutWithMock(rpcapi, 'get_rdp_console')
+        rpcapi.get_rdp_console(
+            self.context, instance=fake_instance,
+            console_type=fake_console_type).AndReturn(fake_connect_info)
+
+        self.mox.StubOutWithMock(self.compute_api.consoleauth_rpcapi,
+                                 'authorize_console')
+        self.compute_api.consoleauth_rpcapi.authorize_console(
+            self.context, 'fake_token', fake_console_type, 'fake_console_host',
+            'fake_console_port', 'fake_access_path', 'fake_uuid')
+
+        self.mox.ReplayAll()
+
+        console = self.compute_api.get_rdp_console(self.context,
+                fake_instance, fake_console_type)
+        self.assertEqual(console, {'url': 'fake_console_url'})
+
+    def test_get_rdp_console_no_host(self):
+        instance = self._create_fake_instance(params={'host': ''})
+
+        self.assertRaises(exception.InstanceNotReady,
+                          self.compute_api.get_rdp_console,
+                          self.context, instance, 'rdp')
+
+        db.instance_destroy(self.context, instance['uuid'])
+
     def test_console_output(self):
         fake_instance = {'uuid': 'fake_uuid',
                          'host': 'fake_compute_host'}
         fake_tail_length = 699
         fake_console_output = 'fake console output'
 
-        self.mox.StubOutWithMock(rpc, 'call')
-
-        rpc_msg = {'method': 'get_console_output',
-                   'namespace': None,
-                   'args': {'instance': fake_instance,
-                            'tail_length': fake_tail_length},
-                   'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION}
-        rpc.call(self.context, 'compute.%s' % fake_instance['host'],
-                rpc_msg, None).AndReturn(fake_console_output)
+        rpcapi = compute_rpcapi.ComputeAPI
+        self.mox.StubOutWithMock(rpcapi, 'get_console_output')
+        rpcapi.get_console_output(
+            self.context, instance=fake_instance,
+            tail_length=fake_tail_length).AndReturn(fake_console_output)
 
         self.mox.ReplayAll()
 
@@ -7801,10 +8829,8 @@ class ComputeAPITestCase(BaseTestCase):
         new_type = flavors.get_flavor_by_flavor_id('4')
         sys_meta = flavors.save_flavor_info({}, new_type)
 
-        instance = {
-            'image_ref': 'foo',
-            'system_metadata': sys_meta,
-            }
+        instance = objects.Instance(image_ref='foo',
+                                    system_metadata=sys_meta)
         self.mox.StubOutWithMock(self.compute.network_api,
                                  'allocate_port_for_instance')
         nwinfo = [fake_network_cache_model.new_vif()]
@@ -7825,16 +8851,60 @@ class ComputeAPITestCase(BaseTestCase):
 
     def test_detach_interface(self):
         nwinfo, port_id = self.test_attach_interface()
-        self.stubs.Set(self.compute, '_get_instance_nw_info',
-                       lambda *a, **k: nwinfo)
         self.stubs.Set(self.compute.network_api,
                        'deallocate_port_for_instance',
                        lambda a, b, c: [])
-        self.compute.detach_interface(self.context, {}, port_id)
+        instance = objects.Instance()
+        instance.info_cache = objects.InstanceInfoCache.new(
+            self.context, 'fake-uuid')
+        instance.info_cache.network_info = network_model.NetworkInfo.hydrate(
+            nwinfo)
+        self.compute.detach_interface(self.context, instance, port_id)
         self.assertEqual(self.compute.driver._interfaces, {})
 
     def test_attach_volume(self):
-        # Ensure instance can be soft rebooted.
+        fake_bdm = fake_block_device.FakeDbBlockDeviceDict(
+                {'source_type': 'volume', 'destination_type': 'volume',
+                 'volume_id': 'fake-volume-id', 'device_name': '/dev/vdb'})
+        instance = self._create_fake_instance()
+        fake_volume = {'id': 'fake-volume-id'}
+
+        with contextlib.nested(
+            mock.patch.object(cinder.API, 'get', return_value=fake_volume),
+            mock.patch.object(cinder.API, 'check_attach'),
+            mock.patch.object(cinder.API, 'reserve_volume'),
+            mock.patch.object(compute_rpcapi.ComputeAPI,
+                'reserve_block_device_name', return_value='/dev/vdb'),
+            mock.patch.object(db, 'block_device_mapping_get_by_volume_id',
+                return_value=fake_bdm),
+            mock.patch.object(compute_rpcapi.ComputeAPI, 'attach_volume')
+        ) as (mock_get, mock_check_attach, mock_reserve_vol, mock_reserve_bdm,
+                mock_bdm_get, mock_attach):
+
+            self.compute_api.attach_volume(
+                    self.context, instance, 'fake-volume-id',
+                    '/dev/vdb', 'ide', 'cdrom')
+
+            mock_reserve_bdm.assert_called_once_with(
+                    self.context, device='/dev/vdb', instance=instance,
+                    volume_id='fake-volume-id', disk_bus='ide',
+                    device_type='cdrom')
+            mock_bdm_get.assert_called_once_with(
+                    self.context, 'fake-volume-id', [])
+            self.assertEqual(mock_get.call_args,
+                             mock.call(self.context, 'fake-volume-id'))
+            self.assertEqual(mock_check_attach.call_args,
+                             mock.call(
+                                 self.context, fake_volume, instance=instance))
+            mock_reserve_vol.assert_called_once_with(
+                    self.context, 'fake-volume-id')
+            a, kw = mock_attach.call_args
+            self.assertEqual(kw['volume_id'], 'fake-volume-id')
+            self.assertEqual(kw['mountpoint'], '/dev/vdb')
+            self.assertEqual(kw['bdm'].device_name, '/dev/vdb')
+            self.assertEqual(kw['bdm'].volume_id, 'fake-volume-id')
+
+    def test_attach_volume_no_device(self):
 
         called = {}
 
@@ -7864,37 +8934,19 @@ class ComputeAPITestCase(BaseTestCase):
         self.stubs.Set(compute_rpcapi.ComputeAPI, 'attach_volume',
                        fake_rpc_attach_volume)
 
+        self.mox.StubOutWithMock(objects.BlockDeviceMapping,
+                                 'get_by_volume_id')
+        objects.BlockDeviceMapping.get_by_volume_id(
+                self.context, mox.IgnoreArg()).AndReturn('fake-bdm')
+        self.mox.ReplayAll()
+
         instance = self._create_fake_instance()
-        self.compute_api.attach_volume(self.context, instance, 1, '/dev/vdb')
+        self.compute_api.attach_volume(self.context, instance, 1, device=None)
         self.assertTrue(called.get('fake_check_attach'))
         self.assertTrue(called.get('fake_reserve_volume'))
         self.assertTrue(called.get('fake_reserve_volume'))
         self.assertTrue(called.get('fake_rpc_reserve_block_device_name'))
         self.assertTrue(called.get('fake_rpc_attach_volume'))
-
-    def test_attach_volume_no_device(self):
-
-        called = {}
-
-        def fake_check_attach(*args, **kwargs):
-            called['fake_check_attach'] = True
-
-        def fake_reserve_volume(*args, **kwargs):
-            called['fake_reserve_volume'] = True
-
-        def fake_volume_get(self, context, volume_id):
-            called['fake_volume_get'] = True
-            return {'id': volume_id}
-
-        def fake_rpc_attach_volume(self, context, **kwargs):
-            called['fake_rpc_attach_volume'] = True
-
-        self.stubs.Set(cinder.API, 'get', fake_volume_get)
-        self.stubs.Set(cinder.API, 'check_attach', fake_check_attach)
-        self.stubs.Set(cinder.API, 'reserve_volume',
-                       fake_reserve_volume)
-        self.stubs.Set(compute_rpcapi.ComputeAPI, 'attach_volume',
-                       fake_rpc_attach_volume)
 
     def test_detach_volume(self):
         # Ensure volume can be detached from instance
@@ -7928,7 +8980,8 @@ class ComputeAPITestCase(BaseTestCase):
         instance = {'uuid': 'uuid1',
                     'locked': False,
                     'launched_at': timeutils.utcnow(),
-                    'vm_state': vm_states.ACTIVE}
+                    'vm_state': vm_states.ACTIVE,
+                    'task_state': None}
         volume = {'id': 1, 'attach_status': 'detached'}
 
         self.assertRaises(exception.InvalidVolume,
@@ -7941,11 +8994,25 @@ class ComputeAPITestCase(BaseTestCase):
         instance = {'uuid': 'uuid1',
                     'locked': False,
                     'launched_at': timeutils.utcnow(),
-                    'vm_state': vm_states.ACTIVE}
+                    'vm_state': vm_states.ACTIVE,
+                    'task_state': None}
         volume = {'id': 1, 'attach_status': 'in-use',
                   'instance_uuid': 'uuid2'}
 
         self.assertRaises(exception.VolumeUnattached,
+                          self.compute_api.detach_volume, self.context,
+                          instance, volume)
+
+    def test_detach_suspended_instance_fails(self):
+        instance = {'uuid': 'uuid1',
+                    'locked': False,
+                    'launched_at': timeutils.utcnow(),
+                    'vm_state': vm_states.SUSPENDED,
+                    'task_state': None}
+        volume = {'id': 1, 'attach_status': 'in-use',
+                  'instance_uuid': 'uuid2'}
+
+        self.assertRaises(exception.InstanceInvalidState,
                           self.compute_api.detach_volume, self.context,
                           instance, volume)
 
@@ -7955,11 +9022,12 @@ class ComputeAPITestCase(BaseTestCase):
         called = {}
         instance = self._create_fake_instance()
 
-        def fake_get_instance_volume_bdm(*args, **kwargs):
-            return {'device_name': '/dev/vdb', 'volume_id': 1,
-                    'connection_info': '{"test": "test"}'}
+        fake_bdm = fake_block_device.FakeDbBlockDeviceDict(
+                {'device_name': '/dev/vdb', 'volume_id': 1,
+                 'source_type': 'snapshot', 'destination_type': 'volume',
+                 'connection_info': '{"test": "test"}'})
 
-        def fake_libvirt_driver_instance_exists(*args, **kwargs):
+        def fake_libvirt_driver_instance_exists(_instance):
             called['fake_libvirt_driver_instance_exists'] = True
             return False
 
@@ -7971,12 +9039,17 @@ class ComputeAPITestCase(BaseTestCase):
             called['fake_roll_detaching'] = True
 
         self.stubs.Set(cinder.API, 'roll_detaching', fake_roll_detaching)
-        self.stubs.Set(self.compute, "_get_instance_volume_bdm",
-                       fake_get_instance_volume_bdm)
         self.stubs.Set(self.compute.driver, "instance_exists",
                        fake_libvirt_driver_instance_exists)
         self.stubs.Set(self.compute.driver, "detach_volume",
                        fake_libvirt_driver_detach_volume_fails)
+
+        self.mox.StubOutWithMock(objects.BlockDeviceMapping,
+                                 'get_by_volume_id')
+        objects.BlockDeviceMapping.get_by_volume_id(
+                self.context, 1).AndReturn(objects.BlockDeviceMapping(
+                    **fake_bdm))
+        self.mox.ReplayAll()
 
         self.assertRaises(AttributeError, self.compute.detach_volume,
                           self.context, 1, instance)
@@ -8025,20 +9098,23 @@ class ComputeAPITestCase(BaseTestCase):
         instance = self._create_fake_instance_obj()
 
         img_bdm = {'instance_uuid': instance['uuid'],
-                   'device_name': '/dev/vda',
-                   'source_type': 'image',
-                   'destination_type': 'local',
-                   'delete_on_termination': False,
-                   'boot_index': 0,
-                   'image_id': 'fake_image'}
+                     'device_name': '/dev/vda',
+                     'source_type': 'image',
+                     'destination_type': 'local',
+                     'delete_on_termination': False,
+                     'boot_index': 0,
+                     'image_id': 'fake_image'}
         vol_bdm = {'instance_uuid': instance['uuid'],
-                   'device_name': '/dev/vdc',
-                   'source_type': 'volume',
-                   'destination_type': 'volume',
-                   'delete_on_termination': False,
-                   'volume_id': 'fake_vol'}
+                     'device_name': '/dev/vdc',
+                     'source_type': 'volume',
+                     'destination_type': 'volume',
+                     'delete_on_termination': False,
+                     'volume_id': 'fake_vol'}
+        bdms = []
         for bdm in img_bdm, vol_bdm:
-            db.block_device_mapping_create(admin, bdm, legacy=False)
+            bdm_obj = objects.BlockDeviceMapping(**bdm)
+            bdm_obj.create(admin)
+            bdms.append(bdm_obj)
 
         self.stubs.Set(self.compute, 'volume_api', mox.MockAnything())
         self.stubs.Set(self.compute, '_prep_block_device', mox.MockAnything())
@@ -8046,7 +9122,7 @@ class ComputeAPITestCase(BaseTestCase):
                 None, True, None, False)
 
         self.compute.terminate_instance(self.context,
-                self._objectify(instance), [], [])
+                self._objectify(instance), bdms, [])
 
         bdms = db.block_device_mapping_get_all_by_instance(admin,
                                                            instance['uuid'])
@@ -8109,7 +9185,7 @@ class ComputeAPITestCase(BaseTestCase):
                                                      security_group_name)
 
     def test_get_diagnostics(self):
-        instance = self._create_fake_instance()
+        instance = self._create_fake_instance_obj()
 
         rpcapi = compute_rpcapi.ComputeAPI
         self.mox.StubOutWithMock(rpcapi, 'get_diagnostics')
@@ -8122,12 +9198,19 @@ class ComputeAPITestCase(BaseTestCase):
                        lambda *a, **kw: None)
         self.compute_api.delete(self.context, self._objectify(instance))
 
-    def test_inject_file(self):
-        # Ensure we can write a file to an instance.
+    def test_get_instance_diagnostics(self):
         instance = self._create_fake_instance()
-        self.compute_api.inject_file(self.context, instance,
-                                     "/tmp/test", "File Contents")
-        db.instance_destroy(self.context, instance['uuid'])
+
+        rpcapi = compute_rpcapi.ComputeAPI
+        self.mox.StubOutWithMock(rpcapi, 'get_instance_diagnostics')
+        rpcapi.get_instance_diagnostics(self.context, instance=instance)
+        self.mox.ReplayAll()
+
+        self.compute_api.get_instance_diagnostics(self.context, instance)
+
+        self.stubs.Set(self.compute_api.network_api, 'deallocate_for_instance',
+                       lambda *a, **kw: None)
+        self.compute_api.delete(self.context, self._objectify(instance))
 
     def test_secgroup_refresh(self):
         instance = self._create_fake_instance()
@@ -8146,15 +9229,11 @@ class ComputeAPITestCase(BaseTestCase):
                    rule_get)
         self.stubs.Set(self.compute_api.db, 'security_group_get', group_get)
 
-        self.mox.StubOutWithMock(rpc, 'cast')
-        topic = rpc.queue_get_for(self.context, CONF.compute_topic,
-                                  instance['host'])
-        rpc.cast(self.context, topic,
-                {"method": "refresh_instance_security_rules",
-                 "namespace": None,
-                 "args": {'instance': jsonutils.to_primitive(instance)},
-                 "version":
-                    compute_rpcapi.SecurityGroupAPI.BASE_RPC_API_VERSION})
+        rpcapi = self.security_group_api.security_group_rpcapi
+        self.mox.StubOutWithMock(rpcapi, 'refresh_instance_security_rules')
+        rpcapi.refresh_instance_security_rules(self.context,
+                                               instance['host'],
+                                               instance)
         self.mox.ReplayAll()
 
         self.security_group_api.trigger_members_refresh(self.context, [1])
@@ -8176,15 +9255,11 @@ class ComputeAPITestCase(BaseTestCase):
                    rule_get)
         self.stubs.Set(self.compute_api.db, 'security_group_get', group_get)
 
-        self.mox.StubOutWithMock(rpc, 'cast')
-        topic = rpc.queue_get_for(self.context, CONF.compute_topic,
-                                  instance['host'])
-        rpc.cast(self.context, topic,
-                {"method": "refresh_instance_security_rules",
-                 "namespace": None,
-                 "args": {'instance': jsonutils.to_primitive(instance)},
-                 "version":
-                   compute_rpcapi.SecurityGroupAPI.BASE_RPC_API_VERSION})
+        rpcapi = self.security_group_api.security_group_rpcapi
+        self.mox.StubOutWithMock(rpcapi, 'refresh_instance_security_rules')
+        rpcapi.refresh_instance_security_rules(self.context,
+                                               instance['host'],
+                                               instance)
         self.mox.ReplayAll()
 
         self.security_group_api.trigger_members_refresh(self.context, [1, 2])
@@ -8204,7 +9279,9 @@ class ComputeAPITestCase(BaseTestCase):
                    rule_get)
         self.stubs.Set(self.compute_api.db, 'security_group_get', group_get)
 
-        self.mox.StubOutWithMock(rpc, 'cast')
+        rpcapi = self.security_group_api.security_group_rpcapi
+        self.mox.StubOutWithMock(rpcapi, 'refresh_instance_security_rules')
+
         self.mox.ReplayAll()
 
         self.security_group_api.trigger_members_refresh(self.context, [1])
@@ -8218,15 +9295,11 @@ class ComputeAPITestCase(BaseTestCase):
 
         self.stubs.Set(self.compute_api.db, 'security_group_get', group_get)
 
-        self.mox.StubOutWithMock(rpc, 'cast')
-        topic = rpc.queue_get_for(self.context, CONF.compute_topic,
-                                  instance['host'])
-        rpc.cast(self.context, topic,
-                {"method": "refresh_instance_security_rules",
-                 "namespace": None,
-                 "args": {'instance': jsonutils.to_primitive(instance)},
-                 "version":
-                   compute_rpcapi.SecurityGroupAPI.BASE_RPC_API_VERSION})
+        rpcapi = self.security_group_api.security_group_rpcapi
+        self.mox.StubOutWithMock(rpcapi, 'refresh_instance_security_rules')
+        rpcapi.refresh_instance_security_rules(self.context,
+                                               instance['host'],
+                                               instance)
         self.mox.ReplayAll()
 
         self.security_group_api.trigger_rules_refresh(self.context, [1])
@@ -8240,15 +9313,11 @@ class ComputeAPITestCase(BaseTestCase):
 
         self.stubs.Set(self.compute_api.db, 'security_group_get', group_get)
 
-        self.mox.StubOutWithMock(rpc, 'cast')
-        topic = rpc.queue_get_for(self.context, CONF.compute_topic,
-                                  instance['host'])
-        rpc.cast(self.context, topic,
-                {"method": "refresh_instance_security_rules",
-                 "namespace": None,
-                 "args": {'instance': jsonutils.to_primitive(instance)},
-                 "version":
-                   compute_rpcapi.SecurityGroupAPI.BASE_RPC_API_VERSION})
+        rpcapi = self.security_group_api.security_group_rpcapi
+        self.mox.StubOutWithMock(rpcapi, 'refresh_instance_security_rules')
+        rpcapi.refresh_instance_security_rules(self.context,
+                                               instance['host'],
+                                               instance)
         self.mox.ReplayAll()
 
         self.security_group_api.trigger_rules_refresh(self.context, [1, 2])
@@ -8260,7 +9329,8 @@ class ComputeAPITestCase(BaseTestCase):
 
         self.stubs.Set(self.compute_api.db, 'security_group_get', group_get)
 
-        self.mox.StubOutWithMock(rpc, 'cast')
+        rpcapi = self.security_group_api.security_group_rpcapi
+        self.mox.StubOutWithMock(rpcapi, 'refresh_instance_security_rules')
         self.mox.ReplayAll()
 
         self.security_group_api.trigger_rules_refresh(self.context, [1, 2])
@@ -8286,22 +9356,19 @@ class ComputeAPITestCase(BaseTestCase):
         self.assertEqual(instance['task_state'], task_states.MIGRATING)
 
     def test_evacuate(self):
-        instance = jsonutils.to_primitive(self._create_fake_instance(
-                                          services=True))
-        instance_uuid = instance['uuid']
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertIsNone(instance['task_state'])
+        instance = self._create_fake_instance_obj(services=True)
+        self.assertIsNone(instance.task_state)
 
         def fake_service_is_up(*args, **kwargs):
             return False
 
         def fake_rebuild_instance(*args, **kwargs):
-            db.instance_update(self.context, instance_uuid,
-                               {'host': kwargs['host']})
+            instance.host = kwargs['host']
+            instance.save()
 
         self.stubs.Set(self.compute_api.servicegroup_api, 'service_is_up',
                 fake_service_is_up)
-        self.stubs.Set(self.compute_api.compute_rpcapi, 'rebuild_instance',
+        self.stubs.Set(self.compute_api.compute_task_api, 'rebuild_instance',
                 fake_rebuild_instance)
         self.compute_api.evacuate(self.context.elevated(),
                                   instance,
@@ -8309,11 +9376,10 @@ class ComputeAPITestCase(BaseTestCase):
                                   on_shared_storage=True,
                                   admin_password=None)
 
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['task_state'], task_states.REBUILDING)
-        self.assertEqual(instance['host'], 'fake_dest_host')
-
-        db.instance_destroy(self.context, instance['uuid'])
+        instance.refresh()
+        self.assertEqual(instance.task_state, task_states.REBUILDING)
+        self.assertEqual(instance.host, 'fake_dest_host')
+        instance.destroy()
 
     def test_fail_evacuate_from_non_existing_host(self):
         inst = {}
@@ -8334,26 +9400,18 @@ class ComputeAPITestCase(BaseTestCase):
         inst['ephemeral_gb'] = 0
         inst['architecture'] = 'x86_64'
         inst['os_type'] = 'Linux'
+        instance = self._create_fake_instance_obj(inst)
 
-        instance = jsonutils.to_primitive(db.instance_create(self.context,
-                                                             inst))
-        instance_uuid = instance['uuid']
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertIsNone(instance['task_state'])
-
+        self.assertIsNone(instance.task_state)
         self.assertRaises(exception.ComputeHostNotFound,
                 self.compute_api.evacuate, self.context.elevated(), instance,
                 host='fake_dest_host', on_shared_storage=True,
                 admin_password=None)
-
-        db.instance_destroy(self.context, instance['uuid'])
+        instance.destroy()
 
     def test_fail_evacuate_from_running_host(self):
-        instance = jsonutils.to_primitive(self._create_fake_instance(
-                                          services=True))
-        instance_uuid = instance['uuid']
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertIsNone(instance['task_state'])
+        instance = self._create_fake_instance_obj(services=True)
+        self.assertIsNone(instance.task_state)
 
         def fake_service_is_up(*args, **kwargs):
             return True
@@ -8365,35 +9423,21 @@ class ComputeAPITestCase(BaseTestCase):
                 self.compute_api.evacuate, self.context.elevated(), instance,
                 host='fake_dest_host', on_shared_storage=True,
                 admin_password=None)
-
-        db.instance_destroy(self.context, instance['uuid'])
+        instance.destroy()
 
     def test_fail_evacuate_instance_in_wrong_state(self):
-        instances = [
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.BUILDING})),
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.PAUSED})),
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.SUSPENDED})),
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.RESCUED})),
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.RESIZED})),
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.SOFT_DELETED})),
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.DELETED})),
-            jsonutils.to_primitive(self._create_fake_instance(
-                                    {'vm_state': vm_states.ERROR}))
-        ]
+        states = [vm_states.BUILDING, vm_states.PAUSED, vm_states.SUSPENDED,
+                  vm_states.RESCUED, vm_states.RESIZED, vm_states.SOFT_DELETED,
+                  vm_states.DELETED]
+        instances = [self._create_fake_instance_obj({'vm_state': state})
+                     for state in states]
 
         for instance in instances:
             self.assertRaises(exception.InstanceInvalidState,
                 self.compute_api.evacuate, self.context, instance,
                 host='fake_dest_host', on_shared_storage=True,
                 admin_password=None)
-            db.instance_destroy(self.context, instance['uuid'])
+            instance.destroy()
 
     def test_get_migrations(self):
         migration = test_migration.fake_db_migration(uuid="1234")
@@ -8408,41 +9452,8 @@ class ComputeAPITestCase(BaseTestCase):
         self.assertEqual(1, len(migrations))
         self.assertEqual(migrations[0].id, migration['id'])
 
-    def _setup_get_instance_bdm_mox(self):
-        new_bdm = object()
 
-        self.mox.StubOutWithMock(self.compute_api.db,
-                       'block_device_mapping_get_all_by_instance')
-        self.compute_api.db.\
-            block_device_mapping_get_all_by_instance(
-                mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(new_bdm)
-        return new_bdm
-
-    def test_get_instance_bdms_legacy(self):
-        expected = self._setup_get_instance_bdm_mox()
-        self.mox.ReplayAll()
-
-        instance = {'uuid': 'fake-instance'}
-
-        self.assertEqual(expected,
-                         self.compute_api.get_instance_bdms({},
-                            instance, legacy=False))
-
-    def test_get_instance_bdms_default(self):
-        new_bdm = self._setup_get_instance_bdm_mox()
-        expected = legacy_bdm = object()
-
-        self.mox.StubOutWithMock(block_device, 'legacy_mapping')
-        block_device.legacy_mapping(new_bdm).AndReturn(legacy_bdm)
-        self.mox.ReplayAll()
-
-        instance = {'uuid': 'fake-instance'}
-
-        self.assertEqual(expected,
-                         self.compute_api.get_instance_bdms({}, instance))
-
-
-def fake_rpc_method(context, topic, msg, do_cast=True):
+def fake_rpc_method(context, method, **kwargs):
     pass
 
 
@@ -8468,8 +9479,8 @@ class ComputeAPIAggrTestCase(BaseTestCase):
         super(ComputeAPIAggrTestCase, self).setUp()
         self.api = compute_api.AggregateAPI()
         self.context = context.get_admin_context()
-        self.stubs.Set(rpc, 'call', fake_rpc_method)
-        self.stubs.Set(rpc, 'cast', fake_rpc_method)
+        self.stubs.Set(self.api.compute_rpcapi.client, 'call', fake_rpc_method)
+        self.stubs.Set(self.api.compute_rpcapi.client, 'cast', fake_rpc_method)
 
     def test_aggregate_no_zone(self):
         # Ensure we can create an aggregate without an availability  zone
@@ -8480,6 +9491,23 @@ class ComputeAPIAggrTestCase(BaseTestCase):
                          aggr['id'])
         self.assertRaises(exception.AggregateNotFound,
                           self.api.delete_aggregate, self.context, aggr['id'])
+
+    def test_check_az_for_aggregate(self):
+        # Ensure all conflict hosts can be returned
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host1 = values[fake_zone][0]
+        fake_host2 = values[fake_zone][1]
+        aggr1 = self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                               fake_zone, fake_host1)
+        aggr1 = self._init_aggregate_with_host(aggr1, None, None, fake_host2)
+        aggr2 = self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                               fake_host2)
+        aggr2 = self._init_aggregate_with_host(aggr2, None, None, fake_host1)
+        metadata = {'availability_zone': 'another_zone'}
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.api.update_aggregate,
+                          self.context, aggr2['id'], metadata)
 
     def test_update_aggregate(self):
         # Ensure metadata can be updated.
@@ -8497,14 +9525,43 @@ class ComputeAPIAggrTestCase(BaseTestCase):
         self.assertEqual(msg.event_type,
                          'aggregate.updateprop.end')
 
-    def test_update_aggregate_metadata(self):
-        # Ensure metadata can be updated.
-        aggr = self.api.create_aggregate(self.context, 'fake_aggregate',
-                                         'fake_zone')
-        metadata = {'foo_key1': 'foo_value1',
-                    'foo_key2': 'foo_value2', }
+    def test_update_aggregate_no_az(self):
+        # Ensure metadata without availability zone can be
+        # updated,even the aggregate contains hosts belong
+        # to another availability zone
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                       fake_zone, fake_host)
+        aggr2 = self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                               fake_host)
+        metadata = {'name': 'new_fake_aggregate'}
         fake_notifier.NOTIFICATIONS = []
-        aggr = self.api.update_aggregate_metadata(self.context, aggr['id'],
+        aggr2 = self.api.update_aggregate(self.context, aggr2['id'],
+                                                  metadata)
+        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
+        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updateprop.start')
+        msg = fake_notifier.NOTIFICATIONS[1]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updateprop.end')
+
+    def test_update_aggregate_az_change(self):
+        # Ensure availability zone can be updated,
+        # when the aggregate is the only one with
+        # availability zone
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        aggr1 = self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                               fake_zone, fake_host)
+        self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                       fake_host)
+        metadata = {'availability_zone': 'new_fake_zone'}
+        fake_notifier.NOTIFICATIONS = []
+        aggr1 = self.api.update_aggregate(self.context, aggr1['id'],
                                                   metadata)
         self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
         msg = fake_notifier.NOTIFICATIONS[0]
@@ -8513,12 +9570,182 @@ class ComputeAPIAggrTestCase(BaseTestCase):
         msg = fake_notifier.NOTIFICATIONS[1]
         self.assertEqual(msg.event_type,
                          'aggregate.updatemetadata.end')
+
+    def test_update_aggregate_az_fails(self):
+        # Ensure aggregate's availability zone can't be updated,
+        # when aggregate has hosts in other availability zone
+        fake_notifier.NOTIFICATIONS = []
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                       fake_zone, fake_host)
+        aggr2 = self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                               fake_host)
+        metadata = {'availability_zone': 'another_zone'}
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.api.update_aggregate,
+                          self.context, aggr2['id'], metadata)
+        fake_host2 = values[fake_zone][1]
+        aggr3 = self._init_aggregate_with_host(None, 'fake_aggregate3',
+                                               None, fake_host2)
+        metadata = {'availability_zone': fake_zone}
+        aggr3 = self.api.update_aggregate(self.context, aggr3['id'],
+                                          metadata)
+        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 15)
+        msg = fake_notifier.NOTIFICATIONS[13]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.start')
+        msg = fake_notifier.NOTIFICATIONS[14]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.end')
+
+    def test_update_aggregate_az_fails_with_nova_az(self):
+        # Ensure aggregate's availability zone can't be updated,
+        # when aggregate has hosts in other availability zone
+        fake_notifier.NOTIFICATIONS = []
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                       CONF.default_availability_zone,
+                                       fake_host)
+        aggr2 = self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                               fake_host)
+        metadata = {'availability_zone': 'another_zone'}
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.api.update_aggregate,
+                          self.context, aggr2['id'], metadata)
+
+    def test_update_aggregate_metadata(self):
+        # Ensure metadata can be updated.
+        aggr = self.api.create_aggregate(self.context, 'fake_aggregate',
+                                         'fake_zone')
+        metadata = {'foo_key1': 'foo_value1',
+                    'foo_key2': 'foo_value2',
+                    'availability_zone': 'fake_zone'}
+        fake_notifier.NOTIFICATIONS = []
+        availability_zones._get_cache().add('fake_key', 'fake_value')
+        aggr = self.api.update_aggregate_metadata(self.context, aggr['id'],
+                                                  metadata)
+        self.assertIsNone(availability_zones._get_cache().get('fake_key'))
+        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
+        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.start')
+        msg = fake_notifier.NOTIFICATIONS[1]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.end')
+        fake_notifier.NOTIFICATIONS = []
         metadata['foo_key1'] = None
+        expected_payload_meta_data = {'foo_key1': None,
+                                      'foo_key2': 'foo_value2',
+                                      'availability_zone': 'fake_zone'}
         expected = self.api.update_aggregate_metadata(self.context,
                                              aggr['id'], metadata)
+        self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
+        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual('aggregate.updatemetadata.start', msg.event_type)
+        self.assertEqual(expected_payload_meta_data, msg.payload['meta_data'])
+        msg = fake_notifier.NOTIFICATIONS[1]
+        self.assertEqual('aggregate.updatemetadata.end', msg.event_type)
+        self.assertEqual(expected_payload_meta_data, msg.payload['meta_data'])
         self.assertThat(expected['metadata'],
                         matchers.DictMatches({'availability_zone': 'fake_zone',
                         'foo_key2': 'foo_value2'}))
+
+    def test_update_aggregate_metadata_no_az(self):
+        # Ensure metadata without availability zone can be
+        # updated,even the aggregate contains hosts belong
+        # to another availability zone
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                       fake_zone, fake_host)
+        aggr2 = self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                               fake_host)
+        metadata = {'foo_key2': 'foo_value3'}
+        fake_notifier.NOTIFICATIONS = []
+        aggr2 = self.api.update_aggregate_metadata(self.context, aggr2['id'],
+                                                  metadata)
+        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
+        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.start')
+        msg = fake_notifier.NOTIFICATIONS[1]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.end')
+        self.assertThat(aggr2['metadata'],
+                        matchers.DictMatches({'foo_key2': 'foo_value3'}))
+
+    def test_update_aggregate_metadata_az_change(self):
+        # Ensure availability zone can be updated,
+        # when the aggregate is the only one with
+        # availability zone
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        aggr1 = self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                               fake_zone, fake_host)
+        self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                       fake_host)
+        metadata = {'availability_zone': 'new_fake_zone'}
+        fake_notifier.NOTIFICATIONS = []
+        aggr1 = self.api.update_aggregate_metadata(self.context,
+                                                   aggr1['id'], metadata)
+        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
+        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.start')
+        msg = fake_notifier.NOTIFICATIONS[1]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.end')
+
+    def test_update_aggregate_az_do_not_replace_existing_metadata(self):
+        # Ensure that that update of the aggregate availability zone
+        # does not replace the aggregate existing metadata
+        aggr = self.api.create_aggregate(self.context, 'fake_aggregate',
+                                         'fake_zone')
+        metadata = {'foo_key1': 'foo_value1'}
+        aggr = self.api.update_aggregate_metadata(self.context,
+                                                  aggr['id'],
+                                                  metadata)
+        metadata = {'availability_zone': 'new_fake_zone'}
+        aggr = self.api.update_aggregate(self.context,
+                                         aggr['id'],
+                                         metadata)
+        self.assertThat(aggr['metadata'], matchers.DictMatches(
+            {'availability_zone': 'new_fake_zone', 'foo_key1': 'foo_value1'}))
+
+    def test_update_aggregate_metadata_az_fails(self):
+        # Ensure aggregate's availability zone can't be updated,
+        # when aggregate has hosts in other availability zone
+        fake_notifier.NOTIFICATIONS = []
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                       fake_zone, fake_host)
+        aggr2 = self._init_aggregate_with_host(None, 'fake_aggregate2', None,
+                                               fake_host)
+        metadata = {'availability_zone': 'another_zone'}
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.api.update_aggregate_metadata,
+                          self.context, aggr2['id'], metadata)
+        aggr3 = self._init_aggregate_with_host(None, 'fake_aggregate3',
+                                               None, fake_host)
+        metadata = {'availability_zone': fake_zone}
+        aggr3 = self.api.update_aggregate_metadata(self.context,
+                                                   aggr3['id'],
+                                                   metadata)
+        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 15)
+        msg = fake_notifier.NOTIFICATIONS[13]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.start')
+        msg = fake_notifier.NOTIFICATIONS[14]
+        self.assertEqual(msg.event_type,
+                         'aggregate.updatemetadata.end')
 
     def test_delete_aggregate(self):
         # Ensure we can delete an aggregate.
@@ -8570,6 +9797,24 @@ class ComputeAPIAggrTestCase(BaseTestCase):
 
         self.stubs.Set(self.api.compute_rpcapi, 'add_aggregate_host',
                        fake_add_aggregate_host)
+
+        self.mox.StubOutWithMock(availability_zones,
+                                 'update_host_availability_zone_cache')
+
+        def _stub_update_host_avail_zone_cache(host, az=None):
+            if az is not None:
+                availability_zones.update_host_availability_zone_cache(
+                    self.context, host, az)
+            else:
+                availability_zones.update_host_availability_zone_cache(
+                    self.context, host)
+
+        for avail_zone, hosts in six.iteritems(values):
+            for host in hosts:
+                _stub_update_host_avail_zone_cache(
+                    host, CONF.default_availability_zone)
+        _stub_update_host_avail_zone_cache(fake_host)
+        self.mox.ReplayAll()
 
         fake_notifier.NOTIFICATIONS = []
         aggr = self.api.add_host_to_aggregate(self.context,
@@ -8636,6 +9881,25 @@ class ComputeAPIAggrTestCase(BaseTestCase):
                           self.api.add_host_to_aggregate,
                           self.context, aggr2['id'], fake_host)
 
+    def test_add_host_to_multi_az_with_nova_agg(self):
+        # Ensure we can't add a host if already existing in an agg with AZ set
+        #  to default
+        values = _create_service_entries(self.context)
+        fake_zone = values.keys()[0]
+        fake_host = values[fake_zone][0]
+        aggr = self.api.create_aggregate(self.context,
+                                         'fake_aggregate',
+                                         CONF.default_availability_zone)
+        aggr = self.api.add_host_to_aggregate(self.context,
+                                              aggr['id'], fake_host)
+        self.assertEqual(len(aggr['hosts']), 1)
+        fake_zone2 = "another_zone"
+        aggr2 = self.api.create_aggregate(self.context,
+                                         'fake_aggregate2', fake_zone2)
+        self.assertRaises(exception.InvalidAggregateAction,
+                          self.api.add_host_to_aggregate,
+                          self.context, aggr2['id'], fake_host)
+
     def test_add_host_to_aggregate_multiple(self):
         # Ensure we can add multiple hosts to an aggregate.
         values = _create_service_entries(self.context)
@@ -8676,6 +9940,12 @@ class ComputeAPIAggrTestCase(BaseTestCase):
 
         self.stubs.Set(self.api.compute_rpcapi, 'remove_aggregate_host',
                        fake_remove_aggregate_host)
+
+        self.mox.StubOutWithMock(availability_zones,
+                                 'update_host_availability_zone_cache')
+        availability_zones.update_host_availability_zone_cache(self.context,
+                                                               host_to_remove)
+        self.mox.ReplayAll()
 
         fake_notifier.NOTIFICATIONS = []
         expected = self.api.remove_host_from_aggregate(self.context,
@@ -8928,8 +10198,7 @@ class ComputePolicyTestCase(BaseTestCase):
 
 
 class DisabledInstanceTypesTestCase(BaseTestCase):
-    """
-    Some instance-types are marked 'disabled' which means that they will not
+    """Some instance-types are marked 'disabled' which means that they will not
     show up in customer-facing listings. We do, however, want those
     instance-types to be available for emergency migrations and for rebuilding
     of existing instances.
@@ -9012,7 +10281,7 @@ class ComputeReschedulingTestCase(BaseTestCase):
         if not filter_properties:
             filter_properties = {}
 
-        instance_uuid = "12-34-56-78-90"
+        instance = self._create_fake_instance_obj()
 
         admin_password = None
         injected_files = None
@@ -9023,7 +10292,7 @@ class ComputeReschedulingTestCase(BaseTestCase):
         method_args = (request_spec, admin_password, injected_files,
                        requested_networks, is_first_time, filter_properties)
         return self.compute._reschedule(self.context, request_spec,
-                filter_properties, instance_uuid, scheduler_method,
+                filter_properties, instance, scheduler_method,
                 method_args, self.expected_task_state, exc_info=exc_info)
 
     def test_reschedule_no_filter_properties(self):
@@ -9049,7 +10318,8 @@ class ComputeReschedulingTestCase(BaseTestCase):
             raise test.TestingException("just need an exception")
         except test.TestingException:
             exc_info = sys.exc_info()
-            exc_str = traceback.format_exception(*exc_info)
+            exc_str = traceback.format_exception_only(exc_info[0],
+                                                      exc_info[1])
 
         self.assertTrue(self._reschedule(filter_properties=filter_properties,
             request_spec=request_spec, exc_info=exc_info))
@@ -9074,15 +10344,15 @@ class ComputeReschedulingResizeTestCase(ComputeReschedulingTestCase):
         instance = fake_instance.fake_db_instance(uuid=instance_uuid)
         instance = self._objectify(instance)
         instance_type = {}
-        image = None
         reservations = None
 
-        scheduler_method = self.compute.scheduler_rpcapi.prep_resize
-        method_args = (instance, instance_type, image, request_spec,
-                filter_properties, reservations)
+        scheduler_method = self.compute.compute_task_api.resize_instance
+        scheduler_hint = dict(filter_properties=filter_properties)
+        method_args = (instance, None, scheduler_hint, instance_type,
+                       reservations)
 
         return self.compute._reschedule(self.context, request_spec,
-                filter_properties, instance_uuid, scheduler_method,
+                filter_properties, instance, scheduler_method,
                 method_args, self.expected_task_state, exc_info=exc_info)
 
 
@@ -9103,15 +10373,21 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
         """Basic sanity check to make sure _reschedule_or_error is called
         when a build fails.
         """
+        self.mox.StubOutWithMock(objects.BlockDeviceMappingList,
+                                 'get_by_instance_uuid')
         self.mox.StubOutWithMock(self.compute, '_spawn')
         self.mox.StubOutWithMock(self.compute, '_reschedule_or_error')
 
+        bdms = block_device_obj.block_device_make_list(self.context, [])
+
+        objects.BlockDeviceMappingList.get_by_instance_uuid(
+                mox.IgnoreArg(), self.instance.uuid).AndReturn(bdms)
         self.compute._spawn(mox.IgnoreArg(), self.instance, mox.IgnoreArg(),
                 [], mox.IgnoreArg(), [], None, set_access_ip=False).AndRaise(
                         test.TestingException("BuildError"))
         self.compute._reschedule_or_error(mox.IgnoreArg(), self.instance,
                 mox.IgnoreArg(), None, None, None,
-                False, None, {}, [], False).AndReturn(True)
+                False, None, {}, bdms, False).AndReturn(True)
 
         self.mox.ReplayAll()
         self.compute._run_instance(self.context, None, {}, None, None, None,
@@ -9130,7 +10406,6 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
             exc_info = sys.exc_info()
 
             compute_utils.add_instance_fault_from_exc(self.context,
-                    self.compute.conductor_api,
                     self.instance, exc_info[0], exc_info=exc_info)
             self.compute._shutdown_instance(self.context, self.instance,
                     mox.IgnoreArg(),
@@ -9144,6 +10419,39 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
             self.assertRaises(InnerTestingException,
                     self.compute._reschedule_or_error, self.context,
                     self.instance, exc_info, None, None, None, False, None, {})
+
+    def test_shutdown_instance_fail_instance_info_cache_not_found(self):
+        # Covers the case that _shutdown_instance fails with an
+        # InstanceInfoCacheNotFound exception when getting instance network
+        # information prior to calling driver.destroy.
+        elevated_context = self.context.elevated()
+        error = exception.InstanceInfoCacheNotFound(
+                                        instance_uuid=self.instance['uuid'])
+        with contextlib.nested(
+            mock.patch.object(self.context, 'elevated',
+                              return_value=elevated_context),
+            mock.patch.object(self.compute, '_get_instance_nw_info',
+                              side_effect=error),
+            mock.patch.object(self.compute,
+                              '_get_instance_block_device_info'),
+            mock.patch.object(self.compute.driver, 'destroy'),
+            mock.patch.object(self.compute, '_try_deallocate_network')
+        ) as (
+            elevated_mock,
+            _get_instance_nw_info_mock,
+            _get_instance_block_device_info_mock,
+            destroy_mock,
+            _try_deallocate_network_mock
+        ):
+            inst_obj = self._objectify(self.instance)
+            self.compute._shutdown_instance(self.context, inst_obj,
+                                            bdms=[], notify=False)
+            # By asserting that _try_deallocate_network_mock was called
+            # exactly once, we know that _get_instance_nw_info raising
+            # InstanceInfoCacheNotFound did not make _shutdown_instance error
+            # out and driver.destroy was still called.
+            _try_deallocate_network_mock.assert_called_once_with(
+                elevated_context, inst_obj, None)
 
     def test_reschedule_fail(self):
         # Test handling of exception from _reschedule.
@@ -9163,7 +10471,7 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
                                         mox.IgnoreArg())
         self.compute._cleanup_volumes(self.context, instance_uuid,
                                         mox.IgnoreArg())
-        self.compute._reschedule(self.context, None, instance_uuid,
+        self.compute._reschedule(self.context, None, self.instance,
                 {}, self.compute.scheduler_rpcapi.run_instance,
                 method_args, task_states.SCHEDULING, exc_info).AndRaise(
                         InnerTestingException("Inner"))
@@ -9183,10 +10491,9 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
 
         try:
             raise test.TestingException("Original")
-        except Exception:
+        except test.TestingException:
             exc_info = sys.exc_info()
             compute_utils.add_instance_fault_from_exc(self.context,
-                    self.compute.conductor_api,
                     self.instance, exc_info[0], exc_info=exc_info)
 
             self.compute._shutdown_instance(self.context, self.instance,
@@ -9194,7 +10501,7 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
                                             mox.IgnoreArg())
             self.compute._cleanup_volumes(self.context, instance_uuid,
                                             mox.IgnoreArg())
-            self.compute._reschedule(self.context, None, {}, instance_uuid,
+            self.compute._reschedule(self.context, None, {}, self.instance,
                     self.compute.scheduler_rpcapi.run_instance, method_args,
                     task_states.SCHEDULING, exc_info).AndReturn(False)
 
@@ -9219,14 +10526,13 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
             exc_info = sys.exc_info()
 
             compute_utils.add_instance_fault_from_exc(self.context,
-                    self.compute.conductor_api,
                     self.instance, exc_info[0], exc_info=exc_info)
             self.compute._shutdown_instance(self.context, self.instance,
                                             mox.IgnoreArg(),
                                             mox.IgnoreArg())
             self.compute._cleanup_volumes(self.context, instance_uuid,
                                           mox.IgnoreArg())
-            self.compute._reschedule(self.context, None, {}, instance_uuid,
+            self.compute._reschedule(self.context, None, {}, self.instance,
                     self.compute.scheduler_rpcapi.run_instance,
                     method_args, task_states.SCHEDULING, exc_info).AndReturn(
                             True)
@@ -9274,6 +10580,20 @@ class ComputeRescheduleOrErrorTestCase(BaseTestCase):
                 self.compute._run_instance, self.context, None, {}, None, None,
                 None, False, None, self.instance, False)
 
+    def test_no_reschedule_on_block_device_fail(self):
+        self.mox.StubOutWithMock(self.compute, '_prep_block_device')
+        self.mox.StubOutWithMock(self.compute, '_reschedule_or_error')
+
+        exc = exception.InvalidBDM()
+
+        self.compute._prep_block_device(mox.IgnoreArg(), self.instance,
+                                        mox.IgnoreArg()).AndRaise(exc)
+
+        self.mox.ReplayAll()
+        self.assertRaises(exception.InvalidBDM, self.compute._run_instance,
+                          self.context, None, {}, None, None, None, False,
+                          None, self.instance, False)
+
 
 class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
     """Test logic and exception handling around rescheduling prep resize
@@ -9299,7 +10619,8 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
                 mox.IgnoreArg()).AndRaise(test.TestingException("Original"))
 
         self.compute._reschedule_resize_or_reraise(mox.IgnoreArg(), None,
-                inst_obj, mox.IgnoreArg(), self.instance_type, [], {},
+                inst_obj, mox.IgnoreArg(), self.instance_type,
+                mox.IgnoreArg(), {},
                 {})
 
         self.mox.ReplayAll()
@@ -9315,13 +10636,14 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
         raises another exception
         """
         instance = self._create_fake_instance_obj()
-        method_args = (None, instance, self.instance_type, None, None,
-                None)
+        scheduler_hint = dict(filter_properties={})
+        method_args = (instance, None, scheduler_hint, self.instance_type,
+                       None)
         self.mox.StubOutWithMock(self.compute, "_reschedule")
 
         self.compute._reschedule(
-                self.context, None, None, instance.uuid,
-                self.compute.scheduler_rpcapi.prep_resize, method_args,
+                self.context, None, None, instance,
+                self.compute.compute_task_api.resize_instance, method_args,
                 task_states.RESIZE_PREP).AndRaise(
                         InnerTestingException("Inner"))
         self.mox.ReplayAll()
@@ -9332,20 +10654,22 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
             exc_info = sys.exc_info()
             self.assertRaises(test.TestingException,
                     self.compute._reschedule_resize_or_reraise, self.context,
-                    None, instance, exc_info, self.instance_type, None,
-                    {}, {})
+                    None, instance, exc_info, self.instance_type,
+                    self.none_quotas, {}, {})
 
     def test_reschedule_false(self):
         """Original exception should be raised if the resize is not
         rescheduled.
         """
         instance = self._create_fake_instance_obj()
-        method_args = (None, instance, self.instance_type, None, None, None)
+        scheduler_hint = dict(filter_properties={})
+        method_args = (instance, None, scheduler_hint, self.instance_type,
+                       None)
         self.mox.StubOutWithMock(self.compute, "_reschedule")
 
         self.compute._reschedule(
-                self.context, None, None, instance.uuid,
-                self.compute.scheduler_rpcapi.prep_resize, method_args,
+                self.context, None, None, instance,
+                self.compute.compute_task_api.resize_instance, method_args,
                 task_states.RESIZE_PREP).AndReturn(False)
         self.mox.ReplayAll()
 
@@ -9355,14 +10679,16 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
             exc_info = sys.exc_info()
             self.assertRaises(test.TestingException,
                     self.compute._reschedule_resize_or_reraise, self.context,
-                    None, instance, exc_info, self.instance_type, None,
-                    {}, {})
+                    None, instance, exc_info, self.instance_type,
+                    self.none_quotas, {}, {})
 
     def test_reschedule_true(self):
         # If rescheduled, the original resize exception should be logged.
         instance = self._create_fake_instance_obj()
-        instance_p = obj_base.obj_to_primitive(instance)
-        method_args = (instance_p, self.instance_type, None, {}, {}, None)
+        scheduler_hint = dict(filter_properties={})
+        method_args = (instance, None, scheduler_hint, self.instance_type,
+                       None)
+
         try:
             raise test.TestingException("Original")
         except Exception:
@@ -9371,22 +10697,23 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
             self.mox.StubOutWithMock(self.compute, "_reschedule")
             self.mox.StubOutWithMock(self.compute, "_log_original_error")
             self.compute._reschedule(self.context, {}, {},
-                    instance.uuid,
-                    self.compute.scheduler_rpcapi.prep_resize, method_args,
+                    instance,
+                    self.compute.compute_task_api.resize_instance, method_args,
                     task_states.RESIZE_PREP, exc_info).AndReturn(True)
 
             self.compute._log_original_error(exc_info, instance.uuid)
             self.mox.ReplayAll()
 
-            self.compute._reschedule_resize_or_reraise(self.context, None,
-                    instance, exc_info, self.instance_type, None, {}, {})
+            self.compute._reschedule_resize_or_reraise(
+                    self.context, None, instance, exc_info,
+                    self.instance_type, self.none_quotas, {}, {})
 
 
 class ComputeInactiveImageTestCase(BaseTestCase):
     def setUp(self):
         super(ComputeInactiveImageTestCase, self).setUp()
 
-        def fake_show(meh, context, id):
+        def fake_show(meh, context, id, **kwargs):
             return {'id': id, 'min_disk': None, 'min_ram': None,
                     'name': 'fake_name',
                     'status': 'deleted',
@@ -9442,7 +10769,8 @@ class EvacuateHostTestCase(BaseTestCase):
         def fake_get_compute_info(context, host):
             self.assertTrue(context.is_admin)
             self.assertEqual('fake-mini', host)
-            return {'hypervisor_hostname': self.rt.nodename}
+            cn = objects.ComputeNode(hypervisor_hostname=self.rt.nodename)
+            return cn
 
         self.stubs.Set(self.compute, '_get_compute_info',
                        fake_get_compute_info)
@@ -9477,7 +10805,7 @@ class EvacuateHostTestCase(BaseTestCase):
         """Confirm evacuate scenario updates vm_state to stopped
         if instance is in stopped state
         """
-        #Initialize the VM to stopped state
+        # Initialize the VM to stopped state
         db.instance_update(self.context, self.inst_ref['uuid'],
                            {"vm_state": vm_states.STOPPED})
         self.inst_ref['vm_state'] = vm_states.STOPPED
@@ -9487,7 +10815,7 @@ class EvacuateHostTestCase(BaseTestCase):
 
         self._rebuild()
 
-        #Check the vm state is reset to stopped
+        # Check the vm state is reset to stopped
         instance = db.instance_get(self.context, self.inst_ref['id'])
         self.assertEqual(instance['vm_state'], vm_states.STOPPED)
 
@@ -9535,7 +10863,7 @@ class EvacuateHostTestCase(BaseTestCase):
 
         self.mox.StubOutWithMock(self.compute, '_prep_block_device')
         self.compute._prep_block_device(mox.IsA(self.context),
-                                        mox.IsA(self.inst_ref),
+                                        mox.IsA(objects.Instance),
                                         mox.IgnoreArg())
 
         self.stubs.Set(self.compute.driver, 'instance_on_disk', lambda x: True)
@@ -9552,7 +10880,7 @@ class EvacuateHostTestCase(BaseTestCase):
         """Confirm evacuate scenario on shared storage."""
         self.mox.StubOutWithMock(self.compute.driver, 'spawn')
         self.compute.driver.spawn(mox.IsA(self.context),
-                mox.IsA(self.inst_ref), {}, mox.IgnoreArg(), 'newpass',
+                mox.IsA(objects.Instance), {}, mox.IgnoreArg(), 'newpass',
                 network_info=mox.IgnoreArg(),
                 block_device_info=mox.IgnoreArg())
 
@@ -9572,8 +10900,9 @@ class EvacuateHostTestCase(BaseTestCase):
 
         self.mox.StubOutWithMock(self.compute.driver, 'spawn')
         self.compute.driver.spawn(mox.IsA(self.context),
-                mox.IsA(self.inst_ref), mox.IsA(fake_image), mox.IgnoreArg(),
-                mox.IsA('newpass'), network_info=mox.IgnoreArg(),
+                mox.IsA(objects.Instance), mox.IsA(fake_image),
+                mox.IgnoreArg(), mox.IsA('newpass'),
+                network_info=mox.IgnoreArg(),
                 block_device_info=mox.IgnoreArg())
 
         self.stubs.Set(self.compute.driver, 'instance_on_disk',
@@ -9607,7 +10936,7 @@ class ComputeInjectedFilesTestCase(BaseTestCase):
 
     def setUp(self):
         super(ComputeInjectedFilesTestCase, self).setUp()
-        self.instance = self._create_fake_instance()
+        self.instance = self._create_fake_instance_obj()
         self.stubs.Set(self.compute.driver, 'spawn', self._spawn)
 
     def _spawn(self, context, instance, image_meta, injected_files,
@@ -9782,3 +11111,13 @@ class CheckRequestedImageTestCase(test.TestCase):
 
         self.compute_api._check_requested_image(self.context, image['id'],
                 image, self.instance_type)
+
+
+class ComputeHooksTestCase(test.BaseHookTestCase):
+    def test_delete_instance_has_hook(self):
+        delete_func = compute_manager.ComputeManager._delete_instance
+        self.assert_has_hook('delete_instance', delete_func)
+
+    def test_create_instance_has_hook(self):
+        create_func = compute_api.API.create
+        self.assert_has_hook('create_instance', create_func)

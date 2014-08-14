@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -16,16 +14,16 @@
 #    under the License.
 
 import os.path
-
-from lxml import etree
-import six
 from xml.dom import minidom
 from xml.parsers import expat
 from xml import sax
 from xml.sax import expatreader
 
+from lxml import etree
+import six
+
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import utils
 
 
@@ -101,6 +99,16 @@ def get_items(obj):
     """Get items in obj."""
 
     return list(obj.items())
+
+
+def get_items_without_dict(obj):
+    """Get items in obj but omit any items containing a dict."""
+
+    obj_list = list(obj.items())
+    for item in obj_list:
+        if isinstance(list(item)[1], dict):
+            obj_list.remove(item)
+    return obj_list
 
 
 class EmptyStringSelector(Selector):
@@ -403,7 +411,7 @@ class TemplateElement(object):
         # We have fully rendered the element; return it
         return elem
 
-    def render(self, parent, obj, patches=[], nsmap=None):
+    def render(self, parent, obj, patches=None, nsmap=None):
         """Render an object.
 
         Renders an object against this template node.  Returns a list
@@ -420,6 +428,7 @@ class TemplateElement(object):
                       the etree.Element instances.
         """
 
+        patches = patches or []
         # First, get the datum we're rendering
         data = None if obj is None else self.selector(obj)
 
@@ -880,9 +889,7 @@ class TemplateBuilder(object):
 
 
 def make_links(parent, selector=None):
-    """
-    Attach an Atom <links> element to the parent.
-    """
+    """Attach an Atom <links> element to the parent."""
 
     elem = SubTemplateElement(parent, '{%s}link' % XMLNS_ATOM,
                               selector=selector)
@@ -895,15 +902,18 @@ def make_links(parent, selector=None):
 
 
 def make_flat_dict(name, selector=None, subselector=None,
-                   ns=None, colon_ns=False):
-    """
-    Utility for simple XML templates that traditionally used
+                   ns=None, colon_ns=False, root=None,
+                   ignore_sub_dicts=False):
+    """Utility for simple XML templates that traditionally used
     XMLDictSerializer with no metadata.  Returns a template element
     where the top-level element has the given tag name, and where
     sub-elements have tag names derived from the object's keys and
-    text derived from the object's values.  This only works for flat
-    dictionary objects, not dictionaries containing nested lists or
-    dictionaries.
+    text derived from the object's values.
+
+    :param root: if None, this will create the root.
+    :param ignore_sub_dicts: If True, ignores any dict objects inside the
+                             object. If False, causes an error if there is a
+                             dict object present.
     """
 
     # Set up the names we need...
@@ -916,13 +926,13 @@ def make_flat_dict(name, selector=None, subselector=None,
 
     if selector is None:
         selector = name
-
-    # Build the root element
-    root = TemplateElement(elemname, selector=selector,
-                           subselector=subselector, colon_ns=colon_ns)
-
+    if not root:
+        # Build the root element
+        root = TemplateElement(elemname, selector=selector,
+                               subselector=subselector, colon_ns=colon_ns)
+    choice = get_items if ignore_sub_dicts is False else get_items_without_dict
     # Build an element to represent all the keys and values
-    elem = SubTemplateElement(root, tagname, selector=get_items,
+    elem = SubTemplateElement(root, tagname, selector=choice,
                               colon_ns=colon_ns)
     elem.text = 1
 
@@ -980,7 +990,7 @@ def safe_minidom_parse_string(xml_string):
         return minidom.parseString(xml_string, parser=ProtectedExpatParser())
     except (sax.SAXParseException, ValueError,
             expat.ExpatError, LookupError) as e:
-        #NOTE(Vijaya Erukala): XML input such as
+        # NOTE(Vijaya Erukala): XML input such as
         #                      <?xml version="1.0" encoding="TF-8"?>
         #                      raises LookupError: unknown encoding: TF-8
         raise exception.MalformedRequestBody(reason=str(e))

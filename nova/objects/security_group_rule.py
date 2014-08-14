@@ -13,9 +13,9 @@
 #    under the License.
 
 from nova import db
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova.objects import security_group
 
 OPTIONAL_ATTRS = ['parent_group', 'grantee_group']
 
@@ -29,7 +29,7 @@ class SecurityGroupRule(base.NovaPersistentObject, base.NovaObject):
         'protocol': fields.StringField(nullable=True),
         'from_port': fields.IntegerField(nullable=True),
         'to_port': fields.IntegerField(nullable=True),
-        'cidr': fields.Field(fields.CIDR(), nullable=True),
+        'cidr': fields.IPNetworkField(nullable=True),
         'parent_group': fields.ObjectField('SecurityGroup', nullable=True),
         'grantee_group': fields.ObjectField('SecurityGroup', nullable=True),
         }
@@ -38,8 +38,8 @@ class SecurityGroupRule(base.NovaPersistentObject, base.NovaObject):
     def _from_db_subgroup(context, db_group):
         if db_group is None:
             return None
-        return security_group.SecurityGroup._from_db_object(
-            context, security_group.SecurityGroup(), db_group)
+        return objects.SecurityGroup._from_db_object(
+            context, objects.SecurityGroup(context), db_group)
 
     @staticmethod
     def _from_db_object(context, rule, db_rule, expected_attrs=None):
@@ -64,12 +64,16 @@ class SecurityGroupRuleList(base.ObjectListBase, base.NovaObject):
     fields = {
         'objects': fields.ListOfObjectsField('SecurityGroupRule'),
         }
+    child_versions = {
+        '1.0': '1.0',
+        }
 
     @base.remotable_classmethod
     def get_by_security_group_id(cls, context, secgroup_id):
         db_rules = db.security_group_rule_get_by_security_group(
             context, secgroup_id, columns_to_join=['grantee_group'])
-        return base.obj_make_list(context, cls(), SecurityGroupRule, db_rules,
+        return base.obj_make_list(context, cls(context),
+                                  objects.SecurityGroupRule, db_rules,
                                   expected_attrs=['grantee_group'])
 
     @classmethod

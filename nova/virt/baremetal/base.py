@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # Copyright (c) 2011 University of Southern California / ISI
 # All Rights Reserved.
@@ -46,6 +44,14 @@ class NodeDriver(object):
 
     def get_console_output(self, node, instance):
         raise NotImplementedError()
+
+    def dhcp_options_for_instance(self, instance):
+        """Optional override to return the DHCP options to use for instance.
+
+        If no DHCP options are needed, this should not be overridden or None
+        should be returned.
+        """
+        return None
 
 
 class PowerManager(object):

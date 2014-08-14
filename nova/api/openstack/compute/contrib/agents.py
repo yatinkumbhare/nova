@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -20,8 +18,9 @@ import webob.exc
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
-from nova import db
 from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova import utils
 
 
@@ -44,8 +43,7 @@ class AgentsIndexTemplate(xmlutil.TemplateBuilder):
 
 
 class AgentController(object):
-    """
-    The agent is talking about guest agent.The host can use this for
+    """The agent is talking about guest agent.The host can use this for
     things like accessing files on the disk, configuring networking,
     or running other applications/scripts in the guest while it is
     running. Typically this uses some hypervisor-specific transport
@@ -68,9 +66,7 @@ class AgentController(object):
     """
     @wsgi.serializers(xml=AgentsIndexTemplate)
     def index(self, req):
-        """
-        Return a list of all agent builds. Filter by hypervisor.
-        """
+        """Return a list of all agent builds. Filter by hypervisor."""
         context = req.environ['nova.context']
         authorize(context)
         hypervisor = None
@@ -78,7 +74,8 @@ class AgentController(object):
         if 'hypervisor' in req.GET:
             hypervisor = req.GET['hypervisor']
 
-        for agent_build in db.agent_build_get_all(context, hypervisor):
+        builds = objects.AgentList.get_all(context, hypervisor=hypervisor)
+        for agent_build in builds:
             agents.append({'hypervisor': agent_build.hypervisor,
                            'os': agent_build.os,
                            'architecture': agent_build.architecture,
@@ -99,8 +96,9 @@ class AgentController(object):
             url = para['url']
             md5hash = para['md5hash']
             version = para['version']
-        except (TypeError, KeyError):
-            raise webob.exc.HTTPUnprocessableEntity()
+        except (TypeError, KeyError) as ex:
+            msg = _("Invalid request body: %s") % unicode(ex)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
 
         try:
             utils.check_string_length(url, 'url', max_length=255)
@@ -110,13 +108,23 @@ class AgentController(object):
             raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
 
         try:
-            db.agent_build_update(context, id,
-                                {'version': version,
-                                 'url': url,
-                                 'md5hash': md5hash})
+            agent = objects.Agent(context=context, id=id)
+            agent.obj_reset_changes()
+            agent.version = version
+            agent.url = url
+            agent.md5hash = md5hash
+            agent.save()
+        except ValueError as ex:
+            msg = _("Invalid request body: %s") % unicode(ex)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.AgentBuildNotFound as ex:
             raise webob.exc.HTTPNotFound(explanation=ex.format_message())
 
+        # NOTE(alex_xu): The agent_id should be integer that consistent with
+        # create/index actions. But parameter 'id' is string type that parsed
+        # from url. This is a bug, but because back-compatibility, it can't be
+        # fixed for v2 API. This will be fixed after v3 API feature exposed by
+        # micro-version in the future. lp bug #1333494
         return {"agent": {'agent_id': id, 'version': version,
                 'url': url, 'md5hash': md5hash}}
 
@@ -126,7 +134,8 @@ class AgentController(object):
         authorize(context)
 
         try:
-            db.agent_build_destroy(context, id)
+            agent = objects.Agent(context=context, id=id)
+            agent.destroy()
         except exception.AgentBuildNotFound as ex:
             raise webob.exc.HTTPNotFound(explanation=ex.format_message())
 
@@ -143,8 +152,9 @@ class AgentController(object):
             version = agent['version']
             url = agent['url']
             md5hash = agent['md5hash']
-        except (TypeError, KeyError):
-            raise webob.exc.HTTPUnprocessableEntity()
+        except (TypeError, KeyError) as ex:
+            msg = _("Invalid request body: %s") % unicode(ex)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
 
         try:
             utils.check_string_length(hypervisor, 'hypervisor', max_length=255)
@@ -158,16 +168,17 @@ class AgentController(object):
             raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
 
         try:
-            agent_build_ref = db.agent_build_create(context,
-                                                {'hypervisor': hypervisor,
-                                                 'os': os,
-                                                 'architecture': architecture,
-                                                 'version': version,
-                                                 'url': url,
-                                                 'md5hash': md5hash})
-            agent['agent_id'] = agent_build_ref.id
-        except Exception as ex:
-            raise webob.exc.HTTPServerError(str(ex))
+            agent_obj = objects.Agent(context=context)
+            agent_obj.hypervisor = hypervisor
+            agent_obj.os = os
+            agent_obj.architecture = architecture
+            agent_obj.version = version
+            agent_obj.url = url
+            agent_obj.md5hash = md5hash
+            agent_obj.create()
+            agent['agent_id'] = agent_obj.id
+        except exception.AgentBuildExists as ex:
+            raise webob.exc.HTTPConflict(explanation=ex.format_message())
         return {'agent': agent}
 
 
@@ -177,7 +188,7 @@ class Agents(extensions.ExtensionDescriptor):
     name = "Agents"
     alias = "os-agents"
     namespace = "http://docs.openstack.org/compute/ext/agents/api/v2"
-    updated = "2012-10-28T00:00:00-00:00"
+    updated = "2012-10-28T00:00:00Z"
 
     def get_resources(self):
         resources = []

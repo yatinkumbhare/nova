@@ -19,7 +19,7 @@ from nova.api.openstack.compute.contrib import admin_actions
 from nova.compute import vm_states
 import nova.context
 from nova import exception
-from nova.objects import instance as instance_obj
+from nova import objects
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
@@ -63,8 +63,8 @@ class CommonMixin(object):
         instance = fake_instance.fake_db_instance(
                 id=1, uuid=uuid, vm_state=vm_states.ACTIVE,
                 task_state=None, launched_at=timeutils.utcnow())
-        instance = instance_obj.Instance._from_db_object(
-                self.context, instance_obj.Instance(), instance)
+        instance = objects.Instance._from_db_object(
+                self.context, objects.Instance(), instance)
         self.compute_api.get(self.context, uuid,
                              want_objects=True).AndReturn(instance)
         return instance
@@ -138,18 +138,22 @@ class CommonMixin(object):
         self.mox.VerifyAll()
         self.mox.UnsetStubs()
 
-    def _test_locked_instance(self, action, method=None):
+    def _test_locked_instance(self, action, method=None, body_map=None,
+                              compute_api_args_map=None):
         if method is None:
             method = action
 
         instance = self._stub_instance_get()
-        getattr(self.compute_api, method)(self.context, instance).AndRaise(
+
+        args, kwargs = compute_api_args_map.get(action, ((), {}))
+        getattr(self.compute_api, method)(self.context, instance,
+                                          *args, **kwargs).AndRaise(
                 exception.InstanceIsLocked(instance_uuid=instance['uuid']))
 
         self.mox.ReplayAll()
 
         res = self._make_request('/servers/%s/action' % instance['uuid'],
-                                 {action: None})
+                                 {action: body_map.get(action)})
         self.assertEqual(409, res.status_int)
         # Do these here instead of tearDown because this method is called
         # more than once for the same test case
@@ -174,13 +178,21 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
             self.mox.StubOutWithMock(self.compute_api, 'get')
 
     def test_actions_raise_conflict_on_invalid_state(self):
-        actions = ['pause', 'unpause', 'suspend', 'resume', 'migrate']
-        method_translations = {'migrate': 'resize'}
+        actions = ['pause', 'unpause', 'suspend', 'resume', 'migrate',
+                   'os-migrateLive']
+        method_translations = {'migrate': 'resize',
+                               'os-migrateLive': 'live_migrate'}
+        body_map = {'os-migrateLive':
+                        {'host': 'hostname',
+                         'block_migration': False,
+                         'disk_over_commit': False}}
+        args_map = {'os-migrateLive': ((False, False, 'hostname'), {})}
 
         for action in actions:
             method = method_translations.get(action)
             self.mox.StubOutWithMock(self.compute_api, method or action)
-            self._test_invalid_state(action, method=method)
+            self._test_invalid_state(action, method=method, body_map=body_map,
+                                     compute_api_args_map=args_map)
             # Re-mock this.
             self.mox.StubOutWithMock(self.compute_api, 'get')
 
@@ -201,15 +213,23 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
 
     def test_actions_with_locked_instance(self):
         actions = ['pause', 'unpause', 'suspend', 'resume', 'migrate',
-                   'resetNetwork', 'injectNetworkInfo']
+                   'resetNetwork', 'injectNetworkInfo', 'os-migrateLive']
         method_translations = {'migrate': 'resize',
                                'resetNetwork': 'reset_network',
-                               'injectNetworkInfo': 'inject_network_info'}
+                               'injectNetworkInfo': 'inject_network_info',
+                               'os-migrateLive': 'live_migrate'}
+        args_map = {'os-migrateLive': ((False, False, 'hostname'), {})}
+        body_map = {'os-migrateLive': {'host': 'hostname',
+                                       'block_migration': False,
+                                       'disk_over_commit': False}}
 
         for action in actions:
             method = method_translations.get(action)
             self.mox.StubOutWithMock(self.compute_api, method or action)
-            self._test_locked_instance(action, method=method)
+            self._test_locked_instance(action, method=method,
+                                       body_map=body_map,
+                                       compute_api_args_map=args_map)
+
             # Re-mock this.
             self.mox.StubOutWithMock(self.compute_api, 'get')
 
@@ -224,7 +244,7 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
                                  {'migrate': None})
         self.assertEqual(expected_result, res.status_int)
 
-    def test_migrate_live_enabled(self):
+    def _test_migrate_live_succeeded(self, param):
         self.mox.StubOutWithMock(self.compute_api, 'live_migrate')
         instance = self._stub_instance_get()
         self.compute_api.live_migrate(self.context, instance, False,
@@ -233,16 +253,39 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
         self.mox.ReplayAll()
 
         res = self._make_request('/servers/%s/action' % instance['uuid'],
-                                 {'os-migrateLive':
-                                  {'host': 'hostname',
-                                   'block_migration': False,
-                                   'disk_over_commit': False}})
+                                 {'os-migrateLive': param})
         self.assertEqual(202, res.status_int)
+
+    def test_migrate_live_enabled(self):
+        param = {'host': 'hostname',
+                 'block_migration': False,
+                 'disk_over_commit': False}
+        self._test_migrate_live_succeeded(param)
+
+    def test_migrate_live_enabled_with_string_param(self):
+        param = {'host': 'hostname',
+                 'block_migration': "False",
+                 'disk_over_commit': "False"}
+        self._test_migrate_live_succeeded(param)
 
     def test_migrate_live_missing_dict_param(self):
         body = {'os-migrateLive': {'dummy': 'hostname',
                                    'block_migration': False,
                                    'disk_over_commit': False}}
+        res = self._make_request('/servers/FAKE/action', body)
+        self.assertEqual(400, res.status_int)
+
+    def test_migrate_live_with_invalid_block_migration(self):
+        body = {'os-migrateLive': {'host': 'hostname',
+                                   'block_migration': "foo",
+                                   'disk_over_commit': False}}
+        res = self._make_request('/servers/FAKE/action', body)
+        self.assertEqual(400, res.status_int)
+
+    def test_migrate_live_with_invalid_disk_over_commit(self):
+        body = {'os-migrateLive': {'host': 'hostname',
+                                   'block_migration': False,
+                                   'disk_over_commit': "foo"}}
         res = self._make_request('/servers/FAKE/action', body)
         self.assertEqual(400, res.status_int)
 
@@ -272,6 +315,10 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
         self._test_migrate_live_failed_with_exception(
             exception.InvalidHypervisorType())
 
+    def test_migrate_live_invalid_cpu_info(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.InvalidCPUInfo(reason=""))
+
     def test_migrate_live_unable_to_migrate_to_self(self):
         uuid = uuidutils.generate_uuid()
         self._test_migrate_live_failed_with_exception(
@@ -294,6 +341,14 @@ class AdminActionsTest(CommonMixin, test.NoDBTestCase):
     def test_migrate_live_invalid_shared_storage(self):
         self._test_migrate_live_failed_with_exception(
             exception.InvalidSharedStorage(path='', reason=''))
+
+    def test_migrate_live_hypervisor_unavailable(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.HypervisorUnavailable(host=""))
+
+    def test_migrate_live_instance_not_running(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.InstanceNotRunning(instance_id=""))
 
     def test_migrate_live_migration_pre_check_error(self):
         self._test_migrate_live_failed_with_exception(
@@ -481,6 +536,17 @@ class CreateBackupTests(CommonMixin, test.NoDBTestCase):
         self._test_non_existing_instance('createBackup',
                                          body_map=body_map)
 
+    def test_create_backup_with_invalid_createBackup(self):
+        body = {
+            'createBackupup': {
+                'name': 'Backup 1',
+                'backup_type': 'daily',
+                'rotation': 1,
+            },
+        }
+        res = self._make_request(self._make_url('fake'), body)
+        self.assertEqual(400, res.status_int)
+
 
 class ResetStateTests(test.NoDBTestCase):
     def setUp(self):
@@ -521,7 +587,7 @@ class ResetStateTests(test.NoDBTestCase):
                           {"os-resetState": {"state": "active"}})
 
     def _setup_mock(self, expected):
-        instance = instance_obj.Instance()
+        instance = objects.Instance()
         instance.uuid = self.uuid
         instance.vm_state = 'fake'
         instance.task_state = 'fake'

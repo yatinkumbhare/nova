@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Intel Corporation
 # All Rights Reserved.
 #
@@ -14,36 +12,40 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-# @author: Yongli He, Intel Corporation.
 
-""" Example of a PCI alias:
-    pci_alias = '{
-        "name": "QuicAssist",
-        "product_id": "0443",
-        "vendor_id": "8086",
-        "device_type": "ACCEL",
-        }'
+""" Example of a PCI alias::
 
-    Aliases with the same name and the same device_type are OR operation:
-    pci_alias = '{
-        "name": "QuicAssist",
-        "product_id": "0442",
-        "vendor_id": "8086",
-        "device_type": "ACCEL",
-        }'
+        | pci_alias = '{
+        |   "name": "QuicAssist",
+        |   "product_id": "0443",
+        |   "vendor_id": "8086",
+        |   "device_type": "ACCEL",
+        |   }'
+
+    Aliases with the same name and the same device_type are OR operation::
+
+        | pci_alias = '{
+        |   "name": "QuicAssist",
+        |   "product_id": "0442",
+        |   "vendor_id": "8086",
+        |   "device_type": "ACCEL",
+        |   }'
+
     These 2 aliases define a device request meaning: vendor_id is "8086" and
     product id is "0442" or "0443".
+
     """
 
 import copy
+
 import jsonschema
+from oslo.config import cfg
 
 from nova import exception
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.pci import pci_utils
 from nova import utils
-from oslo.config import cfg
 
 pci_alias_opts = [
     cfg.MultiStrOpt('pci_alias',
@@ -161,18 +163,20 @@ def get_pci_requests_from_flavor(flavor):
     optional 'alias_name' is the corresponding alias definition name.
 
     Example:
-    Assume alias configuration is:
-        {'vendor_id':'8086',
-         'device_id':'1502',
-         'name':'alias_1'}
+    Assume alias configuration is::
+
+        |   {'vendor_id':'8086',
+        |    'device_id':'1502',
+        |    'name':'alias_1'}
 
     The flavor extra specs includes: 'pci_passthrough:alias': 'alias_1:2'.
 
-    The returned pci_requests are:
-    pci_requests = [{'count':2,
-                     'specs': [{'vendor_id':'8086',
-                                'device_id':'1502'}],
-                     'alias_name': 'alias_1'}]
+    The returned pci_requests are::
+
+        | pci_requests = [{'count':2,
+        |                'specs': [{'vendor_id':'8086',
+        |                           'device_id':'1502'}],
+        |                'alias_name': 'alias_1'}]
 
     :param flavor: the flavor to be checked
     :returns: a list of pci requests

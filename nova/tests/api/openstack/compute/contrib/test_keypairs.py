@@ -21,7 +21,8 @@ from nova.api.openstack import wsgi
 from nova import db
 from nova import exception
 from nova.openstack.common import jsonutils
-from nova.openstack.common import policy
+from nova.openstack.common import policy as common_policy
+from nova import policy
 from nova import quota
 from nova import test
 from nova.tests.api.openstack import fakes
@@ -99,19 +100,17 @@ class KeypairsTest(test.TestCase):
         self.assertTrue(len(res_dict['keypair']['fingerprint']) > 0)
         self.assertTrue(len(res_dict['keypair']['private_key']) > 0)
 
-    def test_keypair_create_with_empty_name(self):
-        body = {'keypair': {'name': ''}}
+    def _test_keypair_create_bad_request_case(self, body):
         req = webob.Request.blank('/v2/fake/os-keypairs')
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers['Content-Type'] = 'application/json'
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 400)
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(
-            'Keypair data is invalid: '
-            'Keypair name must be between 1 and 255 characters long',
-            res_dict['badRequest']['message'])
+
+    def test_keypair_create_with_empty_name(self):
+        body = {'keypair': {'name': ''}}
+        self._test_keypair_create_bad_request_case(body)
 
     def test_keypair_create_with_name_too_long(self):
         body = {
@@ -119,17 +118,7 @@ class KeypairsTest(test.TestCase):
                 'name': 'a' * 256
             }
         }
-        req = webob.Request.blank('/v2/fake/os-keypairs')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers['Content-Type'] = 'application/json'
-        res = req.get_response(self.app)
-        self.assertEqual(res.status_int, 400)
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(
-            'Keypair data is invalid: '
-            'Keypair name must be between 1 and 255 characters long',
-            res_dict['badRequest']['message'])
+        self._test_keypair_create_bad_request_case(body)
 
     def test_keypair_create_with_non_alphanumeric_name(self):
         body = {
@@ -137,18 +126,20 @@ class KeypairsTest(test.TestCase):
                 'name': 'test/keypair'
             }
         }
-        req = webob.Request.blank('/v2/fake/os-keypairs')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers['Content-Type'] = 'application/json'
-        res = req.get_response(self.app)
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(res.status_int, 400)
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(
-            "Keypair data is invalid: "
-            "Keypair name contains unsafe characters",
-            res_dict['badRequest']['message'])
+        self._test_keypair_create_bad_request_case(body)
+
+    def test_keypair_import_bad_key(self):
+        body = {
+            'keypair': {
+                'name': 'create_test',
+                'public_key': 'ssh-what negative',
+            },
+        }
+        self._test_keypair_create_bad_request_case(body)
+
+    def test_keypair_create_with_invalid_keypair_body(self):
+        body = {'alpha': {'name': 'create_test'}}
+        self._test_keypair_create_bad_request_case(body)
 
     def test_keypair_import(self):
         body = {
@@ -248,26 +239,6 @@ class KeypairsTest(test.TestCase):
             "Key pair 'create_duplicate' already exists.",
             res_dict['conflictingRequest']['message'])
 
-    def test_keypair_import_bad_key(self):
-        body = {
-            'keypair': {
-                'name': 'create_test',
-                'public_key': 'ssh-what negative',
-            },
-        }
-
-        req = webob.Request.blank('/v2/fake/os-keypairs')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers['Content-Type'] = 'application/json'
-        res = req.get_response(self.app)
-        self.assertEqual(res.status_int, 400)
-
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(
-            'Keypair data is invalid: failed to generate fingerprint',
-            res_dict['badRequest']['message'])
-
     def test_keypair_delete(self):
         req = webob.Request.blank('/v2/fake/os-keypairs/FAKE')
         req.method = 'DELETE'
@@ -347,18 +318,6 @@ class KeypairsTest(test.TestCase):
             self.assertIn('key_name', server_dict)
             self.assertEqual(server_dict['key_name'], '')
 
-    def test_keypair_create_with_invalid_keypair_body(self):
-        body = {'alpha': {'name': 'create_test'}}
-        req = webob.Request.blank('/v1.1/fake/os-keypairs')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers['Content-Type'] = 'application/json'
-        res = req.get_response(self.app)
-        res_dict = jsonutils.loads(res.body)
-        self.assertEqual(res.status_int, 400)
-        self.assertEqual(res_dict['badRequest']['message'],
-                         "Invalid request body")
-
 
 class KeypairPolicyTest(test.TestCase):
 
@@ -380,53 +339,53 @@ class KeypairPolicyTest(test.TestCase):
                        db_key_pair_destroy)
 
     def test_keypair_list_fail_policy(self):
-        rules = policy.Rules({'compute_extension:keypairs:index':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:keypairs:index':
+                     common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs')
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.index,
                           req)
 
     def test_keypair_list_pass_policy(self):
-        rules = policy.Rules({'compute_extension:keypairs:index':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:keypairs:index':
+                     common_policy.parse_rule('')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs')
         res = self.KeyPairController.index(req)
         self.assertIn('keypairs', res)
 
     def test_keypair_show_fail_policy(self):
-        rules = policy.Rules({'compute_extension:keypairs:show':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:keypairs:show':
+                     common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs/FAKE')
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.show,
                           req, 'FAKE')
 
     def test_keypair_show_pass_policy(self):
-        rules = policy.Rules({'compute_extension:keypairs:show':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:keypairs:show':
+                     common_policy.parse_rule('')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs/FAKE')
         res = self.KeyPairController.show(req, 'FAKE')
         self.assertIn('keypair', res)
 
     def test_keypair_create_fail_policy(self):
-        rules = policy.Rules({'compute_extension:keypairs:create':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:keypairs:create':
+                     common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs')
         req.method = 'POST'
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.create,
                           req, {})
 
     def test_keypair_create_pass_policy(self):
         body = {'keypair': {'name': 'create_test'}}
-        rules = policy.Rules({'compute_extension:keypairs:create':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:keypairs:create':
+                     common_policy.parse_rule('')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs')
         req.method = 'POST'
@@ -434,18 +393,18 @@ class KeypairPolicyTest(test.TestCase):
         self.assertIn('keypair', res)
 
     def test_keypair_delete_fail_policy(self):
-        rules = policy.Rules({'compute_extension:keypairs:delete':
-                             policy.parse_rule('role:admin')})
+        rules = {'compute_extension:keypairs:delete':
+                     common_policy.parse_rule('role:admin')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs/FAKE')
         req.method = 'DELETE'
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.Forbidden,
                           self.KeyPairController.delete,
                           req, 'FAKE')
 
     def test_keypair_delete_pass_policy(self):
-        rules = policy.Rules({'compute_extension:keypairs:delete':
-                             policy.parse_rule('')})
+        rules = {'compute_extension:keypairs:delete':
+                     common_policy.parse_rule('')}
         policy.set_rules(rules)
         req = fakes.HTTPRequest.blank('/v2/fake/os-keypairs/FAKE')
         req.method = 'DELETE'

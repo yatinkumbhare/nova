@@ -14,8 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import urllib
+
+from lxml import etree
 import webob
 
 from nova.api.openstack.compute.contrib import floating_ip_dns
@@ -41,8 +42,7 @@ floating_ip_id = '1'
 
 
 def _quote_domain(domain):
-    """
-    Domain names tend to have .'s in them.  Urllib doesn't quote dots,
+    """Domain names tend to have .'s in them.  Urllib doesn't quote dots,
     but Routes tends to choke on them, so we need an extra level of
     by-hand quoting here.  This function needs to duplicate the one in
     python-novaclient/novaclient/v1_1/floating_ip_dns.py

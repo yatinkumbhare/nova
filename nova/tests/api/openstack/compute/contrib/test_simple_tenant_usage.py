@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -18,13 +16,16 @@
 import datetime
 
 from lxml import etree
+import mock
 import webob
 
 from nova.api.openstack.compute.contrib import simple_tenant_usage
-from nova.compute import api
 from nova.compute import flavors
+from nova.compute import vm_states
 from nova import context
+from nova import db
 from nova import exception
+from nova import objects
 from nova.openstack.common import jsonutils
 from nova.openstack.common import policy as common_policy
 from nova.openstack.common import timeutils
@@ -54,27 +55,44 @@ FAKE_INST_TYPE = {'id': 1,
                   'flavorid': 'foo',
                   'rxtx_factor': 1.0,
                   'vcpu_weight': 1,
-                  'swap': 0}
+                  'swap': 0,
+                  'created_at': None,
+                  'updated_at': None,
+                  'deleted_at': None,
+                  'deleted': 0,
+                  'disabled': False,
+                  'is_public': True,
+                  'extra_specs': {'foo': 'bar'}}
 
 
-def get_fake_db_instance(start, end, instance_id, tenant_id):
+def get_fake_db_instance(start, end, instance_id, tenant_id,
+                         vm_state=vm_states.ACTIVE):
     sys_meta = utils.dict_to_metadata(
         flavors.save_flavor_info({}, FAKE_INST_TYPE))
-    return {'id': instance_id,
-            'uuid': '00000000-0000-0000-0000-00000000000000%02d' % instance_id,
-            'image_ref': '1',
-            'project_id': tenant_id,
-            'user_id': 'fakeuser',
-            'display_name': 'name',
-            'state_description': 'state',
-            'instance_type_id': 1,
-            'launched_at': start,
-            'terminated_at': end,
-            'system_metadata': sys_meta}
+    # NOTE(mriedem): We use fakes.stub_instance since it sets the fields
+    # needed on the db instance for converting it to an object, but we still
+    # need to override system_metadata to use our fake flavor.
+    inst = fakes.stub_instance(
+            id=instance_id,
+            uuid='00000000-0000-0000-0000-00000000000000%02d' % instance_id,
+            image_ref='1',
+            project_id=tenant_id,
+            user_id='fakeuser',
+            display_name='name',
+            flavor_id=FAKE_INST_TYPE['id'],
+            launched_at=start,
+            terminated_at=end,
+            vm_state=vm_state,
+            memory_mb=MEMORY_MB,
+            vcpus=VCPUS,
+            root_gb=ROOT_GB,
+            ephemeral_gb=EPHEMERAL_GB,)
+    inst['system_metadata'] = sys_meta
+    return inst
 
 
-def fake_instance_get_active_by_window_joined(self, context, begin, end,
-        project_id):
+def fake_instance_get_active_by_window_joined(context, begin, end,
+        project_id, host):
             return [get_fake_db_instance(START,
                                          STOP,
                                          x,
@@ -82,11 +100,11 @@ def fake_instance_get_active_by_window_joined(self, context, begin, end,
                                          for x in xrange(TENANTS * SERVERS)]
 
 
+@mock.patch.object(db, 'instance_get_active_by_window_joined',
+                   fake_instance_get_active_by_window_joined)
 class SimpleTenantUsageTest(test.TestCase):
     def setUp(self):
         super(SimpleTenantUsageTest, self).setUp()
-        self.stubs.Set(api.API, "get_active_by_window",
-                       fake_instance_get_active_by_window_joined)
         self.admin_context = context.RequestContext('fakeadmin_0',
                                                     'faketenant_0',
                                                     is_admin=True)
@@ -214,7 +232,7 @@ class SimpleTenantUsageTest(test.TestCase):
                     ["role:admin"], ["project_id:%(project_id)s"]
                     ])
         }
-        common_policy.set_rules(common_policy.Rules(rules))
+        policy.set_rules(rules)
 
         try:
             res = req.get_response(fakes.wsgi_app(
@@ -238,6 +256,39 @@ class SimpleTenantUsageTest(test.TestCase):
                                fake_auth_context=self.user_context,
                                init_only=('os-simple-tenant-usage',)))
         self.assertEqual(res.status_int, 400)
+
+    def test_get_tenants_usage_with_invalid_start_date(self):
+        tenant_id = 0
+        req = webob.Request.blank(
+                  '/v2/faketenant_0/os-simple-tenant-usage/'
+                  'faketenant_%s?start=%s&end=%s' %
+                  (tenant_id, "xxxx", NOW.isoformat()))
+        req.method = "GET"
+        req.headers["content-type"] = "application/json"
+
+        res = req.get_response(fakes.wsgi_app(
+                               fake_auth_context=self.user_context,
+                               init_only=('os-simple-tenant-usage',)))
+        self.assertEqual(res.status_int, 400)
+
+    def _test_get_tenants_usage_with_one_date(self, date_url_param):
+        req = webob.Request.blank(
+                  '/v2/faketenant_0/os-simple-tenant-usage/'
+                  'faketenant_0?%s' % date_url_param)
+        req.method = "GET"
+        req.headers["content-type"] = "application/json"
+        res = req.get_response(fakes.wsgi_app(
+                               fake_auth_context=self.user_context,
+                               init_only=('os-simple-tenant-usage',)))
+        self.assertEqual(200, res.status_int)
+
+    def test_get_tenants_usage_with_no_start_date(self):
+        self._test_get_tenants_usage_with_one_date(
+            'end=%s' % (NOW + datetime.timedelta(5)).isoformat())
+
+    def test_get_tenants_usage_with_no_end_date(self):
+        self._test_get_tenants_usage_with_one_date(
+            'start=%s' % (NOW - datetime.timedelta(5)).isoformat())
 
 
 class SimpleTenantUsageSerializerTest(test.TestCase):
@@ -412,59 +463,63 @@ class SimpleTenantUsageControllerTest(test.TestCase):
         super(SimpleTenantUsageControllerTest, self).setUp()
         self.controller = simple_tenant_usage.SimpleTenantUsageController()
 
-        class FakeComputeAPI:
-            def get_instance_type(self, context, flavor_type):
-                if flavor_type == 1:
-                    return flavors.get_default_flavor()
-                else:
-                    raise exception.FlavorNotFound(flavor_id=flavor_type)
+        self.context = context.RequestContext('fakeuser', 'fake-project')
 
-        self.compute_api = FakeComputeAPI()
-        self.context = None
-
-        now = timeutils.utcnow()
-        self.baseinst = dict(display_name='foo',
-                             launched_at=now - datetime.timedelta(1),
-                             terminated_at=now,
-                             instance_type_id=1,
-                             vm_state='deleted',
-                             deleted=0)
-        basetype = flavors.get_default_flavor()
-        sys_meta = utils.dict_to_metadata(
-            flavors.save_flavor_info({}, basetype))
-        self.baseinst['system_metadata'] = sys_meta
-        self.basetype = flavors.extract_flavor(self.baseinst)
+        self.baseinst = get_fake_db_instance(START, STOP, instance_id=1,
+                                             tenant_id=self.context.project_id,
+                                             vm_state=vm_states.DELETED)
+        # convert the fake instance dict to an object
+        self.inst_obj = objects.Instance._from_db_object(
+            self.context, objects.Instance(), self.baseinst)
 
     def test_get_flavor_from_sys_meta(self):
         # Non-deleted instances get their type information from their
         # system_metadata
-        flavor = self.controller._get_flavor(self.context, self.compute_api,
-                                             self.baseinst, {})
-        self.assertEqual(flavor, self.basetype)
+        with mock.patch.object(db, 'instance_get_by_uuid',
+                               return_value=self.baseinst):
+            flavor = self.controller._get_flavor(self.context,
+                                                 self.inst_obj, {})
+        self.assertEqual(objects.Flavor, type(flavor))
+        self.assertEqual(FAKE_INST_TYPE['id'], flavor.id)
 
     def test_get_flavor_from_non_deleted_with_id_fails(self):
         # If an instance is not deleted and missing type information from
         # system_metadata, then that's a bug
-        inst_without_sys_meta = dict(self.baseinst, system_metadata=[])
+        self.inst_obj.system_metadata = {}
         self.assertRaises(KeyError,
                           self.controller._get_flavor, self.context,
-                          self.compute_api, inst_without_sys_meta, {})
+                          self.inst_obj, {})
 
     def test_get_flavor_from_deleted_with_id(self):
         # Deleted instances may not have type info in system_metadata,
         # so verify that they get their type from a lookup of their
         # instance_type_id
-        inst_without_sys_meta = dict(self.baseinst, system_metadata=[],
-                                     deleted=1)
-        flavor = self.controller._get_flavor(self.context, self.compute_api,
-                                             inst_without_sys_meta, {})
-        self.assertEqual(flavor, flavors.get_default_flavor())
+        self.inst_obj.system_metadata = {}
+        self.inst_obj.deleted = 1
+        flavor = self.controller._get_flavor(self.context, self.inst_obj, {})
+        self.assertEqual(objects.Flavor, type(flavor))
+        self.assertEqual(FAKE_INST_TYPE['id'], flavor.id)
 
     def test_get_flavor_from_deleted_with_id_of_deleted(self):
         # Verify the legacy behavior of instance_type_id pointing to a
         # missing type being non-fatal
-        inst_without_sys_meta = dict(self.baseinst, system_metadata=[],
-                                     deleted=1, instance_type_id=2)
-        flavor = self.controller._get_flavor(self.context, self.compute_api,
-                                             inst_without_sys_meta, {})
+        self.inst_obj.system_metadata = {}
+        self.inst_obj.deleted = 1
+        self.inst_obj.instance_type_id = 99
+        flavor = self.controller._get_flavor(self.context, self.inst_obj, {})
         self.assertIsNone(flavor)
+
+
+class SimpleTenantUsageUtils(test.NoDBTestCase):
+    def test_valid_string(self):
+        dt = simple_tenant_usage.parse_strtime("2014-02-21T13:47:20.824060",
+                                               "%Y-%m-%dT%H:%M:%S.%f")
+        self.assertEqual(datetime.datetime(
+                microsecond=824060, second=20, minute=47, hour=13,
+                day=21, month=2, year=2014), dt)
+
+    def test_invalid_string(self):
+        self.assertRaises(exception.InvalidStrTime,
+                          simple_tenant_usage.parse_strtime,
+                          "2014-02-21 13:47:20.824060",
+                          "%Y-%m-%dT%H:%M:%S.%f")

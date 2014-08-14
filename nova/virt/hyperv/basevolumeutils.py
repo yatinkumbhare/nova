@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 #
 # Copyright 2012 Pedro Navarro Perez
 # Copyright 2013 Cloudbase Solutions Srl
@@ -29,7 +28,7 @@ if sys.platform == 'win32':
     import wmi
 
 from nova import block_device
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.virt import driver
 
@@ -71,8 +70,9 @@ class BaseVolumeUtils(object):
         except Exception:
             LOG.info(_("The ISCSI initiator name can't be found. "
                        "Choosing the default one"))
-            computer_system = self._conn_cimv2.Win32_ComputerSystem()[0]
             initiator_name = "iqn.1991-05.com.microsoft:" + hostname.lower()
+            if computer_system.PartofDomain:
+                initiator_name += '.' + computer_system.Domain.lower()
         return initiator_name
 
     def volume_in_mapping(self, mount_device, block_device_info):
@@ -89,7 +89,7 @@ class BaseVolumeUtils(object):
             for ephemeral in
             driver.block_device_info_get_ephemerals(block_device_info)]
 
-        LOG.debug(_("block_device_list %s"), block_device_list)
+        LOG.debug("block_device_list %s", block_device_list)
         return block_device.strip_dev(mount_device) in block_device_list
 
     def _get_drive_number_from_disk_path(self, disk_path):
@@ -127,6 +127,10 @@ class BaseVolumeUtils(object):
             return None
 
         devices = initiator_sessions[0].Devices
+
+        if not devices:
+            return None
+
         for device in devices:
             if device.ScsiLun == target_lun:
                 return device.DeviceNumber

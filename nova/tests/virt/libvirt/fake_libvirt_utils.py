@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright (c) 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -92,6 +90,10 @@ def create_cow_image(backing_file, path):
     pass
 
 
+def get_disk_size(path):
+    return 0
+
+
 def get_disk_backing_file(path):
     return disk_backing_files.get(path, None)
 
@@ -109,10 +111,6 @@ def resize2fs(path):
 
 
 def create_lvm_image(vg, lv, size, sparse=False):
-    pass
-
-
-def import_rbd_image(path, *args):
     pass
 
 
@@ -196,13 +194,5 @@ def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
     return "qemu"
 
 
-def list_rbd_volumes(pool):
-    fake_volumes = ['875a8070-d0b9-4949-8b31-104d125c9a64.local',
-                    '875a8070-d0b9-4949-8b31-104d125c9a64.swap',
-                    '875a8070-d0b9-4949-8b31-104d125c9a64',
-                    'wrong875a8070-d0b9-4949-8b31-104d125c9a64']
-    return fake_volumes
-
-
-def remove_rbd_volumes(pool, *names):
+def get_arch(image_meta):
     pass

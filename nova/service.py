@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Justin Santa Barbara
@@ -24,15 +22,20 @@ import random
 import sys
 
 from oslo.config import cfg
+from oslo import messaging
 
+from nova import baserpc
 from nova import conductor
 from nova import context
+from nova import debugger
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
+from nova.objects import base as objects_base
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
-from nova.openstack.common import rpc
+from nova.openstack.common import processutils
 from nova.openstack.common import service
+from nova import rpc
 from nova import servicegroup
 from nova import utils
 from nova import version
@@ -43,21 +46,21 @@ LOG = logging.getLogger(__name__)
 service_opts = [
     cfg.IntOpt('report_interval',
                default=10,
-               help='seconds between nodes reporting state to datastore'),
+               help='Seconds between nodes reporting state to datastore'),
     cfg.BoolOpt('periodic_enable',
                default=True,
-               help='enable periodic tasks'),
+               help='Enable periodic tasks'),
     cfg.IntOpt('periodic_fuzzy_delay',
                default=60,
-               help='range of seconds to randomly delay when starting the'
+               help='Range of seconds to randomly delay when starting the'
                     ' periodic task scheduler to reduce stampeding.'
                     ' (Disable by setting to 0)'),
     cfg.ListOpt('enabled_apis',
                 default=['ec2', 'osapi_compute', 'metadata'],
-                help='a list of APIs to enable by default'),
+                help='A list of APIs to enable by default'),
     cfg.ListOpt('enabled_ssl_apis',
                 default=[],
-                help='a list of APIs with enabled SSL'),
+                help='A list of APIs with enabled SSL'),
     cfg.StrOpt('ec2_listen',
                default="0.0.0.0",
                help='The IP address on which the EC2 API will listen.'),
@@ -65,7 +68,8 @@ service_opts = [
                default=8773,
                help='The port on which the EC2 API will listen.'),
     cfg.IntOpt('ec2_workers',
-               help='Number of workers for EC2 API service'),
+               help='Number of workers for EC2 API service. The default will '
+                    'be equal to the number of CPUs available.'),
     cfg.StrOpt('osapi_compute_listen',
                default="0.0.0.0",
                help='The IP address on which the OpenStack API will listen.'),
@@ -73,7 +77,8 @@ service_opts = [
                default=8774,
                help='The port on which the OpenStack API will listen.'),
     cfg.IntOpt('osapi_compute_workers',
-               help='Number of workers for OpenStack API service'),
+               help='Number of workers for OpenStack API service. The default '
+                    'will be the number of CPUs available.'),
     cfg.StrOpt('metadata_manager',
                default='nova.api.manager.MetadataManager',
                help='OpenStack metadata service manager'),
@@ -84,25 +89,29 @@ service_opts = [
                default=8775,
                help='The port on which the metadata API will listen.'),
     cfg.IntOpt('metadata_workers',
-               help='Number of workers for metadata service'),
+               help='Number of workers for metadata service. The default will '
+                    'be the number of CPUs available.'),
     cfg.StrOpt('compute_manager',
                default='nova.compute.manager.ComputeManager',
-               help='full class name for the Manager for compute'),
+               help='Full class name for the Manager for compute'),
     cfg.StrOpt('console_manager',
                default='nova.console.manager.ConsoleProxyManager',
-               help='full class name for the Manager for console proxy'),
+               help='Full class name for the Manager for console proxy'),
+    cfg.StrOpt('consoleauth_manager',
+               default='nova.consoleauth.manager.ConsoleAuthManager',
+               help='Manager for console auth'),
     cfg.StrOpt('cert_manager',
                default='nova.cert.manager.CertManager',
-               help='full class name for the Manager for cert'),
+               help='Full class name for the Manager for cert'),
     cfg.StrOpt('network_manager',
                default='nova.network.manager.VlanManager',
-               help='full class name for the Manager for network'),
+               help='Full class name for the Manager for network'),
     cfg.StrOpt('scheduler_manager',
                default='nova.scheduler.manager.SchedulerManager',
-               help='full class name for the Manager for scheduler'),
+               help='Full class name for the Manager for scheduler'),
     cfg.IntOpt('service_down_time',
                default=60,
-               help='maximum time since last check-in for up service'),
+               help='Maximum time since last check-in for up service'),
     ]
 
 CONF = cfg.CONF
@@ -137,6 +146,7 @@ class Service(service.Service):
         self.servicegroup_api = servicegroup.API(db_allowed=db_allowed)
         manager_class = importutils.import_class(self.manager_class_name)
         self.manager = manager_class(host=self.host, *args, **kwargs)
+        self.rpcserver = None
         self.report_interval = report_interval
         self.periodic_enable = periodic_enable
         self.periodic_fuzzy_delay = periodic_fuzzy_delay
@@ -159,34 +169,39 @@ class Service(service.Service):
                     self.host, self.binary)
             self.service_id = self.service_ref['id']
         except exception.NotFound:
-            self.service_ref = self._create_service_ref(ctxt)
+            try:
+                self.service_ref = self._create_service_ref(ctxt)
+            except (exception.ServiceTopicExists,
+                    exception.ServiceBinaryExists):
+                # NOTE(danms): If we race to create a record with a sibling
+                # worker, don't fail here.
+                self.service_ref = self.conductor_api.service_get_by_args(ctxt,
+                    self.host, self.binary)
 
         self.manager.pre_start_hook()
 
         if self.backdoor_port is not None:
             self.manager.backdoor_port = self.backdoor_port
 
-        self.conn = rpc.create_connection(new=True)
-        LOG.debug(_("Creating Consumer connection for Service %s") %
-                  self.topic)
+        LOG.debug("Creating RPC server for service %s", self.topic)
 
-        rpc_dispatcher = self.manager.create_rpc_dispatcher(self.backdoor_port)
+        target = messaging.Target(topic=self.topic, server=self.host)
 
-        # Share this same connection for these Consumers
-        self.conn.create_consumer(self.topic, rpc_dispatcher, fanout=False)
+        endpoints = [
+            self.manager,
+            baserpc.BaseRPCAPI(self.manager.service_name, self.backdoor_port)
+        ]
+        endpoints.extend(self.manager.additional_endpoints)
 
-        node_topic = '%s.%s' % (self.topic, self.host)
-        self.conn.create_consumer(node_topic, rpc_dispatcher, fanout=False)
+        serializer = objects_base.NovaObjectSerializer()
 
-        self.conn.create_consumer(self.topic, rpc_dispatcher, fanout=True)
-
-        # Consume from all consumers in a thread
-        self.conn.consume_in_thread()
+        self.rpcserver = rpc.get_server(target, endpoints, serializer)
+        self.rpcserver.start()
 
         self.manager.post_start_hook()
 
-        LOG.debug(_("Join ServiceGroup membership for this service %s")
-                  % self.topic)
+        LOG.debug("Join ServiceGroup membership for this service %s",
+                  self.topic)
         # Add service to the ServiceGroup membership group.
         self.servicegroup_api.join(self.host, self.topic, self)
 
@@ -249,6 +264,9 @@ class Service(service.Service):
             periodic_enable = CONF.periodic_enable
         if periodic_fuzzy_delay is None:
             periodic_fuzzy_delay = CONF.periodic_fuzzy_delay
+
+        debugger.init()
+
         service_obj = cls(host, binary, topic, manager,
                           report_interval=report_interval,
                           periodic_enable=periodic_enable,
@@ -269,8 +287,15 @@ class Service(service.Service):
 
     def stop(self):
         try:
-            self.conn.close()
+            self.rpcserver.stop()
+            self.rpcserver.wait()
         except Exception:
+            pass
+
+        try:
+            self.manager.cleanup_host()
+        except Exception:
+            LOG.exception(_('Service error occurred during cleanup_host'))
             pass
 
         super(Service, self).stop()
@@ -308,7 +333,15 @@ class WSGIService(object):
         self.app = self.loader.load_app(name)
         self.host = getattr(CONF, '%s_listen' % name, "0.0.0.0")
         self.port = getattr(CONF, '%s_listen_port' % name, 0)
-        self.workers = getattr(CONF, '%s_workers' % name, None)
+        self.workers = (getattr(CONF, '%s_workers' % name, None) or
+                        processutils.get_worker_count())
+        if self.workers and self.workers < 1:
+            worker_name = '%s_workers' % name
+            msg = (_("%(worker_name)s value of %(workers)s is invalid, "
+                     "must be greater than 0") %
+                   {'worker_name': worker_name,
+                    'workers': str(self.workers)})
+            raise exception.InvalidInput(msg)
         self.use_ssl = use_ssl
         self.server = wsgi.Server(name,
                                   self.app,
@@ -319,6 +352,14 @@ class WSGIService(object):
         # Pull back actual port used
         self.port = self.server.port
         self.backdoor_port = None
+
+    def reset(self):
+        """Reset server greenpool size to default.
+
+        :returns: None
+
+        """
+        self.server.reset()
 
     def _get_manager(self):
         """Initialize a Manager object appropriate for this service.

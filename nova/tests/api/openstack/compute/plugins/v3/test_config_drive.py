@@ -14,7 +14,6 @@
 #    under the License.
 
 import datetime
-from lxml import etree
 import uuid
 
 from oslo.config import cfg
@@ -26,9 +25,9 @@ from nova.api.openstack.compute.plugins.v3 import servers
 from nova.compute import api as compute_api
 from nova.compute import flavors
 from nova import db
+from nova import exception
 from nova.network import manager
 from nova.openstack.common import jsonutils
-from nova.openstack.common import rpc
 from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests import fake_instance
@@ -37,7 +36,6 @@ from nova.tests.image import fake
 
 CONF = cfg.CONF
 FAKE_UUID = fakes.FAKE_UUID
-CONFIG_DRIVE_XML_KEY = '{%s}config_drive' % config_drive.ConfigDrive.namespace
 
 
 def fake_gen_uuid():
@@ -171,10 +169,8 @@ class ServersControllerCreateTest(test.TestCase):
                 fake_method)
         self.stubs.Set(db, 'instance_get', instance_get)
         self.stubs.Set(db, 'instance_update', instance_update)
-        self.stubs.Set(rpc, 'cast', fake_method)
         self.stubs.Set(db, 'instance_update_and_get_original',
                 server_update)
-        self.stubs.Set(rpc, 'queue_get_for', queue_get_for)
         self.stubs.Set(manager.VlanManager, 'allocate_fixed_ip',
                        fake_method)
 
@@ -191,9 +187,9 @@ class ServersControllerCreateTest(test.TestCase):
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
         if override_controller:
-            server = override_controller.create(req, body).obj['server']
+            server = override_controller.create(req, body=body).obj['server']
         else:
-            server = self.controller.create(req, body).obj['server']
+            server = self.controller.create(req, body=body).obj['server']
 
     def test_create_instance_with_config_drive_disabled(self):
         params = {config_drive.ATTRIBUTE_NAME: "False"}
@@ -207,7 +203,7 @@ class ServersControllerCreateTest(test.TestCase):
         self._test_create_extra(params,
             override_controller=self.no_config_drive_controller)
 
-    def test_create_instance_with_config_drive(self):
+    def _create_instance_body_of_config_drive(self, param):
         def create(*args, **kwargs):
             self.assertIn('config_drive', kwargs)
             return old_create(*args, **kwargs)
@@ -225,7 +221,7 @@ class ServersControllerCreateTest(test.TestCase):
                     'hello': 'world',
                     'open': 'stack',
                 },
-                config_drive.ATTRIBUTE_NAME: "true",
+                config_drive.ATTRIBUTE_NAME: param,
             },
         }
 
@@ -233,112 +229,39 @@ class ServersControllerCreateTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body).obj
 
+        return req, body
+
+    def test_create_instance_with_config_drive(self):
+        param = True
+        req, body = self._create_instance_body_of_config_drive(param)
+        res = self.controller.create(req, body=body).obj
+        server = res['server']
+        self.assertEqual(FAKE_UUID, server['id'])
+
+    def test_create_instance_with_config_drive_as_boolean_string(self):
+        param = 'false'
+        req, body = self._create_instance_body_of_config_drive(param)
+        res = self.controller.create(req, body=body).obj
         server = res['server']
         self.assertEqual(FAKE_UUID, server['id'])
 
     def test_create_instance_with_bad_config_drive(self):
-        image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-        flavor_ref = 'http://localhost/v3/flavors/3'
-        body = {
-            'server': {
-                'name': 'config_drive_test',
-                'image_ref': image_href,
-                'flavor_ref': flavor_ref,
-                'metadata': {
-                    'hello': 'world',
-                    'open': 'stack',
-                },
-                config_drive.ATTRIBUTE_NAME: image_href,
-            },
-        }
-
-        req = fakes.HTTPRequestV3.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
-
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, req, body)
+        param = 12345
+        req, body = self._create_instance_body_of_config_drive(param)
+        self.assertRaises(exception.ValidationError,
+                          self.controller.create, req, body=body)
 
     def test_create_instance_without_config_drive(self):
-        image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
-        flavor_ref = 'http://localhost/v3/flavors/3'
-        body = {
-            'server': {
-                'name': 'config_drive_test',
-                'image_ref': image_href,
-                'flavor_ref': flavor_ref,
-                'metadata': {
-                    'hello': 'world',
-                    'open': 'stack',
-                },
-            },
-        }
-
-        req = fakes.HTTPRequestV3.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body).obj
-
+        param = True
+        req, body = self._create_instance_body_of_config_drive(param)
+        del body['server'][config_drive.ATTRIBUTE_NAME]
+        res = self.controller.create(req, body=body).obj
         server = res['server']
         self.assertEqual(FAKE_UUID, server['id'])
 
-
-class TestServerCreateRequestXMLDeserializer(test.TestCase):
-
-    def setUp(self):
-        super(TestServerCreateRequestXMLDeserializer, self).setUp()
-        ext_info = plugins.LoadedExtensionInfo()
-        controller = servers.ServersController(extension_info=ext_info)
-        self.deserializer = servers.CreateDeserializer(controller)
-
-    def test_request_with_config_drive(self):
-        serial_request = """
-    <server xmlns="http://docs.openstack.org/compute/api/v2"
-        xmlns:%(alias)s="%(namespace)s"
-        name="config_drive_test"
-        image_ref="1"
-        flavor_ref="1"
-        %(alias)s:config_drive="true"/>""" % {
-            "alias": config_drive.ALIAS,
-            "namespace": config_drive.ConfigDrive.namespace}
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "server": {
-                "name": "config_drive_test",
-                "image_ref": "1",
-                "flavor_ref": "1",
-                config_drive.ATTRIBUTE_NAME: "true"
-            },
-        }
-        self.assertEqual(request['body'], expected)
-
-
-class ConfigDriveXmlSerializerTest(test.TestCase):
-
-    def test_server_config_drive(self):
-        fake_server = {"server": {"id": 'fake',
-                                  config_drive.ATTRIBUTE_NAME: 'true'}}
-        serializer = servers.ServerTemplate()
-        serializer.attach(config_drive.ServerConfigDriveTemplate())
-        output = serializer.serialize(fake_server)
-        root = etree.XML(output)
-        self.assertEqual(root.get(CONFIG_DRIVE_XML_KEY), 'true')
-
-    def test_servers_config_drives(self):
-        fake_server = {"servers": [{"id": 'fake1',
-                                    config_drive.ATTRIBUTE_NAME: 'true'},
-                                   {"id": 'fake2',
-                                    config_drive.ATTRIBUTE_NAME: 'false'}]}
-        serializer = servers.ServersTemplate()
-        serializer.attach(config_drive.ServersConfigDriveTemplate())
-        output = serializer.serialize(fake_server)
-        root = etree.XML(output)
-        server_nodes = root.getchildren()
-        self.assertEqual('fake1', server_nodes[0].get('id'))
-        self.assertEqual('true', server_nodes[0].get(CONFIG_DRIVE_XML_KEY))
-        self.assertEqual('fake2', server_nodes[1].get('id'))
-        self.assertEqual('false', server_nodes[1].get(CONFIG_DRIVE_XML_KEY))
+    def test_create_instance_with_empty_config_drive(self):
+        param = ''
+        req, body = self._create_instance_body_of_config_drive(param)
+        self.assertRaises(exception.ValidationError,
+                          self.controller.create, req, body=body)

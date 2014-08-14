@@ -26,7 +26,7 @@ from nova.compute import task_states
 from nova.compute import vm_states
 from nova import db
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
@@ -49,7 +49,9 @@ host_manager_opts = [
                   'RamFilter',
                   'ComputeFilter',
                   'ComputeCapabilitiesFilter',
-                  'ImagePropertiesFilter'
+                  'ImagePropertiesFilter',
+                  'ServerGroupAntiAffinityFilter',
+                  'ServerGroupAffinityFilter',
                   ],
                 help='Which filter class names to use for filtering hosts '
                       'when not specified in the request.'),
@@ -107,13 +109,13 @@ class HostState(object):
     previously used and lock down access.
     """
 
-    def __init__(self, host, node, capabilities=None, service=None):
+    def __init__(self, host, node, compute=None):
         self.host = host
         self.nodename = node
-        self.update_capabilities(capabilities, service)
 
         # Mutable available resources.
         # These will change as resources are virtually "consumed".
+        self.total_usable_ram_mb = 0
         self.total_usable_disk_gb = 0
         self.disk_mb_used = 0
         self.free_ram_mb = 0
@@ -122,11 +124,7 @@ class HostState(object):
         self.vcpus_used = 0
 
         # Additional host information from the compute node stats:
-        self.vm_states = {}
-        self.task_states = {}
         self.num_instances = 0
-        self.num_instances_by_project = {}
-        self.num_instances_by_os_type = {}
         self.num_io_ops = 0
 
         # Other information
@@ -144,21 +142,16 @@ class HostState(object):
         self.metrics = {}
 
         self.updated = None
+        if compute:
+            self.update_from_compute_node(compute)
 
-    def update_capabilities(self, capabilities=None, service=None):
-        # Read-only capability dicts
-
-        if capabilities is None:
-            capabilities = {}
-        self.capabilities = ReadOnlyDict(capabilities)
-        if service is None:
-            service = {}
+    def update_service(self, service):
         self.service = ReadOnlyDict(service)
 
     def _update_metrics_from_compute_node(self, compute):
-        #NOTE(llu): The 'or []' is to avoid json decode failure of None
-        #           returned from compute.get, because DB schema allows
-        #           NULL in the metrics column
+        # NOTE(llu): The 'or []' is to avoid json decode failure of None
+        #            returned from compute.get, because DB schema allows
+        #            NULL in the metrics column
         metrics = compute.get('metrics', []) or []
         if metrics:
             metrics = jsonutils.loads(metrics)
@@ -183,13 +176,20 @@ class HostState(object):
         all_ram_mb = compute['memory_mb']
 
         # Assume virtual size is all consumed by instances if use qcow2 disk.
-        least = compute.get('disk_available_least')
-        free_disk_mb = least if least is not None else compute['free_disk_gb']
-        free_disk_mb *= 1024
+        free_gb = compute['free_disk_gb']
+        least_gb = compute.get('disk_available_least')
+        if least_gb is not None:
+            if least_gb > free_gb:
+                # can occur when an instance in database is not on host
+                LOG.warn(_("Host has more disk space than database expected"
+                           " (%(physical)sgb > %(database)sgb)") %
+                         {'physical': least_gb, 'database': free_gb})
+            free_gb = min(least_gb, free_gb)
+        free_disk_mb = free_gb * 1024
 
         self.disk_mb_used = compute['local_gb_used'] * 1024
 
-        #NOTE(jogo) free_ram_mb can be negative
+        # NOTE(jogo) free_ram_mb can be negative
         self.free_ram_mb = compute['free_ram_mb']
         self.total_usable_ram_mb = all_ram_mb
         self.total_usable_disk_gb = compute['local_gb']
@@ -215,39 +215,11 @@ class HostState(object):
         # Don't store stats directly in host_state to make sure these don't
         # overwrite any values, or get overwritten themselves. Store in self so
         # filters can schedule with them.
-        self.stats = self._statmap(compute.get('stats', []))
-        self.hypervisor_version = compute['hypervisor_version']
+        stats = compute.get('stats', None) or '{}'
+        self.stats = jsonutils.loads(stats)
 
         # Track number of instances on host
         self.num_instances = int(self.stats.get('num_instances', 0))
-
-        # Track number of instances by project_id
-        project_id_keys = [k for k in self.stats.keys() if
-                k.startswith("num_proj_")]
-        for key in project_id_keys:
-            project_id = key[9:]
-            self.num_instances_by_project[project_id] = int(self.stats[key])
-
-        # Track number of instances in certain vm_states
-        vm_state_keys = [k for k in self.stats.keys() if
-                k.startswith("num_vm_")]
-        for key in vm_state_keys:
-            vm_state = key[7:]
-            self.vm_states[vm_state] = int(self.stats[key])
-
-        # Track number of instances in certain task_states
-        task_state_keys = [k for k in self.stats.keys() if
-                k.startswith("num_task_")]
-        for key in task_state_keys:
-            task_state = key[9:]
-            self.task_states[task_state] = int(self.stats[key])
-
-        # Track number of instances by host_type
-        os_keys = [k for k in self.stats.keys() if
-                k.startswith("num_os_type_")]
-        for key in os_keys:
-            os = key[12:]
-            self.num_instances_by_os_type[os] = int(self.stats[key])
 
         self.num_io_ops = int(self.stats.get('io_workload', 0))
 
@@ -267,30 +239,6 @@ class HostState(object):
         # Track number of instances on host
         self.num_instances += 1
 
-        # Track number of instances by project_id
-        project_id = instance.get('project_id')
-        if project_id not in self.num_instances_by_project:
-            self.num_instances_by_project[project_id] = 0
-        self.num_instances_by_project[project_id] += 1
-
-        # Track number of instances in certain vm_states
-        vm_state = instance.get('vm_state', vm_states.BUILDING)
-        if vm_state not in self.vm_states:
-            self.vm_states[vm_state] = 0
-        self.vm_states[vm_state] += 1
-
-        # Track number of instances in certain task_states
-        task_state = instance.get('task_state')
-        if task_state not in self.task_states:
-            self.task_states[task_state] = 0
-        self.task_states[task_state] += 1
-
-        # Track number of instances by host_type
-        os_type = instance.get('os_type')
-        if os_type not in self.num_instances_by_os_type:
-            self.num_instances_by_os_type[os_type] = 0
-        self.num_instances_by_os_type[os_type] += 1
-
         pci_requests = pci_request.get_instance_pci_requests(instance)
         if pci_requests and self.pci_stats:
             self.pci_stats.apply_requests(pci_requests)
@@ -300,11 +248,9 @@ class HostState(object):
         if vm_state == vm_states.BUILDING or task_state in [
                 task_states.RESIZE_MIGRATING, task_states.REBUILDING,
                 task_states.RESIZE_PREP, task_states.IMAGE_SNAPSHOT,
-                task_states.IMAGE_BACKUP]:
+                task_states.IMAGE_BACKUP, task_states.UNSHELVING,
+                task_states.RESCUING]:
             self.num_io_ops += 1
-
-    def _statmap(self, stats):
-        return dict((st['key'], st['value']) for st in stats)
 
     def __repr__(self):
         return ("(%s, %s) ram:%s disk:%s io_ops:%s instances:%s" %
@@ -319,8 +265,6 @@ class HostManager(object):
     host_state_cls = HostState
 
     def __init__(self):
-        # { (host, hypervisor_hostname) : { <service> : { cap k : v }}}
-        self.service_states = {}
         self.host_state_map = {}
         self.filter_handler = filters.HostFilterHandler()
         self.filter_classes = self.filter_handler.get_matching_classes(
@@ -431,24 +375,6 @@ class HostManager(object):
         return self.weight_handler.get_weighed_objects(self.weight_classes,
                 hosts, weight_properties)
 
-    def update_service_capabilities(self, service_name, host, capabilities):
-        """Update the per-service capabilities based on this notification."""
-
-        if service_name != 'compute':
-            LOG.debug(_('Ignoring %(service_name)s service update '
-                        'from %(host)s'), {'service_name': service_name,
-                                           'host': host})
-            return
-
-        state_key = (host, capabilities.get('hypervisor_hostname'))
-        LOG.debug(_("Received %(service_name)s service update from "
-                    "%(state_key)s."), {'service_name': service_name,
-                                        'state_key': state_key})
-        # Copy the capabilities, so we don't modify the original dict
-        capab_copy = dict(capabilities)
-        capab_copy["timestamp"] = timeutils.utcnow()  # Reported time
-        self.service_states[state_key] = capab_copy
-
     def get_all_host_states(self, context):
         """Returns a list of HostStates that represents all the hosts
         the HostManager knows about. Also, each of the consumable resources
@@ -466,17 +392,13 @@ class HostManager(object):
             host = service['host']
             node = compute.get('hypervisor_hostname')
             state_key = (host, node)
-            capabilities = self.service_states.get(state_key, None)
             host_state = self.host_state_map.get(state_key)
             if host_state:
-                host_state.update_capabilities(capabilities,
-                                               dict(service.iteritems()))
+                host_state.update_from_compute_node(compute)
             else:
-                host_state = self.host_state_cls(host, node,
-                        capabilities=capabilities,
-                        service=dict(service.iteritems()))
+                host_state = self.host_state_cls(host, node, compute=compute)
                 self.host_state_map[state_key] = host_state
-            host_state.update_from_compute_node(compute)
+            host_state.update_service(dict(service.iteritems()))
             seen_nodes.add(state_key)
 
         # remove compute nodes from host_state_map if they are not active

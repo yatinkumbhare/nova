@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright 2011 Justin Santa Barbara
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,6 +15,7 @@
 import __builtin__
 import datetime
 import functools
+import hashlib
 import importlib
 import os
 import os.path
@@ -303,6 +302,12 @@ class GenericUtilsTestCase(test.NoDBTestCase):
                           utils.get_shortened_ipv6_cidr,
                           "failure")
 
+    def test_get_hash_str(self):
+        base_str = "foo"
+        value = hashlib.md5(base_str).hexdigest()
+        self.assertEqual(
+            value, utils.get_hash_str(base_str))
+
 
 class MonkeyPatchTestCase(test.NoDBTestCase):
     """Unit test for utils.monkey_patch()."""
@@ -333,20 +338,20 @@ class MonkeyPatchTestCase(test.NoDBTestCase):
 
         self.assertEqual(ret_b, 8)
         package_a = self.example_package + 'example_a.'
-        self.assertTrue(package_a + 'example_function_a'
-            in nova.tests.monkey_patch_example.CALLED_FUNCTION)
+        self.assertIn(package_a + 'example_function_a',
+                      nova.tests.monkey_patch_example.CALLED_FUNCTION)
 
-        self.assertTrue(package_a + 'ExampleClassA.example_method'
-            in nova.tests.monkey_patch_example.CALLED_FUNCTION)
-        self.assertTrue(package_a + 'ExampleClassA.example_method_add'
-            in nova.tests.monkey_patch_example.CALLED_FUNCTION)
+        self.assertIn(package_a + 'ExampleClassA.example_method',
+                        nova.tests.monkey_patch_example.CALLED_FUNCTION)
+        self.assertIn(package_a + 'ExampleClassA.example_method_add',
+                        nova.tests.monkey_patch_example.CALLED_FUNCTION)
         package_b = self.example_package + 'example_b.'
-        self.assertFalse(package_b + 'example_function_b'
-            in nova.tests.monkey_patch_example.CALLED_FUNCTION)
-        self.assertFalse(package_b + 'ExampleClassB.example_method'
-            in nova.tests.monkey_patch_example.CALLED_FUNCTION)
-        self.assertFalse(package_b + 'ExampleClassB.example_method_add'
-            in nova.tests.monkey_patch_example.CALLED_FUNCTION)
+        self.assertNotIn(package_b + 'example_function_b',
+                         nova.tests.monkey_patch_example.CALLED_FUNCTION)
+        self.assertNotIn(package_b + 'ExampleClassB.example_method',
+                         nova.tests.monkey_patch_example.CALLED_FUNCTION)
+        self.assertNotIn(package_b + 'ExampleClassB.example_method_add',
+                         nova.tests.monkey_patch_example.CALLED_FUNCTION)
 
 
 class MonkeyPatchDefaultTestCase(test.NoDBTestCase):
@@ -376,7 +381,7 @@ class AuditPeriodTest(test.NoDBTestCase):
 
     def setUp(self):
         super(AuditPeriodTest, self).setUp()
-        #a fairly random time to test with
+        # a fairly random time to test with
         self.test_time = datetime.datetime(second=23,
                                            minute=12,
                                            hour=8,
@@ -689,6 +694,52 @@ class WrappedCodeTestCase(test.NoDBTestCase):
         self.assertIn('blue', func_code.co_varnames)
 
 
+class ExpectedArgsTestCase(test.NoDBTestCase):
+    def test_passes(self):
+        @utils.expects_func_args('foo', 'baz')
+        def dec(f):
+            return f
+
+        @dec
+        def func(foo, bar, baz="lol"):
+            pass
+
+    def test_raises(self):
+        @utils.expects_func_args('foo', 'baz')
+        def dec(f):
+            return f
+
+        def func(bar, baz):
+            pass
+
+        self.assertRaises(TypeError, dec, func)
+
+    def test_var_no_of_args(self):
+        @utils.expects_func_args('foo')
+        def dec(f):
+            return f
+
+        @dec
+        def func(bar, *args, **kwargs):
+            pass
+
+    def test_more_layers(self):
+        @utils.expects_func_args('foo', 'baz')
+        def dec(f):
+            return f
+
+        def dec_2(f):
+            def inner_f(*a, **k):
+                return f()
+            return inner_f
+
+        @dec_2
+        def func(bar, baz):
+            pass
+
+        self.assertRaises(TypeError, dec, func)
+
+
 class StringLengthTestCase(test.NoDBTestCase):
     def test_check_string_length(self):
         self.assertIsNone(utils.check_string_length(
@@ -702,6 +753,19 @@ class StringLengthTestCase(test.NoDBTestCase):
         self.assertRaises(exception.InvalidInput,
                           utils.check_string_length,
                           'a' * 256, 'name', max_length=255)
+
+    def test_check_string_length_noname(self):
+        self.assertIsNone(utils.check_string_length(
+                          'test', max_length=255))
+        self.assertRaises(exception.InvalidInput,
+                          utils.check_string_length,
+                          11, max_length=255)
+        self.assertRaises(exception.InvalidInput,
+                          utils.check_string_length,
+                          '', min_length=1)
+        self.assertRaises(exception.InvalidInput,
+                          utils.check_string_length,
+                          'a' * 256, max_length=255)
 
 
 class ValidateIntegerTestCase(test.NoDBTestCase):
@@ -738,15 +802,17 @@ class ValidateIntegerTestCase(test.NoDBTestCase):
                           utils.validate_integer,
                           55, "doing 55 in a 54",
                           max_value=54)
+        self.assertRaises(exception.InvalidInput,
+                          utils.validate_integer,
+                          unichr(129), "UnicodeError",
+                          max_value=1000)
 
 
 class ValidateNeutronConfiguration(test.NoDBTestCase):
     def setUp(self):
         super(ValidateNeutronConfiguration, self).setUp()
-        utils.reset_is_neutron()
 
     def test_nova_network(self):
-        self.flags(network_api_class='nova.network.api.API')
         self.assertFalse(utils.is_neutron())
 
     def test_neutron(self):
@@ -782,13 +848,13 @@ class GetSystemMetadataFromImageTestCase(test.NoDBTestCase):
 
         return image_meta
 
-    def get_instance_type(self):
-        instance_type = {
+    def get_flavor(self):
+        flavor = {
             "id": "fake.flavor",
             "root_gb": 10,
         }
 
-        return instance_type
+        return flavor
 
     def test_base_image_properties(self):
         image = self.get_image()
@@ -815,16 +881,16 @@ class GetSystemMetadataFromImageTestCase(test.NoDBTestCase):
 
     def test_vhd_min_disk_image(self):
         image = self.get_image()
-        instance_type = self.get_instance_type()
+        flavor = self.get_flavor()
 
         image["disk_format"] = "vhd"
 
-        sys_meta = utils.get_system_metadata_from_image(image, instance_type)
+        sys_meta = utils.get_system_metadata_from_image(image, flavor)
 
         # Verify that the min_disk property is taken from
-        # instance_type's root_gb when using vhd disk format
+        # flavor's root_gb when using vhd disk format
         sys_key = "%s%s" % (utils.SM_IMAGE_PROP_PREFIX, "min_disk")
-        self.assertEqual(sys_meta[sys_key], instance_type["root_gb"])
+        self.assertEqual(sys_meta[sys_key], flavor["root_gb"])
 
     def test_dont_inherit_empty_values(self):
         image = self.get_image()
@@ -887,7 +953,7 @@ class GetImageFromSystemMetadataTestCase(test.NoDBTestCase):
         sys_meta = self.get_system_metadata()
         sys_meta["%soo1" % utils.SM_IMAGE_PROP_PREFIX] = "bar"
 
-        CONF.non_inheritable_image_properties = ["foo1"]
+        self.flags(non_inheritable_image_properties=["foo1"])
 
         image = utils.get_image_from_system_metadata(sys_meta)
 
@@ -910,16 +976,9 @@ class VersionTestCase(test.NoDBTestCase):
     def test_convert_version_to_tuple(self):
         self.assertEqual(utils.convert_version_to_tuple('6.7.0'), (6, 7, 0))
 
-    def test_get_major_minor_version_from_string(self):
-        self.assertEqual(utils.get_major_minor_version('6.1.3'), 6.1)
-        self.assertEqual(utils.get_major_minor_version('6.4'), 6.4)
-        self.assertEqual(utils.get_major_minor_version('6'), 6)
 
-    def test_get_major_minor_version_from_float(self):
-        self.assertEqual(utils.get_major_minor_version(6.1), 6.1)
-        self.assertEqual(utils.get_major_minor_version(6), 6.0)
-
-    def test_get_major_minor_version_raises_exception(self):
-        exc = self.assertRaises(exception.NovaException,
-                                utils.get_major_minor_version, '5a.6b')
-        self.assertEqual("Version 5a.6b invalid", exc.message)
+class ConstantTimeCompareTestCase(test.NoDBTestCase):
+    def test_constant_time_compare(self):
+        self.assertTrue(utils.constant_time_compare("abcd1234", "abcd1234"))
+        self.assertFalse(utils.constant_time_compare("abcd1234", "a"))
+        self.assertFalse(utils.constant_time_compare("abcd1234", "ABCD234"))

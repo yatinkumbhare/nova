@@ -11,13 +11,15 @@
 #    under the License.
 
 import iso8601
+import mock
 import mox
 from oslo.config import cfg
 
+from nova.compute import claims
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import db
-from nova.objects import instance as instance_obj
+from nova import objects
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova.tests.compute import test_compute
@@ -28,13 +30,25 @@ CONF = cfg.CONF
 CONF.import_opt('shelved_offload_time', 'nova.compute.manager')
 
 
+def _fake_resources():
+    resources = {
+        'memory_mb': 2048,
+        'memory_mb_used': 0,
+        'free_ram_mb': 2048,
+        'local_gb': 20,
+        'local_gb_used': 0,
+        'free_disk_gb': 20,
+        'vcpus': 2,
+        'vcpus_used': 0
+    }
+    return resources
+
+
 class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
     def _shelve_instance(self, shelved_offload_time):
         CONF.set_override('shelved_offload_time', shelved_offload_time)
         db_instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, db_instance, {}, {}, [], None,
-                None, True, None, False)
-        instance = instance_obj.Instance.get_by_uuid(
+        instance = objects.Instance.get_by_uuid(
             self.context, db_instance['uuid'],
             expected_attrs=['metadata', 'system_metadata'])
         image_id = 'fake_image_id'
@@ -109,9 +123,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
     def test_shelve_volume_backed(self):
         db_instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, db_instance, {}, {}, [], None,
-                None, True, None, False)
-        instance = instance_obj.Instance.get_by_uuid(
+        instance = objects.Instance.get_by_uuid(
             self.context, db_instance['uuid'],
             expected_attrs=['metadata', 'system_metadata'])
         instance.task_state = task_states.SHELVING
@@ -152,15 +164,16 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
     def test_unshelve(self):
         db_instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, db_instance, {}, {}, [], None,
-                None, True, None, False)
-        instance = instance_obj.Instance.get_by_uuid(
+        instance = objects.Instance.get_by_uuid(
             self.context, db_instance['uuid'],
             expected_attrs=['metadata', 'system_metadata'])
         instance.task_state = task_states.UNSHELVING
         instance.save()
         image = {'id': 'fake_id'}
         host = 'fake-mini'
+        node = test_compute.NODENAME
+        limits = {}
+        filter_properties = {'limits': limits}
         cur_time = timeutils.utcnow()
         cur_time_tz = cur_time.replace(tzinfo=iso8601.iso8601.Utc())
         timeutils.set_time_override(cur_time)
@@ -168,39 +181,42 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         sys_meta['shelved_at'] = timeutils.strtime(at=cur_time)
         sys_meta['shelved_image_id'] = image['id']
         sys_meta['shelved_host'] = host
-        hypervisor_hostname = 'fake_hypervisor_hostname'
-        fake_compute_info = {'hypervisor_hostname': hypervisor_hostname}
 
         self.mox.StubOutWithMock(self.compute, '_notify_about_instance_usage')
         self.mox.StubOutWithMock(self.compute, '_prep_block_device')
         self.mox.StubOutWithMock(self.compute.driver, 'spawn')
         self.mox.StubOutWithMock(self.compute, '_get_power_state')
-        self.mox.StubOutWithMock(self.compute, '_get_compute_info')
+        self.mox.StubOutWithMock(self.rt, 'instance_claim')
         self.mox.StubOutWithMock(db, 'instance_update_and_get_original')
+        self.mox.StubOutWithMock(self.compute.network_api,
+                                 'migrate_instance_finish')
 
         self.deleted_image_id = None
 
         def fake_delete(self2, ctxt, image_id):
             self.deleted_image_id = image_id
 
+        def fake_claim(context, instance, limits):
+            instance.host = self.compute.host
+            return claims.Claim(db_instance, self.rt, _fake_resources())
+
         fake_image.stub_out_image_service(self.stubs)
         self.stubs.Set(fake_image._FakeImageService, 'delete', fake_delete)
 
         self.compute._notify_about_instance_usage(self.context, instance,
                 'unshelve.start')
-        self.compute._get_compute_info(mox.IgnoreArg(),
-                                       mox.IgnoreArg()).AndReturn(
-                                                        fake_compute_info)
         db.instance_update_and_get_original(self.context, instance['uuid'],
-                {'task_state': task_states.SPAWNING, 'host': host,
-                 'node': hypervisor_hostname},
+                {'task_state': task_states.SPAWNING},
                 update_cells=False,
                 columns_to_join=['metadata', 'system_metadata'],
                 ).AndReturn((db_instance, db_instance))
         self.compute._prep_block_device(self.context, instance,
-                []).AndReturn('fake_bdm')
+                mox.IgnoreArg(), do_check_attach=False).AndReturn('fake_bdm')
         db_instance['key_data'] = None
         db_instance['auto_disk_config'] = None
+        self.compute.network_api.migrate_instance_finish(
+                self.context, instance, {'source_compute': '',
+                                         'dest_compute': self.compute.host})
         self.compute.driver.spawn(self.context, instance, image,
                 injected_files=[], admin_password=None,
                 network_info=[],
@@ -210,64 +226,67 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
                 {'power_state': 123,
                  'vm_state': vm_states.ACTIVE,
                  'task_state': None,
+                 'image_ref': instance['image_ref'],
                  'key_data': None,
+                 'host': self.compute.host,  # rt.instance_claim set this
                  'auto_disk_config': False,
                  'expected_task_state': task_states.SPAWNING,
                  'launched_at': cur_time_tz},
                  update_cells=False,
                  columns_to_join=['metadata', 'system_metadata']
-                 ).AndReturn((db_instance, db_instance))
+                 ).AndReturn((db_instance,
+                              dict(db_instance,
+                                   host=self.compute.host)))
         self.compute._notify_about_instance_usage(self.context, instance,
                 'unshelve.end')
         self.mox.ReplayAll()
 
-        self.compute.unshelve_instance(self.context, instance,
-                image=image)
+        with mock.patch.object(self.rt, 'instance_claim',
+                               side_effect=fake_claim):
+            self.compute.unshelve_instance(self.context, instance, image=image,
+                    filter_properties=filter_properties, node=node)
         self.assertEqual(image['id'], self.deleted_image_id)
         self.assertEqual(instance.host, self.compute.host)
 
     def test_unshelve_volume_backed(self):
         db_instance = jsonutils.to_primitive(self._create_fake_instance())
-        host = 'fake-mini'
+        node = test_compute.NODENAME
+        limits = {}
+        filter_properties = {'limits': limits}
         cur_time = timeutils.utcnow()
         cur_time_tz = cur_time.replace(tzinfo=iso8601.iso8601.Utc())
         timeutils.set_time_override(cur_time)
-        self.compute.run_instance(self.context, db_instance, {}, {}, [], None,
-                None, True, None, False)
-        instance = instance_obj.Instance.get_by_uuid(
+        instance = objects.Instance.get_by_uuid(
             self.context, db_instance['uuid'],
             expected_attrs=['metadata', 'system_metadata'])
         instance.task_state = task_states.UNSHELVING
         instance.save()
-        sys_meta = dict(instance.system_metadata)
-        sys_meta['shelved_at'] = timeutils.strtime(at=cur_time)
-        sys_meta['shelved_image_id'] = None
-        sys_meta['shelved_host'] = host
-        hypervisor_hostname = 'fake_hypervisor_hostname'
-        fake_compute_info = {'hypervisor_hostname': hypervisor_hostname}
 
         self.mox.StubOutWithMock(self.compute, '_notify_about_instance_usage')
         self.mox.StubOutWithMock(self.compute, '_prep_block_device')
         self.mox.StubOutWithMock(self.compute.driver, 'spawn')
         self.mox.StubOutWithMock(self.compute, '_get_power_state')
-        self.mox.StubOutWithMock(self.compute, '_get_compute_info')
+        self.mox.StubOutWithMock(self.rt, 'instance_claim')
         self.mox.StubOutWithMock(db, 'instance_update_and_get_original')
+        self.mox.StubOutWithMock(self.compute.network_api,
+                                 'migrate_instance_finish')
 
         self.compute._notify_about_instance_usage(self.context, instance,
                 'unshelve.start')
-        self.compute._get_compute_info(mox.IgnoreArg(),
-                                       mox.IgnoreArg()).AndReturn(
-                                                        fake_compute_info)
         db.instance_update_and_get_original(self.context, instance['uuid'],
-                {'task_state': task_states.SPAWNING, 'host': host,
-                 'node': hypervisor_hostname},
+                {'task_state': task_states.SPAWNING},
                 update_cells=False,
                 columns_to_join=['metadata', 'system_metadata']
                 ).AndReturn((db_instance, db_instance))
         self.compute._prep_block_device(self.context, instance,
-                []).AndReturn('fake_bdm')
+                mox.IgnoreArg(), do_check_attach=False).AndReturn('fake_bdm')
         db_instance['key_data'] = None
         db_instance['auto_disk_config'] = None
+        self.compute.network_api.migrate_instance_finish(
+                self.context, instance, {'source_compute': '',
+                                         'dest_compute': self.compute.host})
+        self.rt.instance_claim(self.context, instance, limits).AndReturn(
+                claims.Claim(db_instance, self.rt, _fake_resources()))
         self.compute.driver.spawn(self.context, instance, None,
                 injected_files=[], admin_password=None,
                 network_info=[],
@@ -288,12 +307,10 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
                 'unshelve.end')
         self.mox.ReplayAll()
 
-        self.compute.unshelve_instance(self.context, instance, image=None)
+        self.compute.unshelve_instance(self.context, instance, image=None,
+                filter_properties=filter_properties, node=node)
 
     def test_shelved_poll_none_exist(self):
-        instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
         self.mox.StubOutWithMock(self.compute.driver, 'destroy')
         self.mox.StubOutWithMock(timeutils, 'is_older_than')
         self.mox.ReplayAll()
@@ -301,8 +318,6 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
     def test_shelved_poll_not_timedout(self):
         instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
         sys_meta = utils.metadata_to_dict(instance['system_metadata'])
         shelved_time = timeutils.utcnow()
         timeutils.set_time_override(shelved_time)
@@ -316,13 +331,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         self.compute._poll_shelved_instances(self.context)
 
     def test_shelved_poll_timedout(self):
-        active_instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, active_instance, {}, {}, [],
-                None, None, True, None, False)
-
         instance = jsonutils.to_primitive(self._create_fake_instance())
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
         sys_meta = utils.metadata_to_dict(instance['system_metadata'])
         shelved_time = timeutils.utcnow()
         timeutils.set_time_override(shelved_time)
@@ -348,8 +357,6 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
         fake_instance = self._create_fake_instance({'display_name': 'vm01'})
         instance = jsonutils.to_primitive(fake_instance)
         instance_uuid = instance['uuid']
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
 
         self.assertIsNone(instance['task_state'])
 
@@ -359,7 +366,7 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
             # sets a fake method.
             self2.images = {}
 
-        def fake_create(self2, ctxt, metadata):
+        def fake_create(self2, ctxt, metadata, data=None):
             self.assertEqual(metadata['name'], 'vm01-shelved')
             metadata['id'] = '8b24ed3f-ee57-43bc-bc2e-fb2e9482bc42'
             return metadata
@@ -368,8 +375,7 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
         self.stubs.Set(fake_image._FakeImageService, '__init__', fake_init)
         self.stubs.Set(fake_image._FakeImageService, 'create', fake_create)
 
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     instance_uuid)
+        inst_obj = objects.Instance.get_by_uuid(self.context, instance_uuid)
         self.compute_api.shelve(self.context, inst_obj)
 
         inst_obj.refresh()
@@ -381,13 +387,10 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
         # Ensure instance can be unshelved.
         instance = jsonutils.to_primitive(self._create_fake_instance())
         instance_uuid = instance['uuid']
-        self.compute.run_instance(self.context, instance, {}, {}, [], None,
-                None, True, None, False)
 
         self.assertIsNone(instance['task_state'])
 
-        inst_obj = instance_obj.Instance.get_by_uuid(self.context,
-                                                     instance_uuid)
+        inst_obj = objects.Instance.get_by_uuid(self.context, instance_uuid)
         self.compute_api.shelve(self.context, inst_obj)
 
         inst_obj.refresh()

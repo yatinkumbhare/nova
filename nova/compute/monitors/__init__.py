@@ -12,7 +12,6 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-# @author: Shane Wang, Intel Corporation.
 
 """
 Resource monitor API specification.
@@ -21,14 +20,14 @@ ResourceMonitorBase provides the definition of minimum set of methods
 that needs to be implemented by Resource Monitor.
 """
 
+import functools
 import types
 
+from oslo.config import cfg
 import six
 
-from oslo.config import cfg
-
+from nova.i18n import _
 from nova import loadables
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 
@@ -74,6 +73,33 @@ class ResourceMonitorBase(object):
     def __init__(self, parent):
         self.compute_manager = parent
         self.source = None
+        self._data = {}
+
+    @classmethod
+    def add_timestamp(cls, func):
+        """Decorator to indicate that a method needs to add a timestamp.
+
+        When a function returning a value is decorated by the decorator,
+        which means a timestamp should be added into the returned value.
+        That is, a tuple (value, timestamp) is returned.
+
+        The timestamp is the time when we update the value in the _data.
+
+        If users hope to define how the timestamp is got by themselves,
+        they should not use this decorator in their own classes.
+        """
+        @functools.wraps(func)
+        def wrapper(self, **kwargs):
+            return func(self, **kwargs), self._data.get("timestamp", None)
+        return wrapper
+
+    def _update_data(self):
+        """Method to update the metrics data.
+
+        Each subclass can implement this method to update metrics
+        into _data. It will be called in get_metrics.
+        """
+        pass
 
     def get_metric_names(self):
         """Get available metric names.
@@ -96,6 +122,7 @@ class ResourceMonitorBase(object):
         :returns: a list to tell the current metrics
         """
         data = []
+        self._update_data()
         for name, func in self.metric_map.iteritems():
             ret = func(self, **kwargs)
             data.append(self._populate(name, ret[0], ret[1]))
@@ -170,6 +197,6 @@ def all_monitors():
     """Return a list of monitor classes found in this directory.
 
     This method is used as the default for available monitors
-    and should return a list of all monitor classes avaiable.
+    and should return a list of all monitor classes available.
     """
     return ResourceMonitorHandler().get_all_classes()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright 2013 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -18,10 +16,12 @@
 import os
 import shutil
 
-from nova.openstack.common.gettextutils import _
+from oslo.config import cfg
+
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova import utils
-from oslo.config import cfg
+from nova.virt.hyperv import constants
 
 LOG = logging.getLogger(__name__)
 
@@ -92,12 +92,12 @@ class PathUtils(object):
 
     def _check_create_dir(self, path):
         if not self.exists(path):
-            LOG.debug(_('Creating directory: %s') % path)
+            LOG.debug('Creating directory: %s', path)
             self.makedirs(path)
 
     def _check_remove_dir(self, path):
         if self.exists(path):
-            LOG.debug(_('Removing directory: %s') % path)
+            LOG.debug('Removing directory: %s', path)
             self.rmtree(path)
 
     def _get_instances_sub_dir(self, dir_name, remote_server=None,
@@ -133,6 +133,15 @@ class PathUtils(object):
     def lookup_root_vhd_path(self, instance_name):
         return self._lookup_vhd_path(instance_name, self.get_root_vhd_path)
 
+    def lookup_configdrive_path(self, instance_name):
+        configdrive_path = None
+        for format_ext in constants.DISK_FORMAT_MAP:
+            test_path = self.get_configdrive_path(instance_name, format_ext)
+            if self.exists(test_path):
+                configdrive_path = test_path
+                break
+        return configdrive_path
+
     def lookup_ephemeral_vhd_path(self, instance_name):
         return self._lookup_vhd_path(instance_name,
                                      self.get_ephemeral_vhd_path)
@@ -140,6 +149,10 @@ class PathUtils(object):
     def get_root_vhd_path(self, instance_name, format_ext):
         instance_path = self.get_instance_dir(instance_name)
         return os.path.join(instance_path, 'root.' + format_ext.lower())
+
+    def get_configdrive_path(self, instance_name, format_ext):
+        instance_path = self.get_instance_dir(instance_name)
+        return os.path.join(instance_path, 'configdrive.' + format_ext.lower())
 
     def get_ephemeral_vhd_path(self, instance_name, format_ext):
         instance_path = self.get_instance_dir(instance_name)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Justin Santa Barbara
@@ -22,6 +20,8 @@
 import contextlib
 import datetime
 import functools
+import hashlib
+import hmac
 import inspect
 import os
 import pyclbr
@@ -37,17 +37,16 @@ from xml.sax import saxutils
 import eventlet
 import netaddr
 from oslo.config import cfg
+from oslo import messaging
 import six
 
 from nova import exception
+from nova.i18n import _
 from nova.openstack.common import excutils
-from nova.openstack.common import gettextutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import lockutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import processutils
-from nova.openstack.common.rpc import common as rpc_common
 from nova.openstack.common import timeutils
 
 notify_decorator = 'nova.notifications.notify_decorator'
@@ -69,7 +68,7 @@ utils_opts = [
                help='Length of generated instance admin passwords'),
     cfg.StrOpt('instance_usage_audit_period',
                default='month',
-               help='time period to generate instance usages for.  '
+               help='Time period to generate instance usages for.  '
                     'Time period must be hour, day, month or year'),
     cfg.StrOpt('rootwrap_config',
                default="/etc/nova/rootwrap.conf",
@@ -85,16 +84,6 @@ CONF.import_opt('network_api_class', 'nova.network')
 
 LOG = logging.getLogger(__name__)
 
-# Used for looking up extensions of text
-# to their 'multiplied' byte amount
-BYTE_MULTIPLIERS = {
-    '': 1,
-    't': 1024 ** 4,
-    'g': 1024 ** 3,
-    'm': 1024 ** 2,
-    'k': 1024,
-}
-
 # used in limits
 TIME_UNITS = {
     'SECOND': 1,
@@ -104,8 +93,7 @@ TIME_UNITS = {
 }
 
 
-_IS_NEUTRON_ATTEMPTED = False
-_IS_NEUTRON = False
+_IS_NEUTRON = None
 
 synchronized = lockutils.synchronized_with_prefix('nova-')
 
@@ -170,14 +158,14 @@ def _get_root_helper():
 
 def execute(*cmd, **kwargs):
     """Convenience wrapper around oslo's execute() method."""
-    if 'run_as_root' in kwargs and not 'root_helper' in kwargs:
+    if 'run_as_root' in kwargs and 'root_helper' not in kwargs:
         kwargs['root_helper'] = _get_root_helper()
     return processutils.execute(*cmd, **kwargs)
 
 
 def trycmd(*args, **kwargs):
     """Convenience wrapper around oslo's trycmd() method."""
-    if 'run_as_root' in kwargs and not 'root_helper' in kwargs:
+    if 'run_as_root' in kwargs and 'root_helper' not in kwargs:
         kwargs['root_helper'] = _get_root_helper()
     return processutils.trycmd(*args, **kwargs)
 
@@ -455,8 +443,6 @@ def utf8(value):
     """
     if isinstance(value, unicode):
         return value.encode('utf-8')
-    elif isinstance(value, gettextutils.Message):
-        return unicode(value).encode('utf-8')
     assert isinstance(value, str)
     return value
 
@@ -469,8 +455,7 @@ def check_isinstance(obj, cls):
 
 
 def parse_server_string(server_str):
-    """
-    Parses the given server_string and returns a list of host and port.
+    """Parses the given server_string and returns a list of host and port.
     If it's not a combination of host part and port, the port element
     is a null string. If the input is invalid expression, return a null
     list.
@@ -519,6 +504,10 @@ def is_valid_ipv6(address):
         return netaddr.valid_ipv6(address)
     except Exception:
         return False
+
+
+def is_valid_ip_address(address):
+    return is_valid_ipv4(address) or is_valid_ipv6(address)
 
 
 def is_valid_ipv6_cidr(address):
@@ -578,14 +567,14 @@ def get_ip_version(network):
 
 
 def monkey_patch():
-    """If the Flags.monkey_patch set as True,
+    """If the CONF.monkey_patch set as True,
     this function patches a decorator
     for all functions in specified modules.
     You can set decorators for each modules
     using CONF.monkey_patch_modules.
     The format is "Module path:Decorator function".
     Example:
-      'nova.api.ec2.cloud:nova.notifications.notify_decorator'
+    'nova.api.ec2.cloud:nova.notifications.notify_decorator'
 
     Parameters of the decorator is as follows.
     (See nova.notifications.notify_decorator)
@@ -667,7 +656,7 @@ def read_cached_file(filename, cache_info, reload_func=None):
     """
     mtime = os.path.getmtime(filename)
     if not cache_info or mtime != cache_info.get('mtime'):
-        LOG.debug(_("Reloading cached file %s") % filename)
+        LOG.debug("Reloading cached file %s", filename)
         with open(filename) as fap:
             cache_info['data'] = fap.read()
         cache_info['mtime'] = mtime
@@ -753,7 +742,7 @@ def read_file_as_root(file_path):
 def temporary_chown(path, owner_uid=None):
     """Temporarily chown a path.
 
-    :params owner_uid: UID of temporary owner (defaults to current user)
+    :param owner_uid: UID of temporary owner (defaults to current user)
     """
     if owner_uid is None:
         owner_uid = os.getuid()
@@ -836,7 +825,7 @@ def mkfs(fs, path, label=None, run_as_root=False):
         args = ['mkswap']
     else:
         args = ['mkfs', '-t', fs]
-    #add -F to force no interactive execute on non-block device.
+    # add -F to force no interactive execute on non-block device.
     if fs in ('ext3', 'ext4', 'ntfs'):
         args.extend(['-F'])
     if label:
@@ -922,6 +911,27 @@ def get_wrapped_function(function):
     return _get_wrapped_function(function)
 
 
+def expects_func_args(*args):
+    def _decorator_checker(dec):
+        @functools.wraps(dec)
+        def _decorator(f):
+            base_f = get_wrapped_function(f)
+            arg_names, a, kw, _default = inspect.getargspec(base_f)
+            if a or kw or set(args) <= set(arg_names):
+                # NOTE (ndipanov): We can't really tell if correct stuff will
+                # be passed if it's a function with *args or **kwargs so
+                # we still carry on and hope for the best
+                return dec(f)
+            else:
+                raise TypeError("Decorated function %(f_name)s does not "
+                                "have the arguments expected by the "
+                                "decorator %(d_name)s" %
+                                {'f_name': base_f.__name__,
+                                 'd_name': dec.__name__})
+        return _decorator
+    return _decorator_checker
+
+
 class ExceptionHelper(object):
     """Class to wrap another and translate the ClientExceptions raised by its
     function calls to the actual ones.
@@ -937,12 +947,12 @@ class ExceptionHelper(object):
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
-            except rpc_common.ClientException as e:
-                raise (e._exc_info[1], None, e._exc_info[2])
+            except messaging.ExpectedException as e:
+                raise (e.exc_info[1], None, e.exc_info[2])
         return wrapper
 
 
-def check_string_length(value, name, min_length=0, max_length=None):
+def check_string_length(value, name=None, min_length=0, max_length=None):
     """Check the length of specified string
     :param value: the value of the string
     :param name: the name of the string
@@ -950,8 +960,14 @@ def check_string_length(value, name, min_length=0, max_length=None):
     :param max_length: the max_length of the string
     """
     if not isinstance(value, six.string_types):
-        msg = _("%s is not a string or unicode") % name
+        if name is None:
+            msg = _("The input is not a string or unicode")
+        else:
+            msg = _("%s is not a string or unicode") % name
         raise exception.InvalidInput(message=msg)
+
+    if name is None:
+        name = value
 
     if len(value) < min_length:
         msg = _("%(name)s has a minimum character requirement of "
@@ -968,7 +984,7 @@ def validate_integer(value, name, min_value=None, max_value=None):
     """Make sure that value is a valid integer, potentially within range."""
     try:
         value = int(str(value))
-    except ValueError:
+    except (ValueError, UnicodeEncodeError):
         msg = _('%(value_name)s must be an integer')
         raise exception.InvalidInput(reason=(
             msg % {'value_name': name}))
@@ -1000,8 +1016,7 @@ def spawn_n(func, *args, **kwargs):
 
 
 def is_none_string(val):
-    """
-    Check if a string represents a None value.
+    """Check if a string represents a None value.
     """
     if not isinstance(val, six.string_types):
         return False
@@ -1011,12 +1026,13 @@ def is_none_string(val):
 
 def convert_version_to_int(version):
     try:
-        if type(version) == str:
+        if isinstance(version, six.string_types):
             version = convert_version_to_tuple(version)
-        if type(version) == tuple:
+        if isinstance(version, tuple):
             return reduce(lambda x, y: (x * 1000) + y, version)
     except Exception:
-        raise exception.NovaException(message="Hypervisor version invalid.")
+        msg = _("Hypervisor version %s is invalid.") % version
+        raise exception.NovaException(msg)
 
 
 def convert_version_to_str(version_int):
@@ -1034,23 +1050,10 @@ def convert_version_to_tuple(version_str):
     return tuple(int(part) for part in version_str.split('.'))
 
 
-def get_major_minor_version(version):
-    try:
-        if type(version) == int or type(version) == float:
-            return version
-        if type(version) == str:
-            major_minor_versions = version.split(".")[0:2]
-            version_as_float = float(".".join(major_minor_versions))
-            return version_as_float
-    except Exception:
-        raise exception.NovaException(_("Version %s invalid") % version)
-
-
 def is_neutron():
-    global _IS_NEUTRON_ATTEMPTED
     global _IS_NEUTRON
 
-    if _IS_NEUTRON_ATTEMPTED:
+    if _IS_NEUTRON is not None:
         return _IS_NEUTRON
 
     try:
@@ -1058,7 +1061,6 @@ def is_neutron():
         cls_name = CONF.network_api_class
         if cls_name == 'nova.network.quantumv2.api.API':
             cls_name = 'nova.network.neutronv2.api.API'
-        _IS_NEUTRON_ATTEMPTED = True
 
         from nova.network.neutronv2 import api as neutron_api
         _IS_NEUTRON = issubclass(importutils.import_class(cls_name),
@@ -1067,14 +1069,6 @@ def is_neutron():
         _IS_NEUTRON = False
 
     return _IS_NEUTRON
-
-
-def reset_is_neutron():
-    global _IS_NEUTRON_ATTEMPTED
-    global _IS_NEUTRON
-
-    _IS_NEUTRON_ATTEMPTED = False
-    _IS_NEUTRON = False
 
 
 def is_auto_disk_config_disabled(auto_disk_config_raw):
@@ -1096,7 +1090,7 @@ def get_auto_disk_config_from_image_props(image_properties):
     return image_properties.get("auto_disk_config")
 
 
-def get_system_metadata_from_image(image_meta, instance_type=None):
+def get_system_metadata_from_image(image_meta, flavor=None):
     system_meta = {}
     prefix_format = SM_IMAGE_PROP_PREFIX + '%s'
 
@@ -1107,11 +1101,11 @@ def get_system_metadata_from_image(image_meta, instance_type=None):
     for key in SM_INHERITABLE_KEYS:
         value = image_meta.get(key)
 
-        if key == 'min_disk' and instance_type:
+        if key == 'min_disk' and flavor:
             if image_meta.get('disk_format') == 'vhd':
-                value = instance_type['root_gb']
+                value = flavor['root_gb']
             else:
-                value = max(value, instance_type['root_gb'])
+                value = max(value, flavor['root_gb'])
 
         if value is None:
             continue
@@ -1149,3 +1143,25 @@ def get_image_from_system_metadata(system_meta):
         image_meta['properties'] = properties
 
     return image_meta
+
+
+def get_hash_str(base_str):
+    """returns string that represents hash of base_str (in hex format)."""
+    return hashlib.md5(base_str).hexdigest()
+
+if hasattr(hmac, 'compare_digest'):
+    constant_time_compare = hmac.compare_digest
+else:
+    def constant_time_compare(first, second):
+        """Returns True if both string inputs are equal, otherwise False.
+
+        This function should take a constant amount of time regardless of
+        how many characters in the strings match.
+
+        """
+        if len(first) != len(second):
+            return False
+        result = 0
+        for x, y in zip(first, second):
+            result |= ord(x) ^ ord(y)
+        return result == 0

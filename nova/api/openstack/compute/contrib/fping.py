@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Grid Dynamics
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
@@ -26,7 +24,7 @@ from nova.api.openstack import common
 from nova.api.openstack import extensions
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import utils
 
 authorize = extensions.extension_authorizer('compute', 'fping')
@@ -149,7 +147,7 @@ class Fping(extensions.ExtensionDescriptor):
     name = "Fping"
     alias = "os-fping"
     namespace = "http://docs.openstack.org/compute/ext/fping/api/v1.1"
-    updated = "2012-07-06T00:00:00+00:00"
+    updated = "2012-07-06T00:00:00Z"
 
     def get_resources(self):
         res = extensions.ResourceExtension(

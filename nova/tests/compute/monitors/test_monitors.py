@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 Intel Corporation
 # All Rights Reserved.
 #
@@ -22,15 +20,18 @@ from nova import test
 
 
 class FakeResourceMonitor(monitors.ResourceMonitorBase):
-    def get_metric_names(self):
-        return ["foo.metric1", "foo.metric2"]
+    def _update_data(self):
+        self._data['foo.metric1'] = '1000'
+        self._data['foo.metric2'] = '99.999'
+        self._data['timestamp'] = '123'
 
-    def get_metrics(self):
-        data = []
-        data.append(self._populate('foo.metric1', '1000'))
-        data.append(self._populate('foo.metric2', '99.999'))
+    @monitors.ResourceMonitorBase.add_timestamp
+    def _get_foo_metric1(self, **kwargs):
+        return self._data.get("foo.metric1")
 
-        return data
+    @monitors.ResourceMonitorBase.add_timestamp
+    def _get_foo_metric2(self, **kwargs):
+        return self._data.get("foo.metric2")
 
 
 class FakeMonitorClass1(monitors.ResourceMonitorBase):
@@ -71,10 +72,6 @@ class FakeMonitorClass3(monitors.ResourceMonitorBase):
 
 class FakeMonitorClass4(monitors.ResourceMonitorBase):
     def get_metrics(self, **kwargs):
-        data = [{'timestamp': 123,
-                 'name': 'key4',
-                 'value': 1600,
-                 'source': 'libvirt'}]
         raise test.TestingException()
 
     def get_metric_names(self):
@@ -98,6 +95,7 @@ class ResourceMonitorBaseTestCase(test.TestCase):
         metrics = {}
         for metric in metrics_raw:
             self.assertIn(metric['name'], names)
+            self.assertEqual(metric["timestamp"], '123')
             metrics[metric['name']] = metric['value']
 
         self.assertEqual(metrics["foo.metric1"], '1000')

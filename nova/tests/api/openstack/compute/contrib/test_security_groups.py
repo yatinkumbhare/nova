@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2012 Justin Santa Barbara
 #
@@ -16,6 +14,7 @@
 #    under the License.
 
 from lxml import etree
+import mock
 import mox
 from oslo.config import cfg
 import webob
@@ -25,8 +24,10 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import compute
 from nova.compute import power_state
+from nova import context as context_maker
 import nova.db
 from nova import exception
+from nova import objects
 from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
 from nova import quota
@@ -141,6 +142,11 @@ class TestSecurityGroups(test.TestCase):
         """Check that no reservations are leaked during tests."""
         result = quota.QUOTAS.get_project_quotas(context, context.project_id)
         self.assertEqual(result['security_groups']['reserved'], 0)
+
+    def _assert_security_groups_in_use(self, project_id, user_id, in_use):
+        context = context_maker.get_admin_context()
+        result = quota.QUOTAS.get_user_quotas(context, project_id, user_id)
+        self.assertEqual(result['security_groups']['in_use'], in_use)
 
     def test_create_security_group(self):
         sg = security_group_template()
@@ -274,7 +280,7 @@ class TestSecurityGroups(test.TestCase):
 
     def test_create_security_group_quota_limit(self):
         req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups')
-        for num in range(1, CONF.quota_security_groups + 1):
+        for num in range(1, CONF.quota_security_groups):
             name = 'test%s' % num
             sg = security_group_template(name=name)
             res_dict = self.controller.create(req, {'security_group': sg})
@@ -299,6 +305,47 @@ class TestSecurityGroups(test.TestCase):
             return [security_group_db(sg) for sg in groups]
 
         self.stubs.Set(nova.db, 'security_group_get_by_project',
+                       return_security_groups)
+
+        req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups')
+        res_dict = self.controller.index(req)
+
+        self.assertEqual(res_dict, expected)
+
+    def test_get_security_group_list_missing_group_id_rule(self):
+        groups = []
+        rule1 = security_group_rule_template(cidr='10.2.3.124/24',
+                                             parent_group_id=1,
+                                             group_id={}, id=88,
+                                             protocol='TCP')
+        rule2 = security_group_rule_template(cidr='10.2.3.125/24',
+                                             parent_group_id=1,
+                                             id=99, protocol=88,
+                                             group_id='HAS_BEEN_DELETED')
+        sg = security_group_template(id=1,
+                                     name='test',
+                                     description='test-desc',
+                                     rules=[rule1, rule2])
+
+        groups.append(sg)
+        # An expected rule here needs to be created as the api returns
+        # different attributes on the rule for a response than what was
+        # passed in. For exmaple:
+        #  "cidr": "0.0.0.0/0" ->"ip_range": {"cidr": "0.0.0.0/0"}
+        expected_rule = security_group_rule_template(
+            ip_range={'cidr': '10.2.3.124/24'}, parent_group_id=1,
+            group={}, id=88, ip_protocol='TCP')
+        expected = security_group_template(id=1,
+                                     name='test',
+                                     description='test-desc',
+                                     rules=[expected_rule])
+
+        expected = {'security_groups': [expected]}
+
+        def return_security_groups(context, project, search_opts):
+            return [security_group_db(sg) for sg in groups]
+
+        self.stubs.Set(self.controller.security_group_api, 'list',
                        return_security_groups)
 
         req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups')
@@ -376,6 +423,24 @@ class TestSecurityGroups(test.TestCase):
 
         self.assertEqual(res_dict, expected)
 
+    @mock.patch('nova.db.instance_get_by_uuid')
+    @mock.patch('nova.db.security_group_get_by_instance', return_value=[])
+    def test_get_security_group_empty_for_instance(self, mock_sec_group,
+                                                   mock_db_get_ins):
+        expected = {'security_groups': []}
+
+        def return_instance(context, server_id,
+                            columns_to_join=None, use_slave=False):
+            self.assertEqual(server_id, FAKE_UUID1)
+            return return_server_by_uuid(context, server_id)
+        mock_db_get_ins.side_effect = return_instance
+        req = fakes.HTTPRequest.blank('/v2/%s/servers/%s/os-security-groups' %
+                                      ('fake', FAKE_UUID1))
+        res_dict = self.server_controller.index(req, FAKE_UUID1)
+        self.assertEqual(expected, res_dict)
+        mock_sec_group.assert_called_once_with(req.environ['nova.context'],
+                                               FAKE_UUID1)
+
     def test_get_security_group_by_instance_non_existing(self):
         self.stubs.Set(nova.db, 'instance_get', return_server_nonexistent)
         self.stubs.Set(nova.db, 'instance_get_by_uuid',
@@ -426,7 +491,8 @@ class TestSecurityGroups(test.TestCase):
             self.assertEqual(sg['id'], group_id)
             return security_group_db(sg)
 
-        def return_update_security_group(context, group_id, values):
+        def return_update_security_group(context, group_id, values,
+                                         columns_to_join=None):
             self.assertEqual(sg_update['id'], group_id)
             self.assertEqual(sg_update['name'], values['name'])
             self.assertEqual(sg_update['description'], values['description'])
@@ -466,7 +532,8 @@ class TestSecurityGroups(test.TestCase):
                           req, '1', {'security_group': sg})
 
     def test_delete_security_group_by_id(self):
-        sg = security_group_template(id=1, rules=[])
+        sg = security_group_template(id=1, project_id='fake_project',
+                                     user_id='fake_user', rules=[])
 
         self.called = False
 
@@ -486,6 +553,26 @@ class TestSecurityGroups(test.TestCase):
         self.controller.delete(req, '1')
 
         self.assertTrue(self.called)
+
+    def test_delete_security_group_by_admin(self):
+        sg = security_group_template(id=2, rules=[])
+
+        req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups')
+        self.controller.create(req, {'security_group': sg})
+        context = req.environ['nova.context']
+
+        # Ensure quota usage for security group is correct.
+        self._assert_security_groups_in_use(context.project_id,
+                                            context.user_id, 2)
+
+        # Delete the security group by admin.
+        req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups/2',
+                                      use_admin_context=True)
+        self.controller.delete(req, '2')
+
+        # Ensure quota for security group in use is released.
+        self._assert_security_groups_in_use(context.project_id,
+                                            context.user_id, 1)
 
     def test_delete_security_group_by_invalid_id(self):
         req = fakes.HTTPRequest.blank('/v2/fake/os-security-groups/invalid')
@@ -896,11 +983,19 @@ class TestSecurityGroupRules(test.TestCase):
                           req, {'security_group_rule': rule})
 
     def test_create_with_non_existing_parent_group_id(self):
-        rule = security_group_rule_template(group_id='invalid',
+        rule = security_group_rule_template(group_id=None,
                                             parent_group_id=self.invalid_id)
 
         req = fakes.HTTPRequest.blank('/v2/fake/os-security-group-rules')
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.create,
+                          req, {'security_group_rule': rule})
+
+    def test_create_with_non_existing_group_id(self):
+        rule = security_group_rule_template(group_id='invalid',
+                                            parent_group_id=self.sg2['id'])
+
+        req = fakes.HTTPRequest.blank('/v2/fake/os-security-group-rules')
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
                           req, {'security_group_rule': rule})
 
     def test_create_with_invalid_protocol(self):
@@ -1054,7 +1149,7 @@ class TestSecurityGroupRules(test.TestCase):
         if proto == 'icmp':
             expected_rule['to_port'] = -1
             expected_rule['from_port'] = -1
-        self.assertTrue(security_group_rule == expected_rule)
+        self.assertEqual(expected_rule, security_group_rule)
 
     def test_create_with_no_ports_icmp(self):
         self._test_create_with_no_ports_and_no_group('icmp')
@@ -1083,10 +1178,10 @@ class TestSecurityGroupRules(test.TestCase):
             'ip_protocol': proto, 'to_port': to_port, 'parent_group_id':
              self.sg2['id'], 'ip_range': {}, 'id': security_group_rule['id']
         }
-        self.assertTrue(security_group_rule['ip_protocol'] == proto)
-        self.assertTrue(security_group_rule['from_port'] == from_port)
-        self.assertTrue(security_group_rule['to_port'] == to_port)
-        self.assertTrue(security_group_rule == expected_rule)
+        self.assertEqual(proto, security_group_rule['ip_protocol'])
+        self.assertEqual(from_port, security_group_rule['from_port'])
+        self.assertEqual(to_port, security_group_rule['to_port'])
+        self.assertEqual(expected_rule, security_group_rule)
 
     def test_create_with_ports_icmp(self):
         self._test_create_with_ports('icmp', 0, 1)
@@ -1495,7 +1590,7 @@ def fake_compute_get_all(*args, **kwargs):
     ]
 
     return instance_obj._make_instance_list(args[1],
-                                            instance_obj.InstanceList(),
+                                            objects.InstanceList(),
                                             db_list,
                                             ['metadata', 'system_metadata',
                                              'security_groups', 'info_cache'])

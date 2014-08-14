@@ -19,7 +19,7 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 
@@ -101,7 +101,7 @@ class Assisted_volume_snapshots(extensions.ExtensionDescriptor):
     alias = "os-assisted-volume-snapshots"
     namespace = ("http://docs.openstack.org/compute/ext/"
                  "assisted-volume-snapshots/api/v2")
-    updated = "2013-08-29T00:00:00-00:00"
+    updated = "2013-08-29T00:00:00Z"
 
     def get_resources(self):
         resource = extensions.ResourceExtension('os-assisted-volume-snapshots',

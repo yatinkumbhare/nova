@@ -1,6 +1,5 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 NTT DOCOMO, INC.
+# Copyright 2014 Hewlett-Packard Development Company, L.P.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,7 +18,7 @@ import errno
 import os
 import shutil
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.virt.disk import api as disk_api
 from nova.virt.libvirt import utils as libvirt_utils
@@ -27,17 +26,23 @@ from nova.virt.libvirt import utils as libvirt_utils
 LOG = logging.getLogger(__name__)
 
 
-def cache_image(context, target, image_id, user_id, project_id):
+def cache_image(context, target, image_id, user_id, project_id, clean=False):
+    if clean and os.path.exists(target):
+        os.unlink(target)
     if not os.path.exists(target):
         libvirt_utils.fetch_image(context, target, image_id,
                                   user_id, project_id)
 
 
-def inject_into_image(image, key, net, metadata, admin_password,
-        files, partition, use_cow=False):
+def inject_into_image(image, key, net, metadata, admin_password, files,
+                      partition, use_cow=False):
     try:
-        disk_api.inject_data(image, key, net, metadata, admin_password,
-                files, partition, use_cow)
+        if os.path.exists(image):
+            disk_api.inject_data(image, key, net, metadata, admin_password,
+                                 files, partition, use_cow)
+        else:
+            LOG.warning(_('Image %s not found on disk storage. '
+                          'Continue without injecting data'), image)
     except Exception as e:
         LOG.warn(_("Failed to inject data into image %(image)s. "
                    "Error: %(e)s"), {'image': image, 'e': e})

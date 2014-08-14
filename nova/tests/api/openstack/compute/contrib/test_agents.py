@@ -18,6 +18,7 @@ from nova.api.openstack.compute.contrib import agents
 from nova import context
 from nova import db
 from nova.db.sqlalchemy import models
+from nova import exception
 from nova import test
 
 fake_agents_list = [{'hypervisor': 'kvm', 'os': 'win',
@@ -117,6 +118,33 @@ class AgentsTest(test.NoDBTestCase):
         res_dict = self.controller.create(req, body)
         self.assertEqual(res_dict, response)
 
+    def test_agents_create_key_error(self):
+        req = FakeRequest()
+        body = {'agent': {'hypervisordummy': 'kvm',
+                'os': 'win',
+                'architecture': 'x86',
+                'version': '7.0',
+                'url': 'xxx://xxxx/xxx/xxx',
+                'md5hash': 'add6bb58e139be103324d04d82d8f545'}}
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.create, req, body)
+
+    def test_agents_create_with_existed_agent(self):
+        def fake_agent_build_create_with_exited_agent(context, values):
+            raise exception.AgentBuildExists(**values)
+
+        self.stubs.Set(db, 'agent_build_create',
+                       fake_agent_build_create_with_exited_agent)
+        req = FakeRequest()
+        body = {'agent': {'hypervisor': 'kvm',
+                'os': 'win',
+                'architecture': 'x86',
+                'version': '7.0',
+                'url': 'xxx://xxxx/xxx/xxx',
+                'md5hash': 'add6bb58e139be103324d04d82d8f545'}}
+        self.assertRaises(webob.exc.HTTPConflict, self.controller.create, req,
+                          body=body)
+
     def _test_agents_create_with_invalid_length(self, key):
         req = FakeRequest()
         body = {'agent': {'hypervisor': 'kvm',
@@ -210,6 +238,22 @@ class AgentsTest(test.NoDBTestCase):
                     'md5hash': 'add6bb58e139be103324d04d82d8f545'}}
         res_dict = self.controller.update(req, 1, body)
         self.assertEqual(res_dict, response)
+
+    def test_agents_update_key_error(self):
+        req = FakeRequest()
+        body = {'para': {'versiondummy': '7.0',
+                'url': 'xxx://xxxx/xxx/xxx',
+                'md5hash': 'add6bb58e139be103324d04d82d8f545'}}
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.update, req, 1, body)
+
+    def test_agents_update_value_error(self):
+        req = FakeRequest()
+        body = {'para': {'version': '7.0',
+                'url': 1111,
+                'md5hash': 'add6bb58e139be103324d04d82d8f545'}}
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.update, req, 1, body)
 
     def _test_agents_update_with_invalid_length(self, key):
         req = FakeRequest()

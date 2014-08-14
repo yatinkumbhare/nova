@@ -12,13 +12,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
+
 from nova import db
+from nova import exception
 from nova.objects import compute_node
 from nova.objects import service
+from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova.tests.objects import test_objects
 
 NOW = timeutils.utcnow().replace(microsecond=0)
+fake_stats = {'num_foo': '10'}
+fake_stats_db_format = jsonutils.dumps(fake_stats)
+# host_ip is coerced from a string to an IPAddress
+# but needs to be converted to a string for the database format
+fake_host_ip = '127.0.0.1'
 fake_compute_node = {
     'created_at': NOW,
     'updated_at': None,
@@ -42,7 +51,9 @@ fake_compute_node = {
     'cpu_info': 'Schmintel i786',
     'disk_available_least': 256,
     'metrics': '',
-}
+    'stats': fake_stats_db_format,
+    'host_ip': fake_host_ip,
+    }
 
 
 class _TestComputeNodeObject(object):
@@ -51,7 +62,9 @@ class _TestComputeNodeObject(object):
         db.compute_node_get(self.context, 123).AndReturn(fake_compute_node)
         self.mox.ReplayAll()
         compute = compute_node.ComputeNode.get_by_id(self.context, 123)
-        self.compare_obj(compute, fake_compute_node)
+        self.compare_obj(compute, fake_compute_node,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
 
     def test_get_by_service_id(self):
         self.mox.StubOutWithMock(db, 'compute_node_get_by_service_id')
@@ -59,9 +72,31 @@ class _TestComputeNodeObject(object):
             fake_compute_node)
         self.mox.ReplayAll()
         compute = compute_node.ComputeNode.get_by_service_id(self.context, 456)
-        self.compare_obj(compute, fake_compute_node)
+        self.compare_obj(compute, fake_compute_node,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
 
     def test_create(self):
+        self.mox.StubOutWithMock(db, 'compute_node_create')
+        db.compute_node_create(
+            self.context,
+            {
+                'service_id': 456,
+                'stats': fake_stats_db_format,
+                'host_ip': fake_host_ip,
+            }).AndReturn(fake_compute_node)
+        self.mox.ReplayAll()
+        compute = compute_node.ComputeNode()
+        compute.service_id = 456
+        compute.stats = fake_stats
+        # NOTE (pmurray): host_ip is coerced to an IPAddress
+        compute.host_ip = fake_host_ip
+        compute.create(self.context)
+        self.compare_obj(compute, fake_compute_node,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
+
+    def test_recreate_fails(self):
         self.mox.StubOutWithMock(db, 'compute_node_create')
         db.compute_node_create(self.context, {'service_id': 456}).AndReturn(
             fake_compute_node)
@@ -69,19 +104,37 @@ class _TestComputeNodeObject(object):
         compute = compute_node.ComputeNode()
         compute.service_id = 456
         compute.create(self.context)
-        self.compare_obj(compute, fake_compute_node)
+        self.assertRaises(exception.ObjectActionError, compute.create,
+                          self.context)
 
     def test_save(self):
         self.mox.StubOutWithMock(db, 'compute_node_update')
-        db.compute_node_update(self.context, 123, {'vcpus_used': 3},
-                               prune_stats=False
-                               ).AndReturn(fake_compute_node)
+        db.compute_node_update(
+            self.context, 123,
+            {
+                'vcpus_used': 3,
+                'stats': fake_stats_db_format,
+                'host_ip': fake_host_ip,
+            }).AndReturn(fake_compute_node)
         self.mox.ReplayAll()
         compute = compute_node.ComputeNode()
         compute.id = 123
         compute.vcpus_used = 3
+        compute.stats = fake_stats
+        # NOTE (pmurray): host_ip is coerced to an IPAddress
+        compute.host_ip = fake_host_ip
         compute.save(self.context)
-        self.compare_obj(compute, fake_compute_node)
+        self.compare_obj(compute, fake_compute_node,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
+
+    @mock.patch.object(db, 'compute_node_create',
+                       return_value=fake_compute_node)
+    def test_set_id_failure(self, db_mock):
+        compute = compute_node.ComputeNode()
+        compute.create(self.context)
+        self.assertRaises(exception.ReadOnlyFieldError, setattr,
+                          compute, 'id', 124)
 
     def test_destroy(self):
         self.mox.StubOutWithMock(db, 'compute_node_delete')
@@ -109,7 +162,9 @@ class _TestComputeNodeObject(object):
         self.mox.ReplayAll()
         computes = compute_node.ComputeNodeList.get_all(self.context)
         self.assertEqual(1, len(computes))
-        self.compare_obj(computes[0], fake_compute_node)
+        self.compare_obj(computes[0], fake_compute_node,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
 
     def test_get_by_hypervisor(self):
         self.mox.StubOutWithMock(db, 'compute_node_search_by_hypervisor')
@@ -119,7 +174,20 @@ class _TestComputeNodeObject(object):
         computes = compute_node.ComputeNodeList.get_by_hypervisor(self.context,
                                                                   'hyper')
         self.assertEqual(1, len(computes))
-        self.compare_obj(computes[0], fake_compute_node)
+        self.compare_obj(computes[0], fake_compute_node,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
+
+    @mock.patch('nova.db.service_get')
+    def test_get_by_service(self, service_get):
+        service_get.return_value = {'compute_node': [fake_compute_node]}
+        fake_service = service.Service(id=123)
+        computes = compute_node.ComputeNodeList.get_by_service(self.context,
+                                                               fake_service)
+        self.assertEqual(1, len(computes))
+        self.compare_obj(computes[0], fake_compute_node,
+                         comparators={'stats': self.json_comparator,
+                                      'host_ip': self.str_comparator})
 
 
 class TestComputeNodeObject(test_objects._LocalTest,

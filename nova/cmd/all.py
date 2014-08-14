@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -31,8 +29,9 @@ import sys
 from oslo.config import cfg
 
 from nova import config
+from nova.i18n import _
+from nova import objects
 from nova.objectstore import s3server
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova import service
 from nova import utils
@@ -51,6 +50,7 @@ def main():
     logging.setup("nova")
     LOG = logging.getLogger('nova.all')
     utils.monkey_patch()
+    objects.register_all()
     launcher = service.process_launcher()
 
     # nova-api

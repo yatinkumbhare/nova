@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Piston Cloud Computing, Inc.
@@ -18,15 +16,13 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-#
-# @author: Aaron Rosen, Nicira Networks, Inc.
 
 import urllib
 
 from oslo.config import cfg
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import utils
 
 CONF = cfg.CONF
@@ -147,13 +143,11 @@ class SecurityGroupBase(object):
            defined in the given security group.
         """
         for rule in security_group['rules']:
-            is_duplicate = True
             keys = ('group_id', 'cidr', 'from_port', 'to_port', 'protocol')
             for key in keys:
                 if rule.get(key) != new_rule.get(key):
-                    is_duplicate = False
                     break
-            if is_duplicate:
+            else:
                 return rule.get('id') or True
         return False
 

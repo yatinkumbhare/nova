@@ -24,20 +24,20 @@ from oslo.config import cfg
 from nova.compute import claims
 from nova.compute import flavors
 from nova.compute import monitors
+from nova.compute import resources as ext_resources
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import conductor
 from nova import context
 from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova.objects import base as obj_base
-from nova.objects import instance as instance_obj
-from nova.objects import migration as migration_obj
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
-from nova.openstack.common.notifier import api as notifier
 from nova.pci import pci_manager
+from nova import rpc
 from nova import utils
 
 resource_tracker_opts = [
@@ -47,7 +47,10 @@ resource_tracker_opts = [
                help='Amount of memory in MB to reserve for the host'),
     cfg.StrOpt('compute_stats_class',
                default='nova.compute.stats.Stats',
-               help='Class that will manage stats for the local compute host')
+               help='Class that will manage stats for the local compute host'),
+    cfg.ListOpt('compute_resources',
+                default=['vcpu'],
+                help='The names of the extra resources to track.'),
 ]
 
 CONF = cfg.CONF
@@ -76,6 +79,10 @@ class ResourceTracker(object):
         self.conductor_api = conductor.API()
         monitor_handler = monitors.ResourceMonitorHandler()
         self.monitors = monitor_handler.choose_monitors(self)
+        self.ext_resources_handler = \
+            ext_resources.ResourceHandler(CONF.compute_resources)
+        self.notifier = rpc.get_notifier()
+        self.old_resources = {}
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def instance_claim(self, context, instance_ref, limits=None):
@@ -112,27 +119,23 @@ class ResourceTracker(object):
 
         # get memory overhead required to build this instance:
         overhead = self.driver.estimate_instance_overhead(instance_ref)
-        LOG.debug(_("Memory overhead for %(flavor)d MB instance; %(overhead)d "
-                    "MB"), {'flavor': instance_ref['memory_mb'],
-                            'overhead': overhead['memory_mb']})
+        LOG.debug("Memory overhead for %(flavor)d MB instance; %(overhead)d "
+                  "MB", {'flavor': instance_ref['memory_mb'],
+                          'overhead': overhead['memory_mb']})
 
-        claim = claims.Claim(instance_ref, self, overhead=overhead)
+        claim = claims.Claim(instance_ref, self, self.compute_node,
+                             overhead=overhead, limits=limits)
 
-        if claim.test(self.compute_node, limits):
+        self._set_instance_host_and_node(context, instance_ref)
 
-            self._set_instance_host_and_node(context, instance_ref)
+        # Mark resources in-use and update stats
+        self._update_usage_from_instance(self.compute_node, instance_ref)
 
-            # Mark resources in-use and update stats
-            self._update_usage_from_instance(self.compute_node, instance_ref)
+        elevated = context.elevated()
+        # persist changes to the compute node:
+        self._update(elevated, self.compute_node)
 
-            elevated = context.elevated()
-            # persist changes to the compute node:
-            self._update(elevated, self.compute_node)
-
-            return claim
-
-        else:
-            raise exception.ComputeResourcesUnavailable()
+        return claim
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def resize_claim(self, context, instance, instance_type, limits=None):
@@ -142,10 +145,10 @@ class ResourceTracker(object):
         :param instance: instance object to reserve resources for
         :param instance_type: new instance_type being resized to
         :param limits: Dict of oversubscription limits for memory, disk,
-                       and CPUs.
+        and CPUs
         :returns: A Claim ticket representing the reserved resources.  This
-                  should be turned into finalize  a resource claim or free
-                  resources after the compute operation is finished.
+        should be turned into finalize  a resource claim or free
+        resources after the compute operation is finished.
         """
         if self.disabled:
             # compute_driver doesn't support resource tracking, just
@@ -156,31 +159,27 @@ class ResourceTracker(object):
 
         # get memory overhead required to build this instance:
         overhead = self.driver.estimate_instance_overhead(instance_type)
-        LOG.debug(_("Memory overhead for %(flavor)d MB instance; %(overhead)d "
-                    "MB"), {'flavor': instance_type['memory_mb'],
-                            'overhead': overhead['memory_mb']})
+        LOG.debug("Memory overhead for %(flavor)d MB instance; %(overhead)d "
+                  "MB", {'flavor': instance_type['memory_mb'],
+                          'overhead': overhead['memory_mb']})
 
         instance_ref = obj_base.obj_to_primitive(instance)
         claim = claims.ResizeClaim(instance_ref, instance_type, self,
-                                   overhead=overhead)
+                                   self.compute_node, overhead=overhead,
+                                   limits=limits)
 
-        if claim.test(self.compute_node, limits):
+        migration = self._create_migration(context, instance_ref,
+                                           instance_type)
+        claim.migration = migration
 
-            migration = self._create_migration(context, instance_ref,
-                                               instance_type)
-            claim.migration = migration
-
-            # Mark the resources in-use for the resize landing on this
-            # compute host:
-            self._update_usage_from_migration(context, instance_ref,
+        # Mark the resources in-use for the resize landing on this
+        # compute host:
+        self._update_usage_from_migration(context, instance_ref,
                                               self.compute_node, migration)
-            elevated = context.elevated()
-            self._update(elevated, self.compute_node)
+        elevated = context.elevated()
+        self._update(elevated, self.compute_node)
 
-            return claim
-
-        else:
-            raise exception.ComputeResourcesUnavailable()
+        return claim
 
     def _create_migration(self, context, instance, instance_type):
         """Create a migration record for the upcoming resize.  This should
@@ -188,7 +187,7 @@ class ResourceTracker(object):
         claim will not be lost if the audit process starts.
         """
         old_instance_type = flavors.extract_flavor(instance)
-        migration = migration_obj.Migration()
+        migration = objects.Migration()
         migration.dest_compute = self.host
         migration.dest_node = self.nodename
         migration.dest_host = self.driver.get_host_ip_addr()
@@ -236,12 +235,10 @@ class ResourceTracker(object):
                 instance_type = self._get_instance_type(ctxt, instance, prefix)
 
             if instance_type['id'] == itype['id']:
-                self.stats.update_stats_for_migration(itype, sign=-1)
                 if self.pci_tracker:
                     self.pci_tracker.update_pci_for_migration(instance,
                                                               sign=-1)
                 self._update_usage(self.compute_node, itype, sign=-1)
-                self.compute_node['stats'] = self.stats
 
                 ctxt = context.get_admin_context()
                 self._update(ctxt, self.compute_node)
@@ -282,9 +279,8 @@ class ResourceTracker(object):
             metrics_info['metrics'] = metrics
             metrics_info['host'] = self.host
             metrics_info['host_ip'] = CONF.my_ip
-            notifier.notify(context, 'compute.%s' % nodename,
-                            'compute.metrics.update', notifier.INFO,
-                            metrics_info)
+            notifier = rpc.get_notifier(service='compute', host=nodename)
+            notifier.info(context, 'compute.metrics.update', metrics_info)
         return metrics
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
@@ -318,7 +314,7 @@ class ResourceTracker(object):
                 'pci_passthrough_devices')))
 
         # Grab all instances assigned to this node:
-        instances = instance_obj.InstanceList.get_by_host_and_node(
+        instances = objects.InstanceList.get_by_host_and_node(
             context, self.host, self.nodename)
 
         # Now calculate usage based on instance utilization:
@@ -344,7 +340,7 @@ class ResourceTracker(object):
             self.pci_tracker.clean_usage(instances, migrations, orphans)
             resources['pci_stats'] = jsonutils.dumps(self.pci_tracker.stats)
         else:
-            resources['pci_stats'] = jsonutils.dumps({})
+            resources['pci_stats'] = jsonutils.dumps([])
 
         self._report_final_resource_view(resources)
 
@@ -381,13 +377,24 @@ class ResourceTracker(object):
 
         else:
             # just update the record:
-            self._update(context, resources, prune_stats=True)
+            self._update(context, resources)
             LOG.info(_('Compute_service record updated for %(host)s:%(node)s')
                     % {'host': self.host, 'node': self.nodename})
+
+    def _write_ext_resources(self, resources):
+        resources['stats'] = {}
+        resources['stats'].update(self.stats)
+        self.ext_resources_handler.write_resources(resources)
 
     def _create(self, context, values):
         """Create the compute node in the DB."""
         # initialize load stats from existing instances:
+        self._write_ext_resources(values)
+        # NOTE(pmurray): the stats field is stored as a json string. The
+        # json conversion will be done automatically by the ComputeNode object
+        # so this can be removed when using ComputeNode.
+        values['stats'] = jsonutils.dumps(values['stats'])
+
         self.compute_node = self.conductor_api.compute_node_create(context,
                                                                    values)
 
@@ -413,47 +420,67 @@ class ResourceTracker(object):
         free_ram_mb = resources['memory_mb'] - resources['memory_mb_used']
         free_disk_gb = resources['local_gb'] - resources['local_gb_used']
 
-        LOG.debug(_("Hypervisor: free ram (MB): %s") % free_ram_mb)
-        LOG.debug(_("Hypervisor: free disk (GB): %s") % free_disk_gb)
+        LOG.debug("Hypervisor: free ram (MB): %s" % free_ram_mb)
+        LOG.debug("Hypervisor: free disk (GB): %s" % free_disk_gb)
 
         vcpus = resources['vcpus']
         if vcpus:
             free_vcpus = vcpus - resources['vcpus_used']
-            LOG.debug(_("Hypervisor: free VCPUs: %s") % free_vcpus)
+            LOG.debug("Hypervisor: free VCPUs: %s" % free_vcpus)
         else:
-            LOG.debug(_("Hypervisor: VCPU information unavailable"))
+            LOG.debug("Hypervisor: VCPU information unavailable")
 
         if 'pci_passthrough_devices' in resources and \
                 resources['pci_passthrough_devices']:
-            LOG.debug(_("Hypervisor: assignable PCI devices: %s") %
+            LOG.debug("Hypervisor: assignable PCI devices: %s" %
                 resources['pci_passthrough_devices'])
         else:
-            LOG.debug(_("Hypervisor: no assignable PCI devices"))
+            LOG.debug("Hypervisor: no assignable PCI devices")
 
     def _report_final_resource_view(self, resources):
-        """Report final calculate of free memory, disk, CPUs, and PCI devices,
+        """Report final calculate of physical memory, used virtual memory,
+        disk, usable vCPUs, used virtual CPUs and PCI devices,
         including instance calculations and in-progress resource claims. These
         values will be exposed via the compute node table to the scheduler.
         """
-        LOG.audit(_("Free ram (MB): %s") % resources['free_ram_mb'])
+        LOG.audit(_("Total physical ram (MB): %(pram)s, "
+                    "total allocated virtual ram (MB): %(vram)s"),
+                    {'pram': resources['memory_mb'],
+                     'vram': resources['memory_mb_used']})
         LOG.audit(_("Free disk (GB): %s") % resources['free_disk_gb'])
 
         vcpus = resources['vcpus']
         if vcpus:
-            free_vcpus = vcpus - resources['vcpus_used']
-            LOG.audit(_("Free VCPUS: %s") % free_vcpus)
+            LOG.audit(_("Total usable vcpus: %(tcpu)s, "
+                        "total allocated vcpus: %(ucpu)s"),
+                        {'tcpu': vcpus, 'ucpu': resources['vcpus_used']})
         else:
             LOG.audit(_("Free VCPU information unavailable"))
 
-        if 'pci_devices' in resources:
-            LOG.audit(_("Free PCI devices: %s") % resources['pci_devices'])
+        if 'pci_stats' in resources:
+            LOG.audit(_("PCI stats: %s"), resources['pci_stats'])
 
-    def _update(self, context, values, prune_stats=False):
+    def _resource_change(self, resources):
+        """Check to see if any resouces have changed."""
+        if cmp(resources, self.old_resources) != 0:
+            self.old_resources = resources
+            return True
+        return False
+
+    def _update(self, context, values):
         """Persist the compute node updates to the DB."""
+        self._write_ext_resources(values)
+        # NOTE(pmurray): the stats field is stored as a json string. The
+        # json conversion will be done automatically by the ComputeNode object
+        # so this can be removed when using ComputeNode.
+        values['stats'] = jsonutils.dumps(values['stats'])
+
+        if not self._resource_change(values):
+            return
         if "service" in self.compute_node:
             del self.compute_node['service']
         self.compute_node = self.conductor_api.compute_node_update(
-            context, self.compute_node, values, prune_stats)
+            context, self.compute_node, values)
         if self.pci_tracker:
             self.pci_tracker.save(context)
 
@@ -474,7 +501,7 @@ class ResourceTracker(object):
                                      resources['local_gb_used'])
 
         resources['running_vms'] = self.stats.num_instances
-        resources['vcpus_used'] = self.stats.num_vcpus_used
+        self.ext_resources_handler.update_from_instance(usage, sign)
 
     def _update_usage_from_migration(self, context, instance, resources,
                                      migration):
@@ -517,16 +544,14 @@ class ResourceTracker(object):
                     migration['old_instance_type_id'])
 
         if itype:
-            self.stats.update_stats_for_migration(itype)
             if self.pci_tracker:
                 self.pci_tracker.update_pci_for_migration(instance)
             self._update_usage(resources, itype)
-            resources['stats'] = self.stats
             if self.pci_tracker:
                 resources['pci_stats'] = jsonutils.dumps(
                         self.pci_tracker.stats)
             else:
-                resources['pci_stats'] = jsonutils.dumps({})
+                resources['pci_stats'] = jsonutils.dumps([])
             self.tracked_migrations[uuid] = (migration, itype)
 
     def _update_usage_from_migrations(self, context, resources, migrations):
@@ -594,11 +619,10 @@ class ResourceTracker(object):
             self._update_usage(resources, instance, sign=sign)
 
         resources['current_workload'] = self.stats.calculate_workload()
-        resources['stats'] = self.stats
         if self.pci_tracker:
             resources['pci_stats'] = jsonutils.dumps(self.pci_tracker.stats)
         else:
-            resources['pci_stats'] = jsonutils.dumps({})
+            resources['pci_stats'] = jsonutils.dumps([])
 
     def _update_usage_from_instances(self, resources, instances):
         """Calculate resource usage based on instance utilization.  This is
@@ -608,13 +632,13 @@ class ResourceTracker(object):
         """
         self.tracked_instances.clear()
 
-        # purge old stats
+        # purge old stats and init with anything passed in by the driver
         self.stats.clear()
+        self.stats.digest_stats(resources.get('stats'))
 
         # set some initial values, reserve room for host/hypervisor:
         resources['local_gb_used'] = CONF.reserved_host_disk_mb / 1024
         resources['memory_mb_used'] = CONF.reserved_host_memory_mb
-        resources['vcpus_used'] = 0
         resources['free_ram_mb'] = (resources['memory_mb'] -
                                     resources['memory_mb_used'])
         resources['free_disk_gb'] = (resources['local_gb'] -
@@ -622,10 +646,11 @@ class ResourceTracker(object):
         resources['current_workload'] = 0
         resources['running_vms'] = 0
 
+        # Reset values for extended resources
+        self.ext_resources_handler.reset_resources(resources, self.driver)
+
         for instance in instances:
-            if instance['vm_state'] == vm_states.DELETED:
-                continue
-            else:
+            if instance['vm_state'] != vm_states.DELETED:
                 self._update_usage_from_instance(resources, instance)
 
     def _find_orphaned_instances(self):
@@ -689,15 +714,13 @@ class ResourceTracker(object):
     def _get_instance_type(self, context, instance, prefix,
             instance_type_id=None):
         """Get the instance type from sys metadata if it's stashed.  If not,
-        fall back to fetching it via the conductor API.
+        fall back to fetching it via the object API.
 
         See bug 1164110
         """
-        if not instance_type_id:
-            instance_type_id = instance['instance_type_id']
-
         try:
             return flavors.extract_flavor(instance, prefix)
         except KeyError:
-            return self.conductor_api.instance_type_get(context,
-                    instance_type_id)
+            if not instance_type_id:
+                instance_type_id = instance['instance_type_id']
+            return objects.Flavor.get_by_id(context, instance_type_id)

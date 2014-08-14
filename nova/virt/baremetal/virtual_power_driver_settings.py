@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Hewlett-Packard Development Company, L.P.
 
 # All Rights Reserved.
@@ -41,7 +39,7 @@ class virsh(object):
     """set commands for basic Virsh control."""
 
     def __init__(self):
-        self.base_cmd = '/usr/bin/virsh'
+        self.base_cmd = '/usr/bin/virsh --connect qemu:///system'
         self.start_cmd = 'start {_NodeName_}'
         self.stop_cmd = 'destroy {_NodeName_}'
         self.reboot_cmd = 'reset {_NodeName_}'

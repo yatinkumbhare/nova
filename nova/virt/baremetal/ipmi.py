@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # coding=utf-8
 
 # Copyright 2012 Hewlett-Packard Development Company, L.P.
@@ -28,7 +27,7 @@ import tempfile
 from oslo.config import cfg
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
 from nova import paths
@@ -40,15 +39,15 @@ from nova.virt.baremetal import utils as bm_utils
 opts = [
     cfg.StrOpt('terminal',
                default='shellinaboxd',
-               help='path to baremetal terminal program'),
+               help='Path to baremetal terminal program'),
     cfg.StrOpt('terminal_cert_dir',
-               help='path to baremetal terminal SSL cert(PEM)'),
+               help='Path to baremetal terminal SSL cert(PEM)'),
     cfg.StrOpt('terminal_pid_dir',
                default=paths.state_path_def('baremetal/console'),
-               help='path to directory stores pidfiles of baremetal_terminal'),
+               help='Path to directory stores pidfiles of baremetal_terminal'),
     cfg.IntOpt('ipmi_power_retry',
                default=10,
-               help='maximal number of retries for IPMI operations'),
+               help='Maximal number of retries for IPMI operations'),
     ]
 
 baremetal_group = cfg.OptGroup(name='baremetal',
@@ -108,16 +107,16 @@ class IPMI(base.PowerManager):
         self.password = node['pm_password']
         self.port = node['terminal_port']
 
-        if self.node_id == None:
+        if self.node_id is None:
             raise exception.InvalidParameterValue(_("Node id not supplied "
                 "to IPMI"))
-        if self.address == None:
+        if self.address is None:
             raise exception.InvalidParameterValue(_("Address not supplied "
                 "to IPMI"))
-        if self.user == None:
+        if self.user is None:
             raise exception.InvalidParameterValue(_("User not supplied "
                 "to IPMI"))
-        if self.password == None:
+        if self.password is None:
             raise exception.InvalidParameterValue(_("Password not supplied "
                 "to IPMI"))
 
@@ -135,7 +134,7 @@ class IPMI(base.PowerManager):
             args.append(pwfile)
             args.extend(command.split(" "))
             out, err = utils.execute(*args, attempts=3)
-            LOG.debug(_("ipmitool stdout: '%(out)s', stderr: '%(err)s'"),
+            LOG.debug("ipmitool stdout: '%(out)s', stderr: '%(err)s'",
                       {'out': out, 'err': err})
             return out, err
         finally:

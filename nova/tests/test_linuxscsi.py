@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 #    Copyright 2010 OpenStack Foundation
 #    (c) Copyright 2012-2013 Hewlett-Packard Development Company, L.P.
 #
@@ -61,7 +59,7 @@ class StorageLinuxSCSITestCase(test.NoDBTestCase):
 
         info = linuxscsi.find_multipath_device('/dev/sde')
         LOG.error("info = %s" % info)
-        self.assertEqual("/dev/dm-3", info["device"])
+        self.assertEqual("/dev/mapper/350002ac20398383d", info["device"])
         self.assertEqual("/dev/sde", info['devices'][0]['device'])
         self.assertEqual("0", info['devices'][0]['host'])
         self.assertEqual("0", info['devices'][0]['id'])
@@ -92,7 +90,8 @@ class StorageLinuxSCSITestCase(test.NoDBTestCase):
 
         info = linuxscsi.find_multipath_device('/dev/sde')
         LOG.error("info = %s" % info)
-        self.assertEqual("/dev/dm-2", info["device"])
+        self.assertEqual("/dev/mapper/36005076da00638089c000000000004d5",
+                         info["device"])
         self.assertEqual("/dev/sde", info['devices'][0]['device'])
         self.assertEqual("6", info['devices'][0]['host'])
         self.assertEqual("0", info['devices'][0]['channel'])
@@ -120,7 +119,8 @@ class StorageLinuxSCSITestCase(test.NoDBTestCase):
 
         info = linuxscsi.find_multipath_device('/dev/sdd')
         LOG.error("info = %s" % info)
-        self.assertEqual("/dev/dm-2", info["device"])
+        self.assertEqual("/dev/mapper/36005076303ffc48e0000000000000101",
+                         info["device"])
         self.assertEqual("/dev/sdd", info['devices'][0]['device'])
         self.assertEqual("6", info['devices'][0]['host'])
         self.assertEqual("0", info['devices'][0]['channel'])

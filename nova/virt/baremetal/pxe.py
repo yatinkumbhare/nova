@@ -1,6 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-# Copyright 2012 Hewlett-Packard Development Company, L.P.
+# Copyright 2012,2014 Hewlett-Packard Development Company, L.P.
 # Copyright (c) 2012 NTT DOCOMO, INC.
 # All Rights Reserved.
 #
@@ -28,12 +26,14 @@ from oslo.config import cfg
 
 from nova.compute import flavors
 from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova.openstack.common.db import exception as db_exc
 from nova.openstack.common import fileutils
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 from nova.openstack.common import loopingcall
 from nova.openstack.common import timeutils
+from nova import utils
 from nova.virt.baremetal import baremetal_states
 from nova.virt.baremetal import base
 from nova.virt.baremetal import db
@@ -50,14 +50,14 @@ pxe_opts = [
                help='Template file for injected network config'),
     cfg.StrOpt('pxe_append_params',
                default='nofb nomodeset vga=normal',
-               help='additional append parameters for baremetal PXE boot'),
+               help='Additional append parameters for baremetal PXE boot'),
     cfg.StrOpt('pxe_config_template',
                default='$pybasedir/nova/virt/baremetal/pxe_config.template',
                help='Template file for PXE configuration'),
     cfg.BoolOpt('use_file_injection',
                 help='If True, enable file injection for network info, '
                 'files and admin password',
-                default=True),
+                default=False),
     cfg.IntOpt('pxe_deploy_timeout',
                 help='Timeout for PXE deployments. Default: 0 (unlimited)',
                 default=0),
@@ -67,7 +67,7 @@ pxe_opts = [
                 default=False),
     cfg.StrOpt('pxe_bootfile_name',
                help='This gets passed to Neutron as the bootfile dhcp '
-               'parameter when the dhcp_options_enabled is set.',
+               'parameter.',
                default='pxelinux.0'),
     ]
 
@@ -107,7 +107,7 @@ def build_pxe_config(deployment_id, deployment_key, deployment_iscsi_iqn,
     to the two phases of booting. This may be extended later.
 
     """
-    LOG.debug(_("Building PXE config for deployment %s.") % deployment_id)
+    LOG.debug("Building PXE config for deployment %s.", deployment_id)
 
     network_config = None
     if network_info and CONF.baremetal.pxe_network_config:
@@ -165,11 +165,6 @@ def get_pxe_config_file_path(instance):
     return os.path.join(CONF.baremetal.tftp_root, instance['uuid'], 'config')
 
 
-def get_pxe_bootfile_name(instance):
-    """Returns the pxe_bootfile_name option."""
-    return CONF.baremetal.pxe_bootfile_name
-
-
 def get_partition_sizes(instance):
     flavor = flavors.extract_flavor(instance)
     root_mb = flavor['root_gb'] * 1024
@@ -200,7 +195,7 @@ def get_tftp_image_info(instance, flavor):
     Raises NovaException if
     - instance does not contain kernel_id or ramdisk_id
     - deploy_kernel_id or deploy_ramdisk_id can not be read from
-      flavor['extra_specs'] and defaults are not set
+    flavor['extra_specs'] and defaults are not set
 
     """
     image_info = {
@@ -250,8 +245,8 @@ class PXE(base.NodeDriver):
         fileutils.ensure_tree(
                 os.path.join(CONF.baremetal.tftp_root, instance['uuid']))
 
-        LOG.debug(_("Fetching kernel and ramdisk for instance %s") %
-                        instance['name'])
+        LOG.debug("Fetching kernel and ramdisk for instance %s",
+                  instance['name'])
         for label in image_info.keys():
             (uuid, path) = image_info[label]
             bm_utils.cache_image(
@@ -282,13 +277,14 @@ class PXE(base.NodeDriver):
         fileutils.ensure_tree(get_image_dir_path(instance))
         image_path = get_image_file_path(instance)
 
-        LOG.debug(_("Fetching image %(ami)s for instance %(name)s") %
-                        {'ami': image_meta['id'], 'name': instance['name']})
+        LOG.debug("Fetching image %(ami)s for instance %(name)s",
+                  {'ami': image_meta['id'], 'name': instance['name']})
         bm_utils.cache_image(context=context,
                              target=image_path,
                              image_id=image_meta['id'],
                              user_id=instance['user_id'],
-                             project_id=instance['project_id']
+                             project_id=instance['project_id'],
+                             clean=True,
                         )
 
         return [image_meta['id'], image_path]
@@ -314,7 +310,7 @@ class PXE(base.NodeDriver):
         if injected_files is None:
             injected_files = []
         else:
-            # NOTE(deva): copy so we dont modify the original
+            # NOTE(deva): copy so we don't modify the original
             injected_files = list(injected_files)
 
         net_config = build_network_config(network_info)
@@ -322,14 +318,14 @@ class PXE(base.NodeDriver):
         if instance['hostname']:
             injected_files.append(('/etc/hostname', instance['hostname']))
 
-        LOG.debug(_("Injecting files into image for instance %(name)s") %
-                        {'name': instance['name']})
+        LOG.debug("Injecting files into image for instance %(name)s",
+                  {'name': instance['name']})
 
         bm_utils.inject_into_image(
                     image=get_image_file_path(instance),
                     key=ssh_key,
                     net=net_config,
-                    metadata=instance['metadata'],
+                    metadata=utils.instance_meta(instance),
                     admin_password=admin_password,
                     files=injected_files,
                     partition=partition,
@@ -338,7 +334,8 @@ class PXE(base.NodeDriver):
     def cache_images(self, context, node, instance,
             admin_password, image_meta, injected_files, network_info):
         """Prepare all the images for this instance."""
-        flavor = self.virtapi.flavor_get(context, instance['instance_type_id'])
+        flavor = objects.Flavor.get_by_id(context,
+                                          instance['instance_type_id'])
         tftp_image_info = get_tftp_image_info(instance, flavor)
         self._cache_tftp_images(context, instance, tftp_image_info)
 
@@ -351,6 +348,15 @@ class PXE(base.NodeDriver):
         """Delete instance's image file."""
         bm_utils.unlink_without_raise(get_image_file_path(instance))
         bm_utils.rmtree_without_raise(get_image_dir_path(instance))
+
+    def dhcp_options_for_instance(self, instance):
+        return [{'opt_name': 'bootfile-name',
+                 'opt_value': CONF.baremetal.pxe_bootfile_name},
+                 {'opt_name': 'server-ip-address',
+                  'opt_value': CONF.my_ip},
+                 {'opt_name': 'tftp-server',
+                  'opt_value': CONF.my_ip}
+                 ]
 
     def activate_bootloader(self, context, node, instance, network_info):
         """Configure PXE boot loader for an instance
@@ -373,7 +379,8 @@ class PXE(base.NodeDriver):
             ./pxelinux.cfg/
                  {mac} -> ../{uuid}/config
         """
-        flavor = self.virtapi.flavor_get(context, instance['instance_type_id'])
+        flavor = objects.Flavor.get_by_id(context,
+                                          instance['instance_type_id'])
         image_info = get_tftp_image_info(instance, flavor)
         (root_mb, swap_mb, ephemeral_mb) = get_partition_sizes(instance)
         pxe_config_file_path = get_pxe_config_file_path(instance)
@@ -461,7 +468,7 @@ class PXE(base.NodeDriver):
 
                 status = row.get('task_state')
                 if (status == baremetal_states.DEPLOYING
-                        and locals['started'] == False):
+                        and locals['started'] is False):
                     LOG.info(_("PXE deploy started for instance %s")
                                 % instance['uuid'])
                     locals['started'] = True

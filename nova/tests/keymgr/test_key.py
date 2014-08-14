@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 The Johns Hopkins University/Applied Physics Laboratory
 # All Rights Reserved.
 #
@@ -59,11 +57,11 @@ class SymmetricKeyTestCase(KeyTestCase):
     def test___eq__(self):
         self.assertTrue(self.key == self.key)
 
-        self.assertFalse(self.key == None)
+        self.assertFalse(self.key is None)
         self.assertFalse(None == self.key)
 
     def test___ne__(self):
         self.assertFalse(self.key != self.key)
 
-        self.assertTrue(self.key != None)
+        self.assertTrue(self.key is not None)
         self.assertTrue(None != self.key)

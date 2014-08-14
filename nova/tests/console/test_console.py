@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -49,8 +47,6 @@ class ConsoleTestCase(test.TestCase):
     def _create_instance(self):
         """Create a test instance."""
         inst = {}
-        #inst['host'] = self.host
-        #inst['name'] = 'instance-1234'
         inst['image_id'] = 1
         inst['reservation_id'] = 'r-fakeres'
         inst['user_id'] = self.user_id
@@ -181,7 +177,7 @@ class ConsoleAPITestCase(test.TestCase):
             self.context, 'fake_host').AndReturn('compute.fake_host')
         self.mox.StubOutClassWithMocks(console_rpcapi, 'ConsoleAPI')
         console_api_mock = console_rpcapi.ConsoleAPI(
-            topic='compute.fake_host')
+            topic='compute', server='fake_host')
         console_api_mock.add_console(self.context,
                                      self.fake_instance['id'])
 

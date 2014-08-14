@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Copyright (c) 2012 NTT DOCOMO, INC.
 #    Copyright 2011 OpenStack Foundation
 #    Copyright 2011 Ilya Alekseyev
@@ -20,13 +18,14 @@ import os
 import tempfile
 import time
 
+import mock
 import mox
 
 from nova.cmd import baremetal_deploy_helper as bmdh
 from nova.openstack.common import log as logging
+from nova.openstack.common import units
 from nova import test
 from nova.tests.virt.baremetal.db import base as bm_db_base
-from nova import unit
 from nova.virt.baremetal import db as bm_db
 
 bmdh.LOG = logging.getLogger('nova.virt.baremetal.deploy_helper')
@@ -232,6 +231,48 @@ class PhysicalWorkTestCase(test.NoDBTestCase):
 
         self.mox.VerifyAll()
 
+    def test_deploy_preserve_ephemeral(self):
+        address = '127.0.0.1'
+        port = 3306
+        iqn = 'iqn.xyz'
+        lun = 1
+        image_path = '/tmp/xyz/image'
+        pxe_config_path = '/tmp/abc/pxeconfig'
+        root_mb = 128
+        swap_mb = 64
+        ephemeral_mb = 128
+
+        dev = '/dev/fake'
+        ephemeral_part = '/dev/fake-part1'
+        swap_part = '/dev/fake-part2'
+        root_part = '/dev/fake-part3'
+        root_uuid = '12345678-1234-1234-12345678-12345678abcdef'
+
+        self._deploy_mox()
+        self.mox.StubOutWithMock(bmdh, 'mkfs_ephemeral')
+
+        bmdh.get_dev(address, port, iqn, lun).AndReturn(dev)
+        bmdh.get_image_mb(image_path).AndReturn(1)  # < root_mb
+        bmdh.discovery(address, port)
+        bmdh.login_iscsi(address, port, iqn)
+        bmdh.is_block_device(dev).AndReturn(True)
+        bmdh.make_partitions(dev, root_mb, swap_mb, ephemeral_mb)
+        bmdh.is_block_device(root_part).AndReturn(True)
+        bmdh.is_block_device(swap_part).AndReturn(True)
+        bmdh.is_block_device(ephemeral_part).AndReturn(True)
+        bmdh.dd(image_path, root_part)
+        bmdh.mkswap(swap_part)
+        bmdh.block_uuid(root_part).AndReturn(root_uuid)
+        bmdh.logout_iscsi(address, port, iqn)
+        bmdh.switch_pxe_config(pxe_config_path, root_uuid)
+        bmdh.notify(address, 10000)
+        self.mox.ReplayAll()
+
+        bmdh.deploy(address, port, iqn, lun, image_path, pxe_config_path,
+                    root_mb, swap_mb, ephemeral_mb, True)
+
+        self.mox.VerifyAll()
+
     def test_always_logout_iscsi(self):
         """logout_iscsi() must be called once login_iscsi() is called."""
         address = '127.0.0.1'
@@ -260,8 +301,8 @@ class PhysicalWorkTestCase(test.NoDBTestCase):
         bmdh.get_image_mb(image_path).AndReturn(1)  # < root_mb
         bmdh.discovery(address, port)
         bmdh.login_iscsi(address, port, iqn)
-        bmdh.work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, image_path).\
-                AndRaise(TestException)
+        bmdh.work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, image_path,
+                          False).AndRaise(TestException)
         bmdh.logout_iscsi(address, port, iqn)
         self.mox.ReplayAll()
 
@@ -269,6 +310,72 @@ class PhysicalWorkTestCase(test.NoDBTestCase):
                          bmdh.deploy,
                          address, port, iqn, lun, image_path,
                          pxe_config_path, root_mb, swap_mb, ephemeral_mb)
+
+
+class WorkOnDiskTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(WorkOnDiskTestCase, self).setUp()
+        self.image_path = '/tmp/xyz/image'
+        self.root_mb = 128
+        self.swap_mb = 64
+        self.ephemeral_mb = 256
+        self.dev = '/dev/fake'
+        self.ephemeral_part = '/dev/fake-part1'
+        self.swap_part = '/dev/fake-part2'
+        self.root_part = '/dev/fake-part3'
+
+        self.m_ibd = mock.Mock()
+        self.m_mp = mock.Mock()
+        self.stubs.Set(bmdh, 'is_block_device', self.m_ibd)
+        self.stubs.Set(bmdh, 'make_partitions', self.m_mp)
+
+    def test_no_parent_device(self):
+        self.m_ibd.return_value = False
+        self.assertRaises(bmdh.BareMetalDeployException,
+                          bmdh.work_on_disk,
+                          self.dev, self.root_mb, self.swap_mb,
+                          self.ephemeral_mb, self.image_path, False)
+        self.m_ibd.assert_called_once_with(self.dev)
+        self.assertFalse(self.m_mp.called)
+
+    def test_no_root_partition(self):
+        self.m_ibd.side_effect = [True, False]
+        calls = [mock.call(self.dev),
+                 mock.call(self.root_part)]
+        self.assertRaises(bmdh.BareMetalDeployException,
+                          bmdh.work_on_disk,
+                          self.dev, self.root_mb, self.swap_mb,
+                          self.ephemeral_mb, self.image_path, False)
+        self.assertEqual(self.m_ibd.call_args_list, calls)
+        self.m_mp.assert_called_once_with(self.dev, self.root_mb, self.swap_mb,
+                                          self.ephemeral_mb)
+
+    def test_no_swap_partition(self):
+        self.m_ibd.side_effect = [True, True, False]
+        calls = [mock.call(self.dev),
+                 mock.call(self.root_part),
+                 mock.call(self.swap_part)]
+        self.assertRaises(bmdh.BareMetalDeployException,
+                          bmdh.work_on_disk,
+                          self.dev, self.root_mb, self.swap_mb,
+                          self.ephemeral_mb, self.image_path, False)
+        self.assertEqual(self.m_ibd.call_args_list, calls)
+        self.m_mp.assert_called_once_with(self.dev, self.root_mb, self.swap_mb,
+                                          self.ephemeral_mb)
+
+    def test_no_ephemeral_partition(self):
+        self.m_ibd.side_effect = [True, True, True, False]
+        calls = [mock.call(self.dev),
+                 mock.call(self.root_part),
+                 mock.call(self.swap_part),
+                 mock.call(self.ephemeral_part)]
+        self.assertRaises(bmdh.BareMetalDeployException,
+                          bmdh.work_on_disk,
+                          self.dev, self.root_mb, self.swap_mb,
+                          self.ephemeral_mb, self.image_path, False)
+        self.assertEqual(self.m_ibd.call_args_list, calls)
+        self.m_mp.assert_called_once_with(self.dev, self.root_mb, self.swap_mb,
+                                          self.ephemeral_mb)
 
 
 class SwitchPxeConfigTestCase(test.NoDBTestCase):
@@ -307,7 +414,7 @@ class OtherFunctionTestCase(test.NoDBTestCase):
         self.assertEqual(bmdh.get_image_mb('x'), 0)
         size = 1
         self.assertEqual(bmdh.get_image_mb('x'), 1)
-        size = unit.Mi
+        size = units.Mi
         self.assertEqual(bmdh.get_image_mb('x'), 1)
-        size = unit.Mi + 1
+        size = units.Mi + 1
         self.assertEqual(bmdh.get_image_mb('x'), 2)

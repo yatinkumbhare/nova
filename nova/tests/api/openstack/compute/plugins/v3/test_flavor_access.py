@@ -15,7 +15,6 @@
 
 import datetime
 
-from lxml import etree
 from webob import exc
 
 from nova.api.openstack.compute import flavors as flavors_api
@@ -84,7 +83,7 @@ def _has_flavor_access(flavorid, projectid):
 def fake_get_all_flavors_sorted_list(context, inactive=False,
                                      filters=None, sort_key='flavorid',
                                      sort_dir='asc', limit=None, marker=None):
-    if filters == None or filters['is_public'] == None:
+    if filters is None or filters['is_public'] is None:
         return sorted(INSTANCE_TYPES.values(), key=lambda item: item[sort_key])
 
     res = {}
@@ -141,8 +140,6 @@ class FlavorAccessTest(test.NoDBTestCase):
 
     def test_list_flavor_access_public(self):
         # query flavor-access on public flavor should return 404
-        req = fakes.HTTPRequestV3.blank('/flavors/fake/flavor-access',
-                                        use_admin_context=True)
         self.assertRaises(exc.HTTPNotFound,
                           self.flavor_access_controller.index,
                           self.req, '1')
@@ -274,7 +271,7 @@ class FlavorAccessTest(test.NoDBTestCase):
         req = fakes.HTTPRequestV3.blank('/flavors/3/action',
                                         use_admin_context=True)
         result = self.flavor_action_controller.\
-            _add_tenant_access(req, '3', body)
+            _add_tenant_access(req, '3', body=body)
         self.assertEqual(result, expected)
 
     def test_add_tenant_access_with_non_existed_flavor(self):
@@ -287,14 +284,14 @@ class FlavorAccessTest(test.NoDBTestCase):
                                         use_admin_context=True)
         self.assertRaises(exc.HTTPNotFound,
                           self.flavor_action_controller._add_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_add_tenant_access_with_no_admin_user(self):
         req = fakes.HTTPRequestV3.blank('/flavors/2/action')
         body = {'add_tenant_access': {'tenant_id': 'proj2'}}
         self.assertRaises(exception.PolicyNotAuthorized,
                           self.flavor_action_controller._add_tenant_access,
-                          req, '2', body)
+                          req, '2', body=body)
 
     def test_add_tenant_access_without_policy_check(self):
         req = fakes.HTTPRequestV3.blank('/flavors/3/action')
@@ -306,7 +303,7 @@ class FlavorAccessTest(test.NoDBTestCase):
         self.stubs.Set(flavor_access, 'authorize', fake_authorize)
         self.assertRaises(exc.HTTPForbidden,
                           self.flavor_action_controller._add_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_add_tenant_access_without_tenant_id(self):
         def stub_add_flavor_access(context, flavorid, projectid):
@@ -316,9 +313,9 @@ class FlavorAccessTest(test.NoDBTestCase):
         body = {'add_tenant_access': {}}
         req = fakes.HTTPRequestV3.blank('/flavors/3/action',
                                         use_admin_context=True)
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(exception.ValidationError,
                           self.flavor_action_controller._add_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_add_tenant_access_with_invalid_request(self):
         def stub_add_flavor_access(context, flavorid, projectid):
@@ -328,9 +325,9 @@ class FlavorAccessTest(test.NoDBTestCase):
         body = {'add_tenant_access': None}
         req = fakes.HTTPRequestV3.blank('/flavors/3/action',
                                         use_admin_context=True)
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(exception.ValidationError,
                           self.flavor_action_controller._add_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_add_tenant_access_with_already_added_access(self):
         def stub_add_flavor_access(context, flavorid, projectid):
@@ -343,7 +340,7 @@ class FlavorAccessTest(test.NoDBTestCase):
                                         use_admin_context=True)
         self.assertRaises(exc.HTTPConflict,
                           self.flavor_action_controller._add_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_remove_tenant_access_with_bad_access(self):
         def stub_remove_flavor_access(context, flavorid, projectid):
@@ -356,7 +353,7 @@ class FlavorAccessTest(test.NoDBTestCase):
                                         use_admin_context=True)
         self.assertRaises(exc.HTTPNotFound,
                           self.flavor_action_controller._remove_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_remove_tenant_access_with_non_existed_flavor(self):
         def stub_remove_flavor_access(context, flavorid, projectid):
@@ -368,7 +365,7 @@ class FlavorAccessTest(test.NoDBTestCase):
                                         use_admin_context=True)
         self.assertRaises(exc.HTTPNotFound,
                           self.flavor_action_controller._remove_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_remove_tenant_access_without_tenant_id(self):
         def stub_remove_flavor_access(context, flavorid, projectid):
@@ -378,9 +375,9 @@ class FlavorAccessTest(test.NoDBTestCase):
         body = {'remove_tenant_access': {}}
         req = fakes.HTTPRequestV3.blank('/flavors/3/action',
                                         use_admin_context=True)
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(exception.ValidationError,
                           self.flavor_action_controller._remove_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_remove_tenant_access_with_invalid_request(self):
         def stub_remove_flavor_access(context, flavorid, projectid):
@@ -390,9 +387,9 @@ class FlavorAccessTest(test.NoDBTestCase):
         body = {'remove_tenant_access': None}
         req = fakes.HTTPRequestV3.blank('/flavors/3/action',
                                         use_admin_context=True)
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(exception.ValidationError,
                           self.flavor_action_controller._remove_tenant_access,
-                          req, '3', body)
+                          req, '3', body=body)
 
     def test_remove_tenant_access_with_no_admin_user(self):
         req = fakes.HTTPRequestV3.blank('flavors/2/action',
@@ -400,7 +397,7 @@ class FlavorAccessTest(test.NoDBTestCase):
         body = {'remove_tenant_access': {'tenant_id': 'proj2'}}
         self.assertRaises(exception.PolicyNotAuthorized,
                           self.flavor_action_controller._remove_tenant_access,
-                          req, '2', body)
+                          req, '2', body=body)
 
     def test_remove_tenant_access_without_policy_check(self):
         req = fakes.HTTPRequestV3.blank('/flavors/2/action')
@@ -412,25 +409,4 @@ class FlavorAccessTest(test.NoDBTestCase):
         self.stubs.Set(flavor_access, 'authorize', fake_authorize)
         self.assertRaises(exc.HTTPForbidden,
                           self.flavor_action_controller._remove_tenant_access,
-                          req, '2', body)
-
-
-class FlavorAccessSerializerTest(test.NoDBTestCase):
-    def test_serializer_empty(self):
-        serializer = flavor_access.FlavorAccessTemplate()
-        text = serializer.serialize(dict(flavor_access=[]))
-        tree = etree.fromstring(text)
-        self.assertEqual(len(tree), 0)
-
-    def test_serializer(self):
-        expected = ("<?xml version='1.0' encoding='UTF-8'?>\n"
-                    '<flavor_access>'
-                    '<access tenant_id="proj2" flavor_id="2"/>'
-                    '<access tenant_id="proj3" flavor_id="2"/>'
-                    '</flavor_access>')
-        access_list = [{'flavor_id': '2', 'tenant_id': 'proj2'},
-                       {'flavor_id': '2', 'tenant_id': 'proj3'}]
-
-        serializer = flavor_access.FlavorAccessTemplate()
-        text = serializer.serialize(dict(flavor_access=access_list))
-        self.assertEqual(text, expected)
+                          req, '2', body=body)

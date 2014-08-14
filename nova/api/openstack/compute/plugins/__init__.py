@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,7 +14,7 @@
 
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
@@ -44,12 +42,11 @@ class LoadedExtensionInfo(object):
     def _check_extension(self, extension):
         """Checks for required methods in extension objects."""
         try:
-            LOG.debug(_('Ext name: %s'), extension.name)
-            LOG.debug(_('Ext alias: %s'), extension.alias)
-            LOG.debug(_('Ext description: %s'),
+            LOG.debug('Ext name: %s', extension.name)
+            LOG.debug('Ext alias: %s', extension.alias)
+            LOG.debug('Ext description: %s',
                       ' '.join(extension.__doc__.strip().split()))
-            LOG.debug(_('Ext namespace: %s'), extension.namespace)
-            LOG.debug(_('Ext version: %i'), extension.version)
+            LOG.debug('Ext version: %i', extension.version)
         except AttributeError as ex:
             LOG.exception(_("Exception loading extension: %s"), unicode(ex))
             return False

@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import testtools
 import webob.exc
 
@@ -38,9 +37,8 @@ def stub_service_get_by_host_and_topic(context, host_name, topic):
 
 
 def stub_set_host_enabled(context, host_name, enabled):
-    """
-    Simulates three possible behaviours for VM drivers or compute drivers when
-    enabling or disabling a host.
+    """Simulates three possible behaviours for VM drivers or compute
+    drivers when enabling or disabling a host.
 
     'enabled' means new instances can go to this host
     'disabled' means they can't
@@ -133,6 +131,16 @@ class FakeRequestWithNovaZone(object):
     GET = {"zone": "nova"}
 
 
+class FakeRequestWithNovaService(object):
+    environ = {"nova.context": context_maker.get_admin_context()}
+    GET = {"service": "compute"}
+
+
+class FakeRequestWithInvalidNovaService(object):
+    environ = {"nova.context": context_maker.get_admin_context()}
+    GET = {"service": "invalid"}
+
+
 class HostTestCase(test.TestCase):
     """Test Case for hosts."""
 
@@ -159,7 +167,7 @@ class HostTestCase(test.TestCase):
 
     def _test_host_update(self, host, key, val, expected_value):
         body = {'host': {key: val}}
-        result = self.controller.update(self.req, host, body)
+        result = self.controller.update(self.req, host, body=body)
         self.assertEqual(result['host'][key], expected_value)
 
     def test_list_hosts(self):
@@ -174,6 +182,14 @@ class HostTestCase(test.TestCase):
         self.assertIn('hosts', result)
         hosts = result['hosts']
         self.assertEqual(fake_hosts.HOST_LIST_NOVA_ZONE, hosts)
+
+    def test_list_hosts_with_service(self):
+        result = self.controller.index(FakeRequestWithNovaService())
+        self.assertEqual(fake_hosts.HOST_LIST_NOVA_ZONE, result['hosts'])
+
+    def test_list_hosts_with_invalid_service(self):
+        result = self.controller.index(FakeRequestWithInvalidNovaService())
+        self.assertEqual([], result['hosts'])
 
     def test_disable_host(self):
         self._test_host_update('host_c1', 'status', 'disable', 'disabled')
@@ -195,7 +211,7 @@ class HostTestCase(test.TestCase):
         body = {'host': {key: val}}
         host = "serviceunavailable"
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, host, body)
+                          self.req, host, body=body)
 
     def test_enable_host_service_unavailable(self):
         self._test_host_update_service_unavailable('status', 'enable')
@@ -291,44 +307,54 @@ class HostTestCase(test.TestCase):
 
     def test_bad_status_value(self):
         bad_body = {"host": {"status": "bad"}}
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, "host_c1", bad_body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          self.req, "host", body=bad_body)
         bad_body2 = {"host": {"status": "disablabc"}}
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, "host_c1", bad_body2)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          self.req, "host", body=bad_body2)
 
     def test_bad_update_key(self):
         bad_body = {"host": {"crazy": "bad"}}
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, "host_c1", bad_body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          self.req, "host", body=bad_body)
 
     def test_bad_update_key_type(self):
         bad_body = {"host": "abc"}
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, "host_c1", bad_body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          self.req, "host", body=bad_body)
         bad_body = {"host": None}
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, "host_c1", bad_body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          self.req, "host", body=bad_body)
 
     def test_bad_update_empty(self):
         bad_body = {}
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, "host_c1", bad_body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          self.req, "host", body=bad_body)
 
     def test_bad_update_key_and_correct_update_key(self):
         bad_body = {"host": {"status": "disable",
                              "crazy": "bad"}}
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
-                          self.req, "host_c1", bad_body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          self.req, "host", body=bad_body)
 
     def test_good_update_keys(self):
         body = {"host": {"status": "disable",
                          "maintenance_mode": "enable"}}
-        result = self.controller.update(self.req, 'host_c1', body)
+        result = self.controller.update(self.req, 'host_c1', body=body)
         self.assertEqual(result["host"]["host"], "host_c1")
         self.assertEqual(result["host"]["status"], "disabled")
         self.assertEqual(result["host"]["maintenance_mode"],
                          "on_maintenance")
+
+    def test_update_with_status_key_only(self):
+        body = {"host": {"status": "enable"}}
+        result = self.controller.update(self.req, 'host_c1', body=body)
+        self.assertEqual("enabled", result["host"]["status"])
+
+    def test_update_with_maintenance_mode_key_only(self):
+        body = {"host": {"maintenance_mode": "enable"}}
+        result = self.controller.update(self.req, 'host_c1', body=body)
+        self.assertEqual("on_maintenance", result["host"]["maintenance_mode"])
 
     def test_show_forbidden(self):
         self.req.environ["nova.context"].is_admin = False
@@ -357,7 +383,7 @@ class HostTestCase(test.TestCase):
                'vcpus': 16, 'memory_mb': 32, 'local_gb': 100,
                'vcpus_used': 16, 'memory_mb_used': 32, 'local_gb_used': 10,
                'hypervisor_type': 'qemu', 'hypervisor_version': 12003,
-               'cpu_info': '', 'stats': {}}
+               'cpu_info': '', 'stats': ''}
         db.compute_node_create(ctxt, dic)
 
         return db.service_get(ctxt, s_ref['id'])
@@ -375,7 +401,7 @@ class HostTestCase(test.TestCase):
         for resource in result['host']:
             self.assertIn(resource['resource']['project'], proj)
             self.assertEqual(len(resource['resource']), 5)
-            self.assertTrue(set(resource['resource'].keys()) == set(column))
+            self.assertEqual(set(column), set(resource['resource'].keys()))
         db.service_destroy(ctxt, s_ref['id'])
 
     def test_show_works_correctly(self):
@@ -394,29 +420,7 @@ class HostTestCase(test.TestCase):
         for resource in result['host']:
             self.assertIn(resource['resource']['project'], proj)
             self.assertEqual(len(resource['resource']), 5)
-            self.assertTrue(set(resource['resource'].keys()) == set(column))
+            self.assertEqual(set(column), set(resource['resource'].keys()))
         db.service_destroy(ctxt, s_ref['id'])
         db.instance_destroy(ctxt, i_ref1['uuid'])
         db.instance_destroy(ctxt, i_ref2['uuid'])
-
-
-class HostSerializerTest(test.TestCase):
-    def setUp(self):
-        super(HostSerializerTest, self).setUp()
-
-    def test_index_serializer(self):
-        serializer = os_hosts.HostIndexTemplate()
-        text = serializer.serialize(fake_hosts.OS_API_HOST_LIST)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('hosts', tree.tag)
-        self.assertEqual(len(fake_hosts.HOST_LIST), len(tree))
-        for i in range(len(fake_hosts.HOST_LIST)):
-            self.assertEqual('host', tree[i].tag)
-            self.assertEqual(fake_hosts.HOST_LIST[i]['host_name'],
-                             tree[i].get('host_name'))
-            self.assertEqual(fake_hosts.HOST_LIST[i]['service'],
-                             tree[i].get('service'))
-            self.assertEqual(fake_hosts.HOST_LIST[i]['zone'],
-                             tree[i].get('zone'))

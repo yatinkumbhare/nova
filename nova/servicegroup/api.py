@@ -20,7 +20,7 @@ import random
 
 from oslo.config import cfg
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova import utils
@@ -35,6 +35,9 @@ servicegroup_driver_opt = cfg.StrOpt('servicegroup_driver',
 
 CONF = cfg.CONF
 CONF.register_opt(servicegroup_driver_opt)
+
+# NOTE(geekinutah): By default drivers wait 5 seconds before reporting
+INITIAL_REPORTING_DELAY = 5
 
 
 class API(object):
@@ -58,7 +61,7 @@ class API(object):
         '''
 
         if not cls._driver:
-            LOG.debug(_('ServiceGroup driver defined as an instance of %s'),
+            LOG.debug('ServiceGroup driver defined as an instance of %s',
                       str(CONF.servicegroup_driver))
             driver_name = CONF.servicegroup_driver
             try:
@@ -72,6 +75,25 @@ class API(object):
             # we don't have to check that cls._driver is not NONE,
             # check_isinstance does it
         return super(API, cls).__new__(cls)
+
+    def __init__(self, *args, **kwargs):
+        self.basic_config_check()
+
+    def basic_config_check(self):
+        """Perform basic config check."""
+        # Make sure report interval is less than service down time
+        report_interval = CONF.report_interval
+        if CONF.service_down_time <= report_interval:
+            new_service_down_time = int(report_interval * 2.5)
+            LOG.warn(_("Report interval must be less than service down "
+                       "time. Current config: <service_down_time: "
+                       "%(service_down_time)s, report_interval: "
+                       "%(report_interval)s>. Setting service_down_time to: "
+                       "%(new_service_down_time)s"),
+                       {'service_down_time': CONF.service_down_time,
+                        'report_interval': report_interval,
+                        'new_service_down_time': new_service_down_time})
+            CONF.set_override('service_down_time', new_service_down_time)
 
     def join(self, member_id, group_id, service=None):
         """Add a new member to the ServiceGroup
@@ -89,9 +111,8 @@ class API(object):
 
     def service_is_up(self, member):
         """Check if the given member is up."""
-        msg = _('Check if the given member [%s] is part of the '
-                'ServiceGroup, is up')
-        LOG.debug(msg, member)
+        # NOTE(johngarbutt) no logging in this method,
+        # so this doesn't slow down the scheduler
         return self._driver.is_up(member)
 
     def leave(self, member_id, group_id):
@@ -105,15 +126,15 @@ class API(object):
 
     def get_all(self, group_id):
         """Returns ALL members of the given group."""
-        LOG.debug(_('Returns ALL members of the [%s] '
-                    'ServiceGroup'), group_id)
+        LOG.debug('Returns ALL members of the [%s] '
+                  'ServiceGroup', group_id)
         return self._driver.get_all(group_id)
 
     def get_one(self, group_id):
         """Returns one member of the given group. The strategy to select
         the member is decided by the driver (e.g. random or round-robin).
         """
-        LOG.debug(_('Returns one member of the [%s] group'), group_id)
+        LOG.debug('Returns one member of the [%s] group', group_id)
         return self._driver.get_one(group_id)
 
 
@@ -121,7 +142,7 @@ class ServiceGroupDriver(object):
     """Base class for ServiceGroup drivers."""
 
     def join(self, member_id, group_id, service=None):
-        """Join the given service with it's group."""
+        """Join the given service with its group."""
         raise NotImplementedError()
 
     def is_up(self, member):

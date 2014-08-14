@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -39,10 +37,7 @@ NS = {
 
 EXP_LINKS = {
    'v2.0': {
-       'pdf': 'http://docs.openstack.org/'
-               'api/openstack-compute/2/os-compute-devguide-2.pdf',
-       'wadl': 'http://docs.openstack.org/'
-               'api/openstack-compute/2/wadl/os-compute-2.wadl',
+       'html': 'http://docs.openstack.org/',
     },
 }
 
@@ -55,13 +50,8 @@ EXP_VERSIONS = {
         "links": [
             {
                 "rel": "describedby",
-                "type": "application/pdf",
-                "href": EXP_LINKS['v2.0']['pdf'],
-            },
-            {
-                "rel": "describedby",
-                "type": "application/vnd.sun.wadl+xml",
-                "href": EXP_LINKS['v2.0']['wadl'],
+                "type": "text/html",
+                "href": EXP_LINKS['v2.0']['html'],
             },
         ],
         "media-types": [
@@ -80,10 +70,6 @@ EXP_VERSIONS = {
         "status": "EXPERIMENTAL",
         "updated": "2013-07-23T11:33:21Z",
         "media-types": [
-            {
-                "base": "application/xml",
-                "type": "application/vnd.openstack.compute+xml;version=3",
-            },
             {
                 "base": "application/json",
                 "type": "application/vnd.openstack.compute+json;version=3",
@@ -153,13 +139,8 @@ class VersionsTest(test.NoDBTestCase):
                     },
                     {
                         "rel": "describedby",
-                        "type": "application/pdf",
-                        "href": EXP_LINKS['v2.0']['pdf'],
-                    },
-                    {
-                        "rel": "describedby",
-                        "type": "application/vnd.sun.wadl+xml",
-                        "href": EXP_LINKS['v2.0']['wadl'],
+                        "type": "text/html",
+                        "href": EXP_LINKS['v2.0']['html'],
                     },
                 ],
                 "media-types": [
@@ -197,13 +178,8 @@ class VersionsTest(test.NoDBTestCase):
                     },
                     {
                         "rel": "describedby",
-                        "type": "application/pdf",
-                        "href": EXP_LINKS['v2.0']['pdf'],
-                    },
-                    {
-                        "rel": "describedby",
-                        "type": "application/vnd.sun.wadl+xml",
-                        "href": EXP_LINKS['v2.0']['wadl'],
+                        "type": "text/html",
+                        "href": EXP_LINKS['v2.0']['html'],
                     },
                 ],
                 "media-types": [
@@ -295,16 +271,12 @@ class VersionsTest(test.NoDBTestCase):
         self.assertEqual(len(entry.content), 1)
         self.assertEqual(entry.content[0].value,
             'Version v2.0 CURRENT (2011-01-21T11:33:21Z)')
-        self.assertEqual(len(entry.links), 3)
+        self.assertEqual(len(entry.links), 2)
         self.assertEqual(entry.links[0]['href'], 'http://localhost/v2/')
         self.assertEqual(entry.links[0]['rel'], 'self')
         self.assertEqual(entry.links[1], {
-            'href': EXP_LINKS['v2.0']['pdf'],
-            'type': 'application/pdf',
-            'rel': 'describedby'})
-        self.assertEqual(entry.links[2], {
-            'href': EXP_LINKS['v2.0']['wadl'],
-            'type': 'application/vnd.sun.wadl+xml',
+            'href': EXP_LINKS['v2.0']['html'],
+            'type': 'text/html',
             'rel': 'describedby'})
 
     def test_get_version_list_atom(self):
@@ -357,28 +329,6 @@ class VersionsTest(test.NoDBTestCase):
         expected = {
         "choices": [
             {
-                "id": "v3.0",
-                "status": "EXPERIMENTAL",
-                "links": [
-                    {
-                        "href": "http://localhost/v3/images/1",
-                        "rel": "self",
-                    },
-                ],
-                "media-types": [
-                    {
-                        "base": "application/xml",
-                        "type":
-                        "application/vnd.openstack.compute+xml;version=3",
-                    },
-                    {
-                        "base": "application/json",
-                        "type":
-                        "application/vnd.openstack.compute+json;version=3",
-                    }
-                ],
-            },
-            {
                 "id": "v2.0",
                 "status": "CURRENT",
                 "links": [
@@ -400,6 +350,23 @@ class VersionsTest(test.NoDBTestCase):
                     },
                 ],
             },
+            {
+                "id": "v3.0",
+                "status": "EXPERIMENTAL",
+                "links": [
+                    {
+                        "href": "http://localhost/v3/images/1",
+                        "rel": "self",
+                    },
+                ],
+                "media-types": [
+                    {
+                        "base": "application/json",
+                        "type":
+                        "application/vnd.openstack.compute+json;version=3",
+                    }
+                ],
+            },
         ], }
 
         self.assertThat(jsonutils.loads(res.body),
@@ -417,7 +384,7 @@ class VersionsTest(test.NoDBTestCase):
         versions = root.xpath('ns:version', namespaces=NS)
         self.assertEqual(len(versions), 2)
 
-        version = versions[1]
+        version = versions[0]
         self.assertEqual(version.get('id'), 'v2.0')
         self.assertEqual(version.get('status'), 'CURRENT')
         media_types = version.xpath('ns:media-types/ns:media-type',
@@ -431,7 +398,7 @@ class VersionsTest(test.NoDBTestCase):
         self.assertTrue(common.compare_links(links,
             [{'rel': 'self', 'href': 'http://localhost/v2/images/1'}]))
 
-        version = versions[0]
+        version = versions[1]
         self.assertEqual(version.get('id'), 'v3.0')
         self.assertEqual(version.get('status'), 'EXPERIMENTAL')
         media_types = version.xpath('ns:media-types/ns:media-type',
@@ -446,8 +413,7 @@ class VersionsTest(test.NoDBTestCase):
             [{'rel': 'self', 'href': 'http://localhost/v3/images/1'}]))
 
     def test_multi_choice_server_atom(self):
-        """
-        Make sure multi choice responses do not have content-type
+        """Make sure multi choice responses do not have content-type
         application/atom+xml (should use default of json)
         """
         req = webob.Request.blank('/servers')
@@ -466,28 +432,6 @@ class VersionsTest(test.NoDBTestCase):
 
         expected = {
         "choices": [
-            {
-                "id": "v3.0",
-                "status": "EXPERIMENTAL",
-                "links": [
-                    {
-                        "href": "http://localhost/v3/servers/" + uuid,
-                        "rel": "self",
-                    },
-                ],
-                "media-types": [
-                    {
-                        "base": "application/xml",
-                        "type":
-                        "application/vnd.openstack.compute+xml;version=3",
-                    },
-                    {
-                        "base": "application/json",
-                        "type":
-                        "application/vnd.openstack.compute+json;version=3",
-                    }
-                ],
-            },
             {
                 "id": "v2.0",
                 "status": "CURRENT",
@@ -508,6 +452,23 @@ class VersionsTest(test.NoDBTestCase):
                         "type": "application/vnd.openstack.compute+json"
                                 ";version=2"
                     },
+                ],
+            },
+            {
+                "id": "v3.0",
+                "status": "EXPERIMENTAL",
+                "links": [
+                    {
+                        "href": "http://localhost/v3/servers/" + uuid,
+                        "rel": "self",
+                    },
+                ],
+                "media-types": [
+                    {
+                        "base": "application/json",
+                        "type":
+                        "application/vnd.openstack.compute+json;version=3",
+                    }
                 ],
             },
         ], }
@@ -713,13 +674,8 @@ class VersionsSerializerTests(test.NoDBTestCase):
                     },
                     {
                         "rel": "describedby",
-                        "type": "application/pdf",
-                        "href": EXP_LINKS['v2.0']['pdf'],
-                    },
-                    {
-                        "rel": "describedby",
-                        "type": "application/vnd.sun.wadl+xml",
-                        "href": EXP_LINKS['v2.0']['wadl'],
+                        "type": "text/html",
+                        "href": EXP_LINKS['v2.0']['html'],
                     },
                 ],
                 "media-types": [
@@ -758,15 +714,30 @@ class VersionsSerializerTests(test.NoDBTestCase):
         self.assertEqual(len(entry.content), 1)
         self.assertEqual(entry.content[0].value,
              'Version v2.0 CURRENT (2011-01-21T11:33:21Z)')
-        self.assertEqual(len(entry.links), 3)
+        self.assertEqual(len(entry.links), 2)
         self.assertEqual(entry.links[0]['href'], 'http://localhost/v2/')
         self.assertEqual(entry.links[0]['rel'], 'self')
         self.assertEqual(entry.links[1], {
             'rel': 'describedby',
-            'type': 'application/pdf',
-            'href': EXP_LINKS['v2.0']['pdf']})
-        self.assertEqual(entry.links[2], {
-            'rel': 'describedby',
-            'type': 'application/vnd.sun.wadl+xml',
-            'href': EXP_LINKS['v2.0']['wadl'],
-        })
+            'type': 'text/html',
+            'href': EXP_LINKS['v2.0']['html']})
+
+    def test_multi_choice_image_with_body(self):
+        req = webob.Request.blank('/images/1')
+        req.accept = "application/json"
+        req.method = 'POST'
+        req.content_type = "application/json"
+        req.body = "{\"foo\": \"bar\"}"
+        res = req.get_response(fakes.wsgi_app())
+        self.assertEqual(300, res.status_int)
+        self.assertEqual("application/json", res.content_type)
+
+    def test_get_version_list_with_body(self):
+        req = webob.Request.blank('/')
+        req.accept = "application/json"
+        req.method = 'POST'
+        req.content_type = "application/json"
+        req.body = "{\"foo\": \"bar\"}"
+        res = req.get_response(fakes.wsgi_app())
+        self.assertEqual(200, res.status_int)
+        self.assertEqual("application/json", res.content_type)

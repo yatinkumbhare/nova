@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 # Copyright 2013 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -32,7 +31,6 @@ class ApiSampleTestBaseV3(api_samples_test_base.ApiSampleTestBase):
     extra_extensions_to_load = None
 
     def setUp(self):
-        extends = []
         self.flags(use_ipv6=False,
                    osapi_compute_link_prefix=self._get_host(),
                    osapi_glance_link_prefix=self._get_glance_host())

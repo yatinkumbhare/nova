@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -14,10 +12,11 @@
 
 import webob
 
-from nova.api.openstack.compute.plugins.v3 import flavors as flavors_api
+from nova.api.openstack.compute.schemas.v3 import flavor_manage
 from nova.api.openstack.compute.views import flavors as flavors_view
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
+from nova.api import validation
 from nova.compute import flavors
 from nova import exception
 
@@ -27,9 +26,7 @@ authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
 
 
 class FlavorManageController(wsgi.Controller):
-    """
-    The Flavor Lifecycle API controller for the OpenStack API.
-    """
+    """The Flavor Lifecycle API controller for the OpenStack API."""
     _view_builder_class = flavors_view.V3ViewBuilder
 
     def __init__(self):
@@ -54,24 +51,21 @@ class FlavorManageController(wsgi.Controller):
     @wsgi.response(201)
     @wsgi.action("create")
     @extensions.expected_errors((400, 409))
-    @wsgi.serializers(xml=flavors_api.FlavorTemplate)
+    @validation.schema(flavor_manage.create)
     def _create(self, req, body):
         context = req.environ['nova.context']
         authorize(context)
 
-        if not self.is_valid_body(body, 'flavor'):
-            raise webob.exc.HTTPBadRequest('Invalid request body ')
-
         vals = body['flavor']
 
-        name = vals.get('name')
+        name = vals['name']
         flavorid = vals.get('id')
-        memory = vals.get('ram')
-        vcpus = vals.get('vcpus')
-        root_gb = vals.get('disk')
+        memory = vals['ram']
+        vcpus = vals['vcpus']
+        root_gb = vals['disk']
         ephemeral_gb = vals.get('ephemeral', 0)
         swap = vals.get('swap', 0)
-        rxtx_factor = vals.get('rxtx_factor', 1.0)
+        rxtx_factor = vals.get('os-flavor-rxtx:rxtx_factor', 1.0)
         is_public = vals.get('flavor-access:is_public', True)
 
         try:
@@ -87,20 +81,15 @@ class FlavorManageController(wsgi.Controller):
         except (exception.FlavorExists,
                 exception.FlavorIdExists) as err:
             raise webob.exc.HTTPConflict(explanation=err.format_message())
-        except exception.InvalidInput as exc:
-            raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
 
         return self._view_builder.show(req, flavor)
 
 
 class FlavorManage(extensions.V3APIExtensionBase):
-    """
-    Flavor create/delete API support
-    """
+    """Flavor create/delete API support."""
 
     name = "FlavorManage"
     alias = ALIAS
-    namespace = "http://docs.openstack.org/compute/core/%s/api/v3" % ALIAS
     version = 1
 
     def get_controller_extensions(self):

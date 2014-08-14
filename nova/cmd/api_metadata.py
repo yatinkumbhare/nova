@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -22,20 +20,34 @@ import sys
 
 from oslo.config import cfg
 
+from nova.conductor import rpcapi as conductor_rpcapi
 from nova import config
+from nova import objects
+from nova.objects import base as objects_base
 from nova.openstack.common import log as logging
+from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
 from nova import utils
+from nova import version
 
 
 CONF = cfg.CONF
 CONF.import_opt('enabled_ssl_apis', 'nova.service')
+CONF.import_opt('use_local', 'nova.conductor.api', group='conductor')
 
 
 def main():
     config.parse_args(sys.argv)
     logging.setup("nova")
     utils.monkey_patch()
+    objects.register_all()
+
+    gmr.TextGuruMeditation.setup_autorun(version)
+
+    if not CONF.conductor.use_local:
+        objects_base.NovaObject.indirection_api = \
+            conductor_rpcapi.ConductorAPI()
+
     should_use_ssl = 'metadata' in CONF.enabled_ssl_apis
     server = service.WSGIService('metadata', use_ssl=should_use_ssl)
     service.serve(server, workers=server.workers)

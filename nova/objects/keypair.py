@@ -13,6 +13,8 @@
 #    under the License.
 
 from nova import db
+from nova import exception
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
 
@@ -49,6 +51,9 @@ class KeyPair(base.NovaPersistentObject, base.NovaObject):
 
     @base.remotable
     def create(self, context):
+        if self.obj_attr_is_set('id'):
+            raise exception.ObjectActionError(action='create',
+                                              reason='already created')
         updates = self.obj_get_changes()
         db_keypair = db.key_pair_create(context, updates)
         self._from_db_object(context, self, db_keypair)
@@ -59,14 +64,23 @@ class KeyPair(base.NovaPersistentObject, base.NovaObject):
 
 
 class KeyPairList(base.ObjectListBase, base.NovaObject):
+    # Version 1.0: Initial version
+    #              KeyPair <= version 1.1
+    VERSION = '1.0'
+
     fields = {
         'objects': fields.ListOfObjectsField('KeyPair'),
+        }
+    child_versions = {
+        '1.0': '1.1',
+        # NOTE(danms): KeyPair was at 1.1 before we added this
         }
 
     @base.remotable_classmethod
     def get_by_user(cls, context, user_id):
         db_keypairs = db.key_pair_get_all_by_user(context, user_id)
-        return base.obj_make_list(context, KeyPairList(), KeyPair, db_keypairs)
+        return base.obj_make_list(context, cls(context), objects.KeyPair,
+                                  db_keypairs)
 
     @base.remotable_classmethod
     def get_count_by_user(cls, context, user_id):

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,12 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mox
 import pkg_resources
 
-import mox
-
 from nova import context
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import test
 from nova.tests.virt.xenapi import stubs
 from nova.virt.xenapi import driver as xenapi_conn
@@ -57,12 +54,6 @@ class TestBittorrentStore(stubs.XenAPITestBaseNoDB):
         self.stubs.Set(
                 vm_utils, 'get_sr_path', lambda *a, **kw: '/fake/sr/path')
 
-        self.instance = {'uuid': 'blah',
-                         'system_metadata': {'image_xenapi_use_agent': 'true'},
-                         'auto_disk_config': True,
-                         'os_type': 'default',
-                         'xenapi_use_agent': 'true'}
-
     def test_download_image(self):
 
         params = {'image_id': 'fake_image_uuid',
@@ -85,22 +76,22 @@ class TestBittorrentStore(stubs.XenAPITestBaseNoDB):
                 'bittorrent', 'download_vhd', **params)
         self.mox.ReplayAll()
 
-        vdis = self.store.download_image(
-                self.context, self.session, self.instance, 'fake_image_uuid')
+        self.store.download_image(self.context, self.session,
+                                  'fake_image_uuid')
 
         self.mox.VerifyAll()
 
     def test_upload_image(self):
         self.assertRaises(NotImplementedError, self.store.upload_image,
-                self.context, self.session, self.instance, ['fake_vdi_uuid'],
+                self.context, self.session, mox.IgnoreArg, ['fake_vdi_uuid'],
                 'fake_image_uuid')
 
 
-def bad_fetcher(instance, image_id):
+def bad_fetcher(image_id):
     raise test.TestingException("just plain bad.")
 
 
-def another_fetcher(instance, image_id):
+def another_fetcher(image_id):
     return "http://www.foobar.com/%s" % image_id
 
 
@@ -115,11 +106,13 @@ class LookupTorrentURLTestCase(test.NoDBTestCase):
     def setUp(self):
         super(LookupTorrentURLTestCase, self).setUp()
         self.store = bittorrent.BittorrentStore()
-        self.instance = {'uuid': 'fakeuuid'}
         self.image_id = 'fakeimageid'
 
     def _mock_iter_none(self, namespace):
         return []
+
+    def _mock_iter_single(self, namespace):
+        return [MockEntryPoint()]
 
     def test_default_fetch_url_no_base_url_set(self):
         self.flags(torrent_base_url=None,
@@ -130,30 +123,32 @@ class LookupTorrentURLTestCase(test.NoDBTestCase):
         exc = self.assertRaises(
                 RuntimeError, self.store._lookup_torrent_url_fn)
         self.assertEqual(_('Cannot create default bittorrent URL without'
-                           ' torrent_base_url set'),
+                           ' torrent_base_url set'
+                           ' or torrent URL fetcher extension'),
                          str(exc))
 
     def test_default_fetch_url_base_url_is_set(self):
         self.flags(torrent_base_url='http://foo',
                    group='xenserver')
         self.stubs.Set(pkg_resources, 'iter_entry_points',
-                       self._mock_iter_none)
+                       self._mock_iter_single)
 
         lookup_fn = self.store._lookup_torrent_url_fn()
         self.assertEqual('http://foo/fakeimageid.torrent',
-                         lookup_fn(self.instance, self.image_id))
+                         lookup_fn(self.image_id))
 
     def test_with_extension(self):
-        def mock_iter_single(namespace):
-            return [MockEntryPoint()]
-
-        self.stubs.Set(pkg_resources, 'iter_entry_points', mock_iter_single)
+        self.stubs.Set(pkg_resources, 'iter_entry_points',
+                       self._mock_iter_single)
 
         lookup_fn = self.store._lookup_torrent_url_fn()
         self.assertEqual("http://www.foobar.com/%s" % self.image_id,
-                         lookup_fn(self.instance, self.image_id))
+                         lookup_fn(self.image_id))
 
     def test_multiple_extensions_found(self):
+        self.flags(torrent_base_url=None,
+                   group='xenserver')
+
         def mock_iter_multiple(namespace):
             return [MockEntryPoint(), MockEntryPoint()]
 
@@ -161,6 +156,6 @@ class LookupTorrentURLTestCase(test.NoDBTestCase):
 
         exc = self.assertRaises(
                 RuntimeError, self.store._lookup_torrent_url_fn)
-        self.assertEqual(_('Multiple torrent URL fetcher extension found.'
+        self.assertEqual(_('Multiple torrent URL fetcher extensions found.'
                            ' Failing.'),
                          str(exc))

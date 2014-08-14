@@ -21,8 +21,8 @@ import six
 
 from nova.cells import rpcapi as cells_rpcapi
 from nova import exception
-from nova.openstack.common import rpc
 from nova import test
+from nova.tests import fake_instance
 
 CONF = cfg.CONF
 CONF.import_opt('topic', 'nova.cells.opts', group='cells')
@@ -41,27 +41,42 @@ class CellsAPITestCase(test.NoDBTestCase):
     def _stub_rpc_method(self, rpc_method, result):
         call_info = {}
 
-        def fake_rpc_method(ctxt, topic, msg, *args, **kwargs):
+        orig_prepare = self.cells_rpcapi.client.prepare
+
+        def fake_rpc_prepare(**kwargs):
+            if 'version' in kwargs:
+                call_info['version'] = kwargs.pop('version')
+            return self.cells_rpcapi.client
+
+        def fake_csv(version):
+            return orig_prepare(version).can_send_version()
+
+        def fake_rpc_method(ctxt, method, **kwargs):
             call_info['context'] = ctxt
-            call_info['topic'] = topic
-            call_info['msg'] = msg
+            call_info['method'] = method
+            call_info['args'] = kwargs
             return result
 
-        self.stubs.Set(rpc, rpc_method, fake_rpc_method)
+        self.stubs.Set(self.cells_rpcapi.client, 'prepare', fake_rpc_prepare)
+        self.stubs.Set(self.cells_rpcapi.client, 'can_send_version', fake_csv)
+        self.stubs.Set(self.cells_rpcapi.client, rpc_method, fake_rpc_method)
+
         return call_info
 
     def _check_result(self, call_info, method, args, version=None):
-        if version is None:
-            version = self.cells_rpcapi.BASE_RPC_API_VERSION
+        self.assertEqual(self.cells_rpcapi.client.target.topic,
+                         self.fake_topic)
         self.assertEqual(self.fake_context, call_info['context'])
-        self.assertEqual(self.fake_topic, call_info['topic'])
-        self.assertEqual(method, call_info['msg']['method'])
-        msg_version = call_info['msg']['version']
-        self.assertIsInstance(msg_version, six.string_types,
-                              msg="Message version %s is not a string" %
-                                  msg_version)
-        self.assertEqual(version, call_info['msg']['version'])
-        self.assertEqual(args, call_info['msg']['args'])
+        self.assertEqual(method, call_info['method'])
+        self.assertEqual(args, call_info['args'])
+        if version is not None:
+            self.assertIn('version', call_info)
+            self.assertIsInstance(call_info['version'], six.string_types,
+                                  msg="Message version %s is not a string" %
+                                  call_info['version'])
+            self.assertEqual(version, call_info['version'])
+        else:
+            self.assertNotIn('version', call_info)
 
     def test_cast_compute_api_method(self):
         fake_cell_name = 'fake_cell_name'
@@ -106,18 +121,6 @@ class CellsAPITestCase(test.NoDBTestCase):
         self._check_result(call_info, 'run_compute_api_method',
                 expected_args)
         self.assertEqual(fake_response, result)
-
-    def test_schedule_run_instance(self):
-        call_info = self._stub_rpc_method('cast', None)
-
-        self.cells_rpcapi.schedule_run_instance(
-                self.fake_context, arg1=1, arg2=2, arg3=3)
-
-        expected_args = {'host_sched_kwargs': {'arg1': 1,
-                                               'arg2': 2,
-                                               'arg3': 3}}
-        self._check_result(call_info, 'schedule_run_instance',
-                expected_args)
 
     def test_build_instances(self):
         call_info = self._stub_rpc_method('cast', None)
@@ -187,18 +190,18 @@ class CellsAPITestCase(test.NoDBTestCase):
                 expected_args)
 
     def test_instance_delete_everywhere(self):
-        fake_instance = {'uuid': 'fake-uuid'}
+        instance = fake_instance.fake_instance_obj(self.fake_context)
 
         call_info = self._stub_rpc_method('cast', None)
 
         self.cells_rpcapi.instance_delete_everywhere(
-                self.fake_context, fake_instance,
+                self.fake_context, instance,
                 'fake-type')
 
-        expected_args = {'instance': fake_instance,
+        expected_args = {'instance': instance,
                          'delete_type': 'fake-type'}
         self._check_result(call_info, 'instance_delete_everywhere',
-                expected_args)
+                expected_args, version='1.27')
 
     def test_instance_fault_create_at_top(self):
         fake_instance_fault = {'id': 2,
@@ -301,6 +304,16 @@ class CellsAPITestCase(test.NoDBTestCase):
                            expected_args,
                            version='1.7')
         self.assertEqual(result, 'fake_response')
+
+    def test_service_delete(self):
+        call_info = self._stub_rpc_method('call', None)
+        cell_service_id = 'cell@id'
+        result = self.cells_rpcapi.service_delete(
+            self.fake_context, cell_service_id=cell_service_id)
+        expected_args = {'cell_service_id': cell_service_id}
+        self._check_result(call_info, 'service_delete',
+                           expected_args, version='1.26')
+        self.assertIsNone(result)
 
     def test_proxy_rpc_to_manager(self):
         call_info = self._stub_rpc_method('call', 'fake_response')
@@ -448,7 +461,7 @@ class CellsAPITestCase(test.NoDBTestCase):
 
         expected_args = {'bdm': fake_bdm, 'create': 'fake-create'}
         self._check_result(call_info, 'bdm_update_or_create_at_top',
-                expected_args, version='1.10')
+                expected_args, version='1.28')
 
     def test_bdm_destroy_at_top(self):
         call_info = self._stub_rpc_method('cast', None)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
@@ -18,6 +16,7 @@
 
 from nova.api.openstack import common
 from nova.image import glance
+from nova.openstack.common import timeutils
 
 
 class ViewBuilder(common.ViewBuilder):
@@ -124,10 +123,10 @@ class ViewBuilder(common.ViewBuilder):
                          str(identifier)])
 
     @staticmethod
-    def _format_date(date_string):
-        """Return standard format for given date."""
-        if date_string is not None:
-            return date_string.strftime('%Y-%m-%dT%H:%M:%SZ')
+    def _format_date(dt):
+        """Return standard format for a given datetime object."""
+        if dt is not None:
+            return timeutils.isotime(dt)
 
     @staticmethod
     def _get_status(image):

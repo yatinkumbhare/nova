@@ -22,7 +22,7 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import compute
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
@@ -96,42 +96,42 @@ class HostController(object):
 
     @wsgi.serializers(xml=HostIndexTemplate)
     def index(self, req):
-        """
-        :returns: A dict in the format:
+        """Returns a dict in the format:
 
-            {'hosts': [{'host_name': 'some.host.name',
-               'service': 'cells',
-               'zone': 'internal'},
-              {'host_name': 'some.other.host.name',
-               'service': 'cells',
-               'zone': 'internal'},
-              {'host_name': 'some.celly.host.name',
-               'service': 'cells',
-               'zone': 'internal'},
-              {'host_name': 'console1.host.com',
-               'service': 'consoleauth',
-               'zone': 'internal'},
-              {'host_name': 'network1.host.com',
-               'service': 'network',
-               'zone': 'internal'},
-              {'host_name': 'netwwork2.host.com',
-               'service': 'network',
-               'zone': 'internal'},
-              {'host_name': 'compute1.host.com',
-               'service': 'compute',
-               'zone': 'nova'},
-              {'host_name': 'compute2.host.com',
-               'service': 'compute',
-               'zone': 'nova'},
-              {'host_name': 'sched1.host.com',
-               'service': 'scheduler',
-               'zone': 'internal'},
-              {'host_name': 'sched2.host.com',
-               'service': 'scheduler',
-               'zone': 'internal'},
-              {'host_name': 'vol1.host.com',
-               'service': 'volume'},
-               'zone': 'internal']}
+        |  {'hosts': [{'host_name': 'some.host.name',
+        |     'service': 'cells',
+        |     'zone': 'internal'},
+        |    {'host_name': 'some.other.host.name',
+        |     'service': 'cells',
+        |     'zone': 'internal'},
+        |    {'host_name': 'some.celly.host.name',
+        |     'service': 'cells',
+        |     'zone': 'internal'},
+        |    {'host_name': 'console1.host.com',
+        |     'service': 'consoleauth',
+        |     'zone': 'internal'},
+        |    {'host_name': 'network1.host.com',
+        |     'service': 'network',
+        |     'zone': 'internal'},
+        |    {'host_name': 'netwwork2.host.com',
+        |     'service': 'network',
+        |     'zone': 'internal'},
+        |    {'host_name': 'compute1.host.com',
+        |     'service': 'compute',
+        |     'zone': 'nova'},
+        |    {'host_name': 'compute2.host.com',
+        |     'service': 'compute',
+        |     'zone': 'nova'},
+        |    {'host_name': 'sched1.host.com',
+        |     'service': 'scheduler',
+        |     'zone': 'internal'},
+        |    {'host_name': 'sched2.host.com',
+        |     'service': 'scheduler',
+        |     'zone': 'internal'},
+        |    {'host_name': 'vol1.host.com',
+        |     'service': 'volume'},
+        |     'zone': 'internal']}
+
         """
         context = req.environ['nova.context']
         authorize(context)
@@ -151,19 +151,20 @@ class HostController(object):
     @wsgi.serializers(xml=HostUpdateTemplate)
     @wsgi.deserializers(xml=HostUpdateDeserializer)
     def update(self, req, id, body):
-        """
+        """Updates a specified body.
+
         :param body: example format {'status': 'enable',
                                      'maintenance_mode': 'enable'}
-        :returns:
         """
         def read_enabled(orig_val, msg):
-            """
+            """Checks a specified orig_val and returns True for 'enabled'
+            and False for 'disabled'.
+
             :param orig_val: A string with either 'enable' or 'disable'. May
                              be surrounded by whitespace, and case doesn't
                              matter
             :param msg: The message to be passed to HTTPBadRequest. A single
                         %s will be replaced with orig_val.
-            :returns:   True for 'enabled' and False for 'disabled'
             """
             val = orig_val.strip().lower()
             if val == "enable":
@@ -356,7 +357,7 @@ class Hosts(extensions.ExtensionDescriptor):
     name = "Hosts"
     alias = "os-hosts"
     namespace = "http://docs.openstack.org/compute/ext/hosts/api/v1.1"
-    updated = "2011-06-29T00:00:00+00:00"
+    updated = "2011-06-29T00:00:00Z"
 
     def get_resources(self):
         resources = [extensions.ResourceExtension('os-hosts',

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -23,10 +21,9 @@ import platform
 
 from oslo.config import cfg
 
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
-from nova import unit
+from nova.openstack.common import units
 from nova.virt.hyperv import constants
 from nova.virt.hyperv import utilsfactory
 
@@ -81,8 +78,8 @@ class HostOps(object):
         drive = os.path.splitdrive(self._pathutils.get_instances_dir())[0]
         (size, free_space) = self._hostutils.get_volume_info(drive)
 
-        total_gb = size / unit.Gi
-        free_gb = free_space / unit.Gi
+        total_gb = size / units.Gi
+        free_gb = free_space / units.Gi
         used_gb = total_gb - free_gb
         return (total_gb, free_gb, used_gb)
 
@@ -91,7 +88,7 @@ class HostOps(object):
         :returns: hypervisor version (ex. 12003)
         """
         version = self._hostutils.get_windows_version().replace('.', '')
-        LOG.debug(_('Windows version: %s ') % version)
+        LOG.debug('Windows version: %s ', version)
         return version
 
     def get_available_resource(self):
@@ -103,7 +100,7 @@ class HostOps(object):
         :returns: dictionary describing resources
 
         """
-        LOG.debug(_('get_available_resource called'))
+        LOG.debug('get_available_resource called')
 
         (total_mem_mb,
          free_mem_mb,
@@ -137,7 +134,7 @@ class HostOps(object):
         return dic
 
     def _update_stats(self):
-        LOG.debug(_("Updating host stats"))
+        LOG.debug("Updating host stats")
 
         (total_mem_mb, free_mem_mb, used_mem_mb) = self._get_memory_info()
         (total_hdd_gb,
@@ -163,7 +160,7 @@ class HostOps(object):
 
            If 'refresh' is True, run the update first.
         """
-        LOG.debug(_("get_host_stats called"))
+        LOG.debug("get_host_stats called")
 
         if refresh or not self._stats:
             self._update_stats()
@@ -178,5 +175,5 @@ class HostOps(object):
         if not host_ip:
             # Return the first available address
             host_ip = self._hostutils.get_local_ips()[0]
-        LOG.debug(_("Host IP address is: %s"), host_ip)
+        LOG.debug("Host IP address is: %s", host_ip)
         return host_ip
