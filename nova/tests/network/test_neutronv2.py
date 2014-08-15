@@ -2030,6 +2030,26 @@ class TestNeutronv2(TestNeutronv2Base):
         self.assertEqual('net-id1', net['id'])
         self.assertEqual('tenant', net['meta']['tenant_id'])
 
+    def test_nw_info_build_no_match(self):
+        fake_port = {
+            'fixed_ips': [{'ip_address': '1.1.1.1'}],
+            'id': 'port-id',
+            'network_id': 'net-id1',
+            'tenant_id': 'tenant',
+            'binding:vif_type': model.VIF_TYPE_OVS,
+            }
+        fake_subnets = [model.Subnet(cidr='1.0.0.0/8')]
+        fake_nets = [{'id': 'net-id2', 'name': 'foo', 'tenant_id': 'tenant'}]
+        api = neutronapi.API()
+        self.mox.ReplayAll()
+        neutronv2.get_client('fake')
+        net, iid = api._nw_info_build_network(fake_port, fake_nets,
+                                              fake_subnets)
+        self.assertEqual(fake_subnets, net['subnets'])
+        self.assertEqual('net-id1', net['id'])
+        self.assertEqual('net-id1', net['id'])
+        self.assertEqual('tenant', net['meta']['tenant_id'])
+
     def test_build_network_info_model(self):
         api = neutronapi.API()
         fake_inst = {'project_id': 'fake', 'uuid': 'uuid',
