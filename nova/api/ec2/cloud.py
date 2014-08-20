@@ -1339,8 +1339,8 @@ class CloudController(vpc, object):
             return resp
 
         self.network_api.associate_floating_ip(context, instance,
-                              floating_address=public_ip,
-                              fixed_address=fixed_ips[0])
+                                               floating_address=public_ip,
+                                               fixed_address=fixed_ips[0])
         return {'return': 'true'}
 
     def disassociate_address(self, context, public_ip=None, **kwargs):
