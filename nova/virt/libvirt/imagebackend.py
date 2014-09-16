@@ -196,9 +196,12 @@ class Image(object):
         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
         def fetch_func_sync(target, *args, **kwargs):
             fetch_func(target=target, *args, **kwargs)
-
-        base_dir = os.path.join(CONF.instances_path,
-                                CONF.image_cache_subdirectory_name)
+        if interpath is None:
+            base_dir = os.path.join(CONF.instances_path,
+                                    CONF.image_cache_subdirectory_name)
+        else:
+            base_dir = os.path.join(CONF.instances_path, interpath,
+                                    CONF.image_cache_subdirectory_name)
         if not os.path.exists(base_dir):
             fileutils.ensure_tree(base_dir)
         base = os.path.join(base_dir, filename)
