@@ -1546,7 +1546,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 virt_dom.managedSave(0)
 
         snapshot_backend = self.image_backend.snapshot(disk_path,
-                image_type=source_format)
+                instance=instance, image_type=source_format)
 
         if live_snapshot:
             LOG.info(_("Beginning live snapshot process"),
