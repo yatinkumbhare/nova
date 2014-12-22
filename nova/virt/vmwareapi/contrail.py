@@ -49,6 +49,9 @@ from thrift.transport.TTransport import TTransportException
 from thrift.protocol import TBinaryProtocol, TProtocol
 from contrail_vrouter_api.vrouter_api import ContrailVRouterApi
 from thrift.Thrift import TApplicationException
+from nova.openstack.common import processutils
+from nova.virt.libvirt import designer
+
 
 LOG = logging.getLogger(__name__)
 
