@@ -84,20 +84,29 @@ class ContrailVIFDriver(object):
         return conf
 
     def plug(self, instance, vif, vlan_id):
-        ip = 0
+        ipv4_address = '0.0.0.0'
+        ipv6_address = None
+        subnets = vif['network']['subnets']
+        for subnet in subnets:
+            ips = subnet['ips'][0]
+            if (ips['version'] == 4):
+                if ips['address'] is not None:
+                    ipv4_address = ips['address']
+            if (ips['version'] == 6):
+                if ips['address'] is not None:
+                    ipv6_address = ips['address']
+
         network = vif['network']
-        subnets_v4 = [s for s in network['subnets'] if s['version'] == 4]
-        if len(subnets_v4[0]['ips']) > 0:
-            ip = subnets_v4[0]['ips'][0]['address']
+
         kwargs = {
-            'ip_address': ip,
+            'ip_address': ipv4_address,
             'vn_id': vif['network']['id'],
             'display_name': instance['display_name'],
             'hostname': instance['hostname'],
             'host': instance['host'],
             'vm_project_id': instance['project_id'],
             'port_type': self.PORT_TYPE,
-            'ip6_address': None,
+            'ip6_address': ipv6_address,
             'vlan' : vlan_id,
         }
         try:
