@@ -341,7 +341,9 @@ class VpcController(object):
         self.create_route_table(context, vpc_id=tenant_name,
                                 default_route_table=True)
 
-        return {'vpc': {'vpcId': tenant_name, 'state': 'available'}}
+        return {'vpc': {'vpcId': tenant_name, 'state': 'available',
+                        'instanceTenancy':'default',
+                        'cidrBlock':cidr_block}}
 
     def delete_vpc(self, context, **kwargs):
         vpc_id = kwargs['vpc_id']
@@ -451,6 +453,7 @@ class VpcController(object):
                 # populate the VPC entry in response
                 item['vpcId'] = tenant.name
                 item['state'] = 'available'
+                item['instanceTenancy'] = 'default'
                 if ipam['fq_name'][2].startswith('dopt-'):
                     item['dhcpOptionsId'] = ipam['fq_name'][2]
                 if ipam['fq_name'][2].startswith('vpc-'):
