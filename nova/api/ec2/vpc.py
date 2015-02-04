@@ -1128,9 +1128,9 @@ class VpcController(object):
 
         port_range = {'start_port': 0, 'end_port': 65535}
         rule = {'direction': '>', 'protocol': 'any',
-                'dst_addresses': [dst], 'action_list': None,
-                'rule_uuid': rule_uuid, 'dst_ports': [port_range],
-                'application': [], 'action_list': {'simple_action': action},
+                'dst_addresses': [dst], 'rule_uuid': rule_uuid,
+                'dst_ports': [port_range], 'application': [],
+                'action_list': {'simple_action': action},
                 'rule_sequence': None, 'src_addresses': [src],
                 'src_ports': [port_range]}
 
@@ -1252,8 +1252,13 @@ class VpcController(object):
         return {'return': 'true'}
 
     def describe_network_acls(self, context, **kwargs):
-        if 'acl_id' in kwargs:
-            acl_id = kwargs.get('acl_id')
+        if 'filter' in kwargs:
+            filters = kwargs['filter']
+        else:
+            filters = []
+
+        if 'network_acl_id' in kwargs:
+            acl_id = kwargs.get('network_acl_id')[0]
         acls = []
 
         neutron = neutronv2.get_client(context)
@@ -1264,7 +1269,7 @@ class VpcController(object):
 
         for pol in policys['policys']:
             acl = {}
-            if 'acl_id' in kwargs and pol['name'] != acl_id:
+            if 'network_acl_id' in kwargs and pol['name'] != acl_id:
                 continue
             if not pol['name'].startswith('acl-'):
                 continue
@@ -1329,6 +1334,28 @@ class VpcController(object):
                         acl['associationSet'].append(assoc)
 
             acls.append(acl)
+        # check for passed filters
+        idx_to_delete = []
+        for idx, entry in enumerate(acls):
+            for filter_entry in filters:
+                if filter_entry['name'] == 'vpc-id':
+                    vpc_id = filter_entry['value']['1']
+                    if entry['vpc_id'] != vpc_id:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'network-acl-ids':
+                    acl_id = filter_entry['value']['1']
+                    if entry['network_acl_id'] != acl_id:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'association.subnet-id':
+                    subnet_id = filter_entry['value']['1']
+                    if ('associationSet' not in entry or
+                        entry['associationSet'][0]['subnetId'] != subnet_id):
+                        idx_to_delete.append(idx)
+
+        # removing records, not matching filters
+        idx_to_delete = list(set(idx_to_delete))
+        for idx in idx_to_delete[::-1]:
+            del acls[idx]
 
         return {'networkAclSet': acls}
 
