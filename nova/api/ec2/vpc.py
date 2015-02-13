@@ -1137,7 +1137,7 @@ class VpcController(object):
         return rule
 
     def create_network_acl(self, context, **kwargs):
-        vpc_id = kwargs.get('vpc_id')[0]
+        vpc_id = kwargs.get('vpc_id')
 
         # get project id
         tenant_id = self._get_tenantid_from_vpcid(vpc_id, context)
@@ -1275,10 +1275,10 @@ class VpcController(object):
                 continue
 
             acl['vpc_id'] = pol['fq_name'][1]
-            acl['default'] = 'false'
+            acl['default'] = 'False'
             acl['network_acl_id'] = pol['name']
             if pol['name'] == 'acl-default':
-                acl['default'] = 'true'
+                acl['default'] = 'True'
             acl['entrySet'] = []
 
             if pol['entries'] and 'policy_rule' in pol['entries']:
@@ -1296,7 +1296,7 @@ class VpcController(object):
                         entry['ruleAction'] = 'allow'
 
                     if rule['rule_uuid'].startswith('egress-'):
-                        entry['egress'] = 'true'
+                        entry['egress'] = True
                         entry['portRange'] = {
                             'from': rule['dst_ports'][0]['start_port'],
                             'to': rule['dst_ports'][0]['end_port']}
@@ -1305,7 +1305,7 @@ class VpcController(object):
                             str(cidr['ip_prefix_len'])
                         entry['cidrBlock'] = cidr_str
                     else:
-                        entry['egress'] = 'false'
+                        entry['egress'] = False
                         cidr = rule['src_addresses'][0]['subnet']
                         cidr_str = cidr['ip_prefix'] + '/' + \
                             str(cidr['ip_prefix_len'])
@@ -1350,6 +1350,58 @@ class VpcController(object):
                     subnet_id = filter_entry['value']['1']
                     if ('associationSet' not in entry or
                         entry['associationSet'][0]['subnetId'] != subnet_id):
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'association.association-id':
+                    assoc_id = filter_entry['value']['1']
+                    if ('associationSet' not in entry or
+                        entry['associationSet'][0]['networkAclAssociationId']
+                        != assoc_id):
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'default':
+                    default = filter_entry['value']['1']
+                    if str(default) not in entry['default']:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'entry.protocol':
+                    protocol = filter_entry['value']['1']
+                    result = [ True for rule in entry['entrySet']
+                              if protocol == rule['protocol']]
+                    if not result:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'entry.cidr':
+                    cidr = filter_entry['value']['1']
+                    result = [ True for rule in entry['entrySet']
+                              if cidr == rule['cidrBlock']]
+                    if not result:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'entry.rule-number':
+                    rule_number = filter_entry['value']['1']
+                    result = [ True for rule in entry['entrySet']
+                              if rule_number == int(rule['ruleNumber'])]
+                    if not result:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'entry.rule-action':
+                    rule_action = filter_entry['value']['1']
+                    result = [ True for rule in entry['entrySet']
+                              if rule_action == rule['ruleAction']]
+                    if not result:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'entry.port-range.from':
+                    port_range_from = filter_entry['value']['1']
+                    result = [ True for rule in entry['entrySet']
+                              if port_range_from == int(rule['portRange']['from'])]
+                    if not result:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'entry.port-range.to':
+                    port_range_to = filter_entry['value']['1']
+                    result = [ True for rule in entry['entrySet']
+                              if port_range_to == int(rule['portRange']['to'])]
+                    if not result:
+                        idx_to_delete.append(idx)
+                if filter_entry['name'] == 'entry.egress':
+                    egress = filter_entry['value']['1']
+                    result = [ True for rule in entry['entrySet']
+                              if egress == rule['egress']]
+                    if not result:
                         idx_to_delete.append(idx)
 
         # removing records, not matching filters
